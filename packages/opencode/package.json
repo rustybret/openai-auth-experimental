@@ -1,6 +1,7 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
   "version": "0.1.0",
+  "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
@@ -29,6 +30,7 @@
   "scripts": {
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc",
     "prepublishOnly": "bun run build"
