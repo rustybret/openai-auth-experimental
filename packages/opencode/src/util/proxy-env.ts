@@ -4,8 +4,9 @@ function proxyEnv(name: string) {
 
 export function getProxyForUrl(url: string) {
   const parsed = new URL(url)
-  if (parsed.protocol === "http:") return proxyEnv("HTTP_PROXY")
-  if (parsed.protocol === "https:") return proxyEnv("HTTPS_PROXY") ?? proxyEnv("HTTP_PROXY")
+  if (parsed.protocol === 'http:') return proxyEnv('HTTP_PROXY')
+  if (parsed.protocol === 'https:')
+    return proxyEnv('HTTPS_PROXY') ?? proxyEnv('HTTP_PROXY')
   return undefined
 }
 

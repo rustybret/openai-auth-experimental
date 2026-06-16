@@ -1,8 +1,8 @@
-import { ResponseStreamError } from "./response-stream-error"
-import { isRecord } from "./util/record"
-import { OpenAIWebSocket } from "./ws"
+import { ResponseStreamError } from './response-stream-error'
+import { isRecord } from './util/record'
+import { OpenAIWebSocket } from './ws'
 
-export const TITLE_HEADER = "x-opencode-title"
+export const TITLE_HEADER = 'x-opencode-title'
 
 export interface CreateWebSocketFetchOptions {
   httpFetch?: typeof globalThis.fetch
@@ -39,50 +39,74 @@ interface ContinuationState {
 const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
-const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
+const CONNECTION_LIMIT_REACHED_CODE = 'websocket_connection_limit_reached'
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
   const pool = new Map<string, PoolEntry>()
   const connectTimeout = options?.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
   const idleTimeout = options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
-  const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
+  const maxConnectionAge =
+    options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
   const rawWebSocket = options?.rawWebSocket ?? false
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
-  if (typeof pruneTimer === "object" && "unref" in pruneTimer && typeof pruneTimer.unref === "function") {
+  if (
+    typeof pruneTimer === 'object' &&
+    'unref' in pruneTimer &&
+    typeof pruneTimer.unref === 'function'
+  ) {
     pruneTimer.unref()
   }
 
-  async function websocketFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const url = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url
+  async function websocketFetch(
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const url =
+      input instanceof URL
+        ? input.toString()
+        : typeof input === 'string'
+          ? input
+          : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
     const httpInit = withoutInternalHeaders(init)
 
-    if (init?.method !== "POST" || !new URL(url).pathname.endsWith("/responses")) {
+    if (
+      init?.method !== 'POST' ||
+      !new URL(url).pathname.endsWith('/responses')
+    ) {
       return httpFetch(input, httpInit)
     }
 
     const body = (() => {
       try {
-        if (typeof init?.body !== "string") return undefined
+        if (typeof init?.body !== 'string') return undefined
         const parsed = JSON.parse(init.body)
-        return typeof parsed === "object" && parsed !== null ? parsed : undefined
+        return typeof parsed === 'object' && parsed !== null
+          ? parsed
+          : undefined
       } catch {
         return undefined
       }
     })()
     if (!body?.stream) return httpFetch(input, httpInit)
-    if (internalHeaders[TITLE_HEADER] === "true") {
+    if (internalHeaders[TITLE_HEADER] === 'true') {
       return httpFetch(input, httpInit)
     }
 
-    const sessionID = internalHeaders["x-session-affinity"] ?? internalHeaders["session-id"]
+    const sessionID =
+      internalHeaders['x-session-affinity'] ?? internalHeaders['session-id']
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
     const key = `${sessionID}:conversation`
 
-    const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
+    const entry = pool.get(key) ?? {
+      lastUsedAt: Date.now(),
+      busy: false,
+      fallback: false,
+      streamFailures: 0,
+    }
     pool.set(key, entry)
 
     if (entry.fallback) {
@@ -97,7 +121,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     try {
       const sourceBody = normalizeResponseBody(body)
       const sourceHeaders = OpenAIWebSocket.normalizeHeaders(httpInit?.headers)
-      const socketHeaders = !entry.socket && !entry.continuation ? prewarmHeaders(sourceHeaders) : sourceHeaders
+      const socketHeaders =
+        !entry.socket && !entry.continuation
+          ? prewarmHeaders(sourceHeaders)
+          : sourceHeaders
       entry.socket = await socket(
         entry,
         options?.url ?? url,
@@ -110,13 +137,19 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       if (!entry.continuation) {
         await prewarm(entry, sourceBody, idleTimeout, init?.signal ?? undefined)
       }
-      let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
+      let resolveFirstEvent: (
+        event: boolean | OpenAIWebSocket.WrappedError,
+      ) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
-      const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>((resolve, reject) => {
-        resolveFirstEvent = resolve
-        rejectFirstEvent = reject
-      })
-      const requestBody = orderCodexBody(applyTurnId(entry, withContinuation(entry, sourceBody)))
+      const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>(
+        (resolve, reject) => {
+          resolveFirstEvent = resolve
+          rejectFirstEvent = reject
+        },
+      )
+      const requestBody = orderCodexBody(
+        applyTurnId(entry, withContinuation(entry, sourceBody)),
+      )
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body: requestBody,
@@ -128,7 +161,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           entry.streamFailures = 0
-          if (event.type !== "response.completed" && event.type !== "response.done") {
+          if (
+            event.type !== 'response.completed' &&
+            event.type !== 'response.done'
+          ) {
             entry.continuation = undefined
             invalidate(entry)
           }
@@ -157,10 +193,11 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       })
       const first = await firstEvent
       if (first !== false) {
-        if (first === true || first.status < 200 || first.status > 599) return response
+        if (first === true || first.status < 200 || first.status > 599)
+          return response
         return new Response(first.body, {
           status: first.status,
-          headers: { "content-type": "application/json", ...first.headers },
+          headers: { 'content-type': 'application/json', ...first.headers },
         })
       }
       if (!entry.fallback) return response
@@ -180,14 +217,17 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       invalidate(entry)
       if (entry.fallback) return httpFetch(input, httpInit)
       return failedResponse(
-        new ResponseStreamError(error instanceof Error ? error.message : String(error), {
-          cause: error,
-        }),
+        new ResponseStreamError(
+          error instanceof Error ? error.message : String(error),
+          {
+            cause: error,
+          },
+        ),
       )
     }
   }
 
-function recordStreamFailure(entry: PoolEntry) {
+  function recordStreamFailure(entry: PoolEntry) {
     entry.streamFailures++
     // Codex counts retries after the initial failed WebSocket attempt.
     if (entry.streamFailures > streamRetries) entry.fallback = true
@@ -222,8 +262,17 @@ function recordStreamFailure(entry: PoolEntry) {
 }
 
 function connectionLimitError(event: Record<string, unknown>) {
-  if (event.type !== "error" || !isRecord(event.error) || event.error.code !== CONNECTION_LIMIT_REACHED_CODE) return
-  return new Error(typeof event.error.message === "string" ? event.error.message : CONNECTION_LIMIT_REACHED_CODE)
+  if (
+    event.type !== 'error' ||
+    !isRecord(event.error) ||
+    event.error.code !== CONNECTION_LIMIT_REACHED_CODE
+  )
+    return
+  return new Error(
+    typeof event.error.message === 'string'
+      ? event.error.message
+      : CONNECTION_LIMIT_REACHED_CODE,
+  )
 }
 
 function failedResponse(error: ResponseStreamError) {
@@ -235,7 +284,7 @@ function failedResponse(error: ResponseStreamError) {
     }),
     {
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: { 'content-type': 'text/event-stream' },
     },
   )
 }
@@ -280,8 +329,14 @@ function invalidate(entry: PoolEntry) {
   entry.continuation = undefined
 }
 
-async function prewarm(entry: PoolEntry, body: Record<string, unknown>, idleTimeout: number, signal?: AbortSignal) {
-  if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0) return
+async function prewarm(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  idleTimeout: number,
+  signal?: AbortSignal,
+) {
+  if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
+    return
   const request = prewarmBody(body)
   const response = OpenAIWebSocket.streamResponsesWebSocket({
     socket: entry.socket,
@@ -290,7 +345,8 @@ async function prewarm(entry: PoolEntry, body: Record<string, unknown>, idleTime
     signal,
     onComplete: (event) => updateContinuation(entry, request, event),
     onTerminal: (event) => {
-      if (event.type !== "response.completed" && event.type !== "response.done") entry.continuation = undefined
+      if (event.type !== 'response.completed' && event.type !== 'response.done')
+        entry.continuation = undefined
     },
     onConnectionInvalid: () => {
       entry.continuation = undefined
@@ -328,23 +384,23 @@ function prewarmTurnMetadata(metadata: Record<string, unknown>) {
     session_id: metadata.session_id,
     thread_id: metadata.thread_id,
     thread_source: metadata.thread_source,
-    turn_id: "",
+    turn_id: '',
     sandbox: metadata.sandbox,
-    request_kind: "prewarm",
+    request_kind: 'prewarm',
     window_id: metadata.window_id,
   })
 }
 
 function prewarmClientMetadata(input: unknown) {
   if (!isRecord(input)) return input
-  if (typeof input["x-codex-turn-metadata"] !== "string") return input
+  if (typeof input['x-codex-turn-metadata'] !== 'string') return input
   try {
-    const metadata = JSON.parse(input["x-codex-turn-metadata"])
+    const metadata = JSON.parse(input['x-codex-turn-metadata'])
     if (!isRecord(metadata)) return input
     return {
       ...input,
-      "x-codex-turn-metadata": prewarmTurnMetadata(metadata),
-      "x-codex-ws-stream-request-start-ms": String(Date.now()),
+      'x-codex-turn-metadata': prewarmTurnMetadata(metadata),
+      'x-codex-ws-stream-request-start-ms': String(Date.now()),
     }
   } catch {
     return input
@@ -352,14 +408,14 @@ function prewarmClientMetadata(input: unknown) {
 }
 
 function prewarmHeaders(input: Record<string, string>) {
-  const metadataText = input["x-codex-turn-metadata"]
+  const metadataText = input['x-codex-turn-metadata']
   if (!metadataText) return input
   try {
     const metadata = JSON.parse(metadataText)
     if (!isRecord(metadata)) return input
     return {
       ...input,
-      "x-codex-turn-metadata": prewarmTurnMetadata(metadata),
+      'x-codex-turn-metadata': prewarmTurnMetadata(metadata),
     }
   } catch {
     return input
@@ -368,29 +424,30 @@ function prewarmHeaders(input: Record<string, string>) {
 
 // Codex serializes the response.create body in this exact key order.
 const CODEX_BODY_KEY_ORDER = [
-  "type",
-  "model",
-  "instructions",
-  "previous_response_id",
-  "input",
-  "tools",
-  "tool_choice",
-  "parallel_tool_calls",
-  "reasoning",
-  "store",
-  "stream",
-  "include",
-  "prompt_cache_key",
-  "text",
-  "generate",
-  "client_metadata",
+  'type',
+  'model',
+  'instructions',
+  'previous_response_id',
+  'input',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'reasoning',
+  'store',
+  'stream',
+  'include',
+  'prompt_cache_key',
+  'text',
+  'generate',
+  'client_metadata',
 ]
 
 function normalizeResponseBody(body: Record<string, unknown>) {
   const next: Record<string, unknown> = { ...body }
-  if (Array.isArray(body.input)) next.input = body.input.map(normalizeResponseInputItem)
+  if (Array.isArray(body.input))
+    next.input = body.input.map(normalizeResponseInputItem)
   // Codex WS sends reasoning as { effort } only; it never requests reasoning summaries.
-  if (isRecord(body.reasoning) && "summary" in body.reasoning) {
+  if (isRecord(body.reasoning) && 'summary' in body.reasoning) {
     const { summary: _summary, ...reasoning } = body.reasoning
     next.reasoning = reasoning
   }
@@ -408,18 +465,25 @@ function orderCodexBody(body: Record<string, unknown>) {
 
 function normalizeResponseInputItem(item: unknown) {
   if (!isRecord(item)) return item
-  if (typeof item.type === "string") return item
-  if (typeof item.role !== "string") return item
-  if (!("content" in item)) return item
+  if (typeof item.type === 'string') return item
+  if (typeof item.role !== 'string') return item
+  if (!('content' in item)) return item
   return {
     ...item,
-    type: "message",
+    type: 'message',
   }
 }
 
-function updateContinuation(entry: PoolEntry, fullBody: Record<string, unknown>, event: Record<string, unknown>) {
+function updateContinuation(
+  entry: PoolEntry,
+  fullBody: Record<string, unknown>,
+  event: Record<string, unknown>,
+) {
   const response = event.response
-  const responseID = isRecord(response) && typeof response.id === "string" ? response.id : undefined
+  const responseID =
+    isRecord(response) && typeof response.id === 'string'
+      ? response.id
+      : undefined
   if (!responseID || !Array.isArray(fullBody.input)) {
     entry.continuation = undefined
     return
@@ -438,16 +502,24 @@ export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
   const input = Array.isArray(body.input) ? body.input : []
   const isNewTurn =
     input.length > 0 &&
-    input.some((item) => !(isRecord(item) && typeof item.type === "string" && item.type.endsWith("_output")))
+    input.some(
+      (item) =>
+        !(
+          isRecord(item) &&
+          typeof item.type === 'string' &&
+          item.type.endsWith('_output')
+        ),
+    )
   if (isNewTurn || !entry.turnID) {
     entry.turnID = crypto.randomUUID()
     entry.turnStartedAt = Date.now()
   }
   const cm = body.client_metadata
-  if (!isRecord(cm) || typeof cm["x-codex-turn-metadata"] !== "string") return body
+  if (!isRecord(cm) || typeof cm['x-codex-turn-metadata'] !== 'string')
+    return body
   let meta: unknown
   try {
-    meta = JSON.parse(cm["x-codex-turn-metadata"])
+    meta = JSON.parse(cm['x-codex-turn-metadata'])
   } catch {
     return body
   }
@@ -459,10 +531,13 @@ export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
     turn_id: entry.turnID,
     sandbox: meta.sandbox,
     turn_started_at_unix_ms: entry.turnStartedAt,
-    request_kind: "turn",
+    request_kind: 'turn',
     window_id: meta.window_id,
   })
-  return { ...body, client_metadata: { ...cm, "x-codex-turn-metadata": turnMetadata } }
+  return {
+    ...body,
+    client_metadata: { ...cm, 'x-codex-turn-metadata': turnMetadata },
+  }
 }
 
 function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
@@ -489,10 +564,15 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
 function continuationInput(input: unknown[]) {
   return input.filter((item) => {
     if (!isRecord(item)) return true
-    if (typeof item.type === "string" && item.type.endsWith("_output")) return true
-    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") return true
-    if (item.type === "message") return item.role !== "assistant"
-    if (typeof item.role === "string") return item.role !== "assistant"
+    if (typeof item.type === 'string' && item.type.endsWith('_output'))
+      return true
+    if (
+      item.type === 'function_call_output' ||
+      item.type === 'custom_tool_call_output'
+    )
+      return true
+    if (item.type === 'message') return item.role !== 'assistant'
+    if (typeof item.role === 'string') return item.role !== 'assistant'
     return false
   })
 }
@@ -503,11 +583,11 @@ function bodySignature(body: Record<string, unknown>) {
       Object.fromEntries(
         Object.entries(body).filter(
           ([key]) =>
-            key !== "input" &&
-            key !== "stream" &&
-            key !== "background" &&
-            key !== "previous_response_id" &&
-            key !== "generate",
+            key !== 'input' &&
+            key !== 'stream' &&
+            key !== 'background' &&
+            key !== 'previous_response_id' &&
+            key !== 'generate',
         ),
       ),
     ),
@@ -518,7 +598,9 @@ function normalizeSignatureBody(body: Record<string, unknown>) {
   if (!isRecord(body.client_metadata)) return body
   const client_metadata = Object.fromEntries(
     Object.entries(body.client_metadata).filter(
-      ([key]) => key !== "x-codex-turn-metadata" && key !== "x-codex-ws-stream-request-start-ms",
+      ([key]) =>
+        key !== 'x-codex-turn-metadata' &&
+        key !== 'x-codex-ws-stream-request-start-ms',
     ),
   )
   return { ...body, client_metadata }
@@ -527,22 +609,29 @@ function normalizeSignatureBody(body: Record<string, unknown>) {
 function hasInputPrefix(prefix: unknown[], input: unknown[]) {
   if (prefix.length >= input.length) return false
   for (let index = 0; index < prefix.length; index++) {
-    if (stableStringify(prefix[index]) !== stableStringify(input[index])) return false
+    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
+      return false
   }
   return true
 }
 
 function stableStringify(value: unknown): string {
-  return JSON.stringify(stable(value)) ?? "undefined"
+  return JSON.stringify(stable(value)) ?? 'undefined'
 }
 
 function stable(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stable)
   if (!isRecord(value)) return value
-  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]))
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stable(value[key])]),
+  )
 }
 
-export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(init: T | undefined): T | undefined {
+export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
+  init: T | undefined,
+): T | undefined {
   if (!init?.headers) return init
   if (init.headers instanceof Headers) {
     const headers = new Headers(init.headers)
@@ -551,13 +640,22 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(init
   }
 
   if (Array.isArray(init.headers)) {
-    return { ...init, headers: init.headers.filter((item) => item[0].toLowerCase() !== TITLE_HEADER) }
+    return {
+      ...init,
+      headers: init.headers.filter(
+        (item) => item[0].toLowerCase() !== TITLE_HEADER,
+      ),
+    }
   }
 
   return {
     ...init,
-    headers: Object.fromEntries(Object.entries(init.headers).filter(([key]) => key.toLowerCase() !== TITLE_HEADER)),
+    headers: Object.fromEntries(
+      Object.entries(init.headers).filter(
+        ([key]) => key.toLowerCase() !== TITLE_HEADER,
+      ),
+    ),
   }
 }
 
-export * as OpenAIWebSocketPool from "./ws-pool"
+export * as OpenAIWebSocketPool from './ws-pool'

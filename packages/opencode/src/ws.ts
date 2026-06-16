@@ -1,14 +1,14 @@
 // Low-level OpenAI Responses WebSocket protocol helpers. Session pooling,
 // fallback, and continuation state intentionally live above this file.
 
-import { APICallError } from "ai"
-import { RawWebSocket } from './raw-ws';
-import { ResponseStreamError } from "./response-stream-error"
-import { errorMessage } from "./util/error"
-import { ProxyEnv } from "./util/proxy-env"
-import { isRecord } from "./util/record"
+import { APICallError } from 'ai'
+import { RawWebSocket } from './raw-ws'
+import { ResponseStreamError } from './response-stream-error'
+import { errorMessage } from './util/error'
+import { ProxyEnv } from './util/proxy-env'
+import { isRecord } from './util/record'
 
-export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
+export const PROTOCOL_HEADER = 'responses_websockets=2026-02-06'
 
 // Real Codex (Rust tokio-tungstenite) emits its WS upgrade application headers in
 // this exact order. Bun's WebSocket reorders them, which (with Cloudflare in front)
@@ -17,24 +17,26 @@ export const PROTOCOL_HEADER = "responses_websockets=2026-02-06"
 // upgrade/sec-websocket-*). This normalizes the application headers to Codex's order.
 // Gated by CORTEXKIT_OPENAI_AUTH_WS_HEADER_ORDER=1.
 const CODEX_WS_HEADER_ORDER = [
-  "chatgpt-account-id",
-  "authorization",
-  "user-agent",
-  "originator",
-  "openai-beta",
-  "version",
-  "x-codex-beta-features",
-  "x-codex-turn-metadata",
-  "x-client-request-id",
-  "session-id",
-  "thread-id",
-  "x-codex-window-id",
+  'chatgpt-account-id',
+  'authorization',
+  'user-agent',
+  'originator',
+  'openai-beta',
+  'version',
+  'x-codex-beta-features',
+  'x-codex-turn-metadata',
+  'x-client-request-id',
+  'session-id',
+  'thread-id',
+  'x-codex-window-id',
 ]
 
 // Order the WS upgrade headers to match Codex's request (lowercase app headers first, in
 // Codex's order). Note: Bun's native WebSocket ignores headers-object insertion order on the
 // wire; the hand-rolled RawWebSocket honors it. Kept for parity on both paths.
-function orderCodexWsHeaders(headers: Record<string, string>): Record<string, string> {
+function orderCodexWsHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
   const lowerToKey = new Map<string, string>()
   for (const key of Object.keys(headers)) lowerToKey.set(key.toLowerCase(), key)
   const out: Record<string, string> = {}
@@ -65,7 +67,9 @@ export interface StreamResponsesWebSocketOptions {
   onFirstEvent?: (error?: WrappedError) => void
   onComplete?: (event: Record<string, unknown>) => void
   onTerminal?: (event: Record<string, unknown>) => void
-  onRetryableTerminal?: (event: Record<string, unknown>) => Promise<WebSocket | undefined>
+  onRetryableTerminal?: (
+    event: Record<string, unknown>,
+  ) => Promise<WebSocket | undefined>
   onConnectionInvalid?: (error: ResponseStreamError) => void
   onAbort?: (error: Error) => void
 }
@@ -86,10 +90,12 @@ type BunWebSocketConstructor = new (
 ) => WebSocket
 
 export function toWebSocketUrl(url: string) {
-  return url.replace(/^http/, "ws")
+  return url.replace(/^http/, 'ws')
 }
 
-export function normalizeHeaders(headers: HeadersInit | undefined): Record<string, string> {
+export function normalizeHeaders(
+  headers: HeadersInit | undefined,
+): Record<string, string> {
   const result: Record<string, string> = {}
   if (!headers) return result
 
@@ -114,10 +120,12 @@ export function normalizeHeaders(headers: HeadersInit | undefined): Record<strin
 }
 
 export function isAbortError(error: unknown): error is DOMException {
-  return error instanceof DOMException && error.name === "AbortError"
+  return error instanceof DOMException && error.name === 'AbortError'
 }
 
-export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOptions) {
+export function connectResponsesWebSocket(
+  options: ConnectResponsesWebSocketOptions,
+) {
   return new Promise<WebSocket>((resolve, reject) => {
     if (options.signal?.aborted) {
       reject(abortError(options.signal))
@@ -126,16 +134,18 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
 
     let headers: Record<string, string> = {
       ...options.headers,
-      "openai-beta": options.headers["openai-beta"] ?? PROTOCOL_HEADER,
+      'openai-beta': options.headers['openai-beta'] ?? PROTOCOL_HEADER,
     }
-    delete headers["content-length"]
+    delete headers['content-length']
     headers = orderCodexWsHeaders(headers)
 
     // Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly.
     const proxy =
-      typeof Bun === "undefined"
+      typeof Bun === 'undefined'
         ? undefined
-        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
+        : ProxyEnv.getProxyForUrl(
+            options.url.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:'),
+          )
     // Codex negotiates `permessage-deflate; client_max_window_bits`; match it for wire parity.
     const perMessageDeflate = true
     // Hand-rolled raw client (opt-in): full control of the upgrade header order + RFC 6455
@@ -143,25 +153,28 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
     // native WebSocket suppresses. Default native Bun WS otherwise.
     const socket = options.rawWebSocket
       ? (new RawWebSocket(options.url, headers) as unknown as WebSocket)
-      : new (globalThis.WebSocket as unknown as BunWebSocketConstructor)(options.url, {
-          headers,
-          ...(proxy ? { proxy } : {}),
-          perMessageDeflate,
-        })
+      : new (globalThis.WebSocket as unknown as BunWebSocketConstructor)(
+          options.url,
+          {
+            headers,
+            ...(proxy ? { proxy } : {}),
+            perMessageDeflate,
+          },
+        )
     const timeout = options.timeout
       ? setTimeout(() => {
           cleanup()
           socket.close()
-          reject(new Error("WebSocket connect timed out"))
+          reject(new Error('WebSocket connect timed out'))
         }, options.timeout)
       : undefined
 
     function cleanup() {
       if (timeout) clearTimeout(timeout)
-      socket.removeEventListener("open", onOpen)
-      socket.removeEventListener("error", onError)
-      socket.removeEventListener("close", onClose)
-      options.signal?.removeEventListener("abort", onAbort)
+      socket.removeEventListener('open', onOpen)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('close', onClose)
+      options.signal?.removeEventListener('abort', onAbort)
     }
 
     function onOpen() {
@@ -176,7 +189,15 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
 
     function onClose(event: CloseEvent) {
       cleanup()
-      reject(new Error(closeMessage("WebSocket closed before open", event.code, event.reason)))
+      reject(
+        new Error(
+          closeMessage(
+            'WebSocket closed before open',
+            event.code,
+            event.reason,
+          ),
+        ),
+      )
     }
 
     function onAbort() {
@@ -185,14 +206,16 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
       reject(abortError(options.signal))
     }
 
-    socket.addEventListener("open", onOpen, { once: true })
-    socket.addEventListener("error", onError, { once: true })
-    socket.addEventListener("close", onClose, { once: true })
-    options.signal?.addEventListener("abort", onAbort, { once: true })
+    socket.addEventListener('open', onOpen, { once: true })
+    socket.addEventListener('error', onError, { once: true })
+    socket.addEventListener('close', onClose, { once: true })
+    options.signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
 
-export function streamResponsesWebSocket(options: StreamResponsesWebSocketOptions) {
+export function streamResponsesWebSocket(
+  options: StreamResponsesWebSocketOptions,
+) {
   const encoder = new TextEncoder()
 
   let socket = options.socket
@@ -205,7 +228,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
   function cleanup() {
     if (idleTimer) clearTimeout(idleTimer)
     cleanupSocket()
-    options.signal?.removeEventListener("abort", onAbort)
+    options.signal?.removeEventListener('abort', onAbort)
   }
 
   function terminateSocket(target = socket) {
@@ -214,7 +237,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
 
   function closeCompleted() {
     cleanup()
-    controller?.enqueue(encoder.encode("data: [DONE]\n\n"))
+    controller?.enqueue(encoder.encode('data: [DONE]\n\n'))
     controller?.close()
   }
 
@@ -230,13 +253,16 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     if (completed) return
     if (!options.idleTimeout) return
     if (idleTimer) clearTimeout(idleTimer)
-    idleTimer = setTimeout(() => invalidate(new ResponseStreamError(message)), options.idleTimeout)
+    idleTimer = setTimeout(
+      () => invalidate(new ResponseStreamError(message)),
+      options.idleTimeout,
+    )
   }
 
   async function onMessage(message: MessageEvent) {
     if (completed) return
-    if (typeof message.data !== "string") {
-      invalidate(new ResponseStreamError("Unexpected binary WebSocket frame"))
+    if (typeof message.data !== 'string') {
+      invalidate(new ResponseStreamError('Unexpected binary WebSocket frame'))
       return
     }
 
@@ -244,13 +270,15 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     const event = (() => {
       try {
         const parsed = JSON.parse(text)
-        return typeof parsed === "object" && parsed !== null ? parsed : undefined
+        return typeof parsed === 'object' && parsed !== null
+          ? parsed
+          : undefined
       } catch {
         return undefined
       }
     })()
 
-    if (event?.type === "error" && options.onRetryableTerminal) {
+    if (event?.type === 'error' && options.onRetryableTerminal) {
       cleanupSocket()
       if (idleTimer) clearTimeout(idleTimer)
       idleTimer = undefined
@@ -266,9 +294,12 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
         }
       } catch (error) {
         invalidate(
-          new ResponseStreamError(error instanceof Error ? error.message : String(error), {
-            cause: error,
-          }),
+          new ResponseStreamError(
+            error instanceof Error ? error.message : String(error),
+            {
+              cause: error,
+            },
+          ),
         )
         return
       }
@@ -299,15 +330,15 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
         `${text
           .split(/\r?\n/)
           .map((line) => `data: ${line}`)
-          .join("\n")}\n\n`,
+          .join('\n')}\n\n`,
       ),
     )
     emitted = true
-    resetIdleTimeout("idle timeout waiting for websocket")
+    resetIdleTimeout('idle timeout waiting for websocket')
 
     if (!event) return
 
-    if (event.type === "response.completed" || event.type === "response.done") {
+    if (event.type === 'response.completed' || event.type === 'response.done') {
       completed = true
       options.onComplete?.(event)
       options.onTerminal?.(event)
@@ -315,7 +346,11 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
       return
     }
 
-    if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
+    if (
+      event.type === 'response.failed' ||
+      event.type === 'response.incomplete' ||
+      event.type === 'error'
+    ) {
       completed = true
       options.onTerminal?.(event)
       closeCompleted()
@@ -329,7 +364,13 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
   function onClose(event: CloseEvent) {
     if (completed) return
     invalidate(
-      new ResponseStreamError(closeMessage("WebSocket closed before response.completed", event.code, event.reason)),
+      new ResponseStreamError(
+        closeMessage(
+          'WebSocket closed before response.completed',
+          event.code,
+          event.reason,
+        ),
+      ),
     )
   }
 
@@ -354,22 +395,27 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
   function attach(next: WebSocket) {
     cleanupSocket()
     socket = next
-    socket.addEventListener("message", onMessage)
-    socket.addEventListener("error", onError, { once: true })
-    socket.addEventListener("close", onClose, { once: true })
+    socket.addEventListener('message', onMessage)
+    socket.addEventListener('error', onError, { once: true })
+    socket.addEventListener('close', onClose, { once: true })
     cleanupSocket = () => {
-      socket.removeEventListener("message", onMessage)
-      socket.removeEventListener("error", onError)
-      socket.removeEventListener("close", onClose)
+      socket.removeEventListener('message', onMessage)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('close', onClose)
     }
     const { background: _background, ...payload } = options.body
-    resetIdleTimeout("idle timeout sending websocket request")
+    resetIdleTimeout('idle timeout sending websocket request')
     try {
-      socket.send(JSON.stringify({ type: "response.create", ...payload }))
-      resetIdleTimeout("idle timeout waiting for websocket")
+      socket.send(JSON.stringify({ type: 'response.create', ...payload }))
+      resetIdleTimeout('idle timeout waiting for websocket')
     } catch (error) {
       if (completed) return
-      invalidate(new ResponseStreamError(error instanceof Error ? error.message : String(error), { cause: error }))
+      invalidate(
+        new ResponseStreamError(
+          error instanceof Error ? error.message : String(error),
+          { cause: error },
+        ),
+      )
     }
   }
 
@@ -377,7 +423,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     new ReadableStream<Uint8Array>({
       start(next) {
         controller = next
-        options.signal?.addEventListener("abort", onAbort, { once: true })
+        options.signal?.addEventListener('abort', onAbort, { once: true })
 
         if (options.signal?.aborted) {
           onAbort()
@@ -392,48 +438,62 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
     }),
     {
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: { 'content-type': 'text/event-stream' },
     },
   )
 }
 
-function parseWrappedError(event: Record<string, unknown> | undefined, body: string) {
-  if (event?.type !== "error") return
+function parseWrappedError(
+  event: Record<string, unknown> | undefined,
+  body: string,
+) {
+  if (event?.type !== 'error') return
   const status = event.status ?? event.status_code
-  if (typeof status !== "number" || (status >= 200 && status < 300)) return
+  if (typeof status !== 'number' || (status >= 200 && status < 300)) return
   return {
     status,
     headers: isRecord(event.headers)
       ? Object.fromEntries(
           Object.entries(event.headers).flatMap(([key, value]) =>
-            typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+            typeof value === 'string' ||
+            typeof value === 'number' ||
+            typeof value === 'boolean'
               ? [[key, String(value)]]
               : [],
           ),
         )
       : undefined,
     body,
-    message: isRecord(event.error) && typeof event.error.message === "string" ? event.error.message : `${status}`,
+    message:
+      isRecord(event.error) && typeof event.error.message === 'string'
+        ? event.error.message
+        : `${status}`,
   }
 }
 
 function cancelError(reason: unknown) {
   if (isAbortError(reason)) return reason
   if (reason instanceof Error) return reason
-  return new DOMException(typeof reason === "string" ? reason : "Aborted", "AbortError")
+  return new DOMException(
+    typeof reason === 'string' ? reason : 'Aborted',
+    'AbortError',
+  )
 }
 
 function abortError(signal: AbortSignal | undefined) {
   const reason = signal?.reason
   if (isAbortError(reason)) return reason
-  return new DOMException(reason instanceof Error ? reason.message : "Aborted", "AbortError")
+  return new DOMException(
+    reason instanceof Error ? reason.message : 'Aborted',
+    'AbortError',
+  )
 }
 
 function closeMessage(message: string, code: number, reason: string | Buffer) {
   const details = [`code ${code}`]
-  if (code === 1009) details.push("message too big")
+  if (code === 1009) details.push('message too big')
   if (reason.length > 0) details.push(reason.toString())
-  return `${message} (${details.join(": ")})`
+  return `${message} (${details.join(': ')})`
 }
 
-export * as OpenAIWebSocket from "./ws"
+export * as OpenAIWebSocket from './ws'

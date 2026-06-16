@@ -1,23 +1,28 @@
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
-import os from "node:os"
-import { setTimeout as sleep } from "node:timers/promises"
-import { createServer } from "http"
-import { getSettings } from "./config"
-import { OpenAIWebSocketPool } from "./ws-pool"
-import { PackageVersion } from "./version"
+import os from 'node:os'
+import { setTimeout as sleep } from 'node:timers/promises'
+import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
+import { createServer } from 'http'
+import { getSettings } from './config'
+import { PackageVersion } from './version'
+import { OpenAIWebSocketPool } from './ws-pool'
 
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-const ISSUER = "https://auth.openai.com"
-const CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
+const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
+const ISSUER = 'https://auth.openai.com'
+const CODEX_API_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 const OAUTH_PORT = 1455
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
-const ALLOWED_MODELS = new Set(["gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"])
-const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
+const ALLOWED_MODELS = new Set([
+  'gpt-5.5',
+  'gpt-5.3-codex-spark',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+])
+const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const USER_AGENT = `cortexkit-opencode-openai-auth/${PackageVersion}`
-const CODEX_BETA_FEATURES = "terminal_resize_reflow"
-const CODEX_VERSION = "0.139.0"
+const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
+const CODEX_VERSION = '0.139.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
-const CODEX_SANDBOX = "seccomp"
+const CODEX_SANDBOX = 'seccomp'
 
 interface PkceCodes {
   verifier: string
@@ -25,43 +30,48 @@ interface PkceCodes {
 }
 
 async function generatePKCE(): Promise<PkceCodes> {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+  const chars =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
   const verifier = Array.from(crypto.getRandomValues(new Uint8Array(43)))
     .map((b) => chars[b % chars.length])
-    .join("")
-  const challenge = base64UrlEncode(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))
+    .join('')
+  const challenge = base64UrlEncode(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)),
+  )
   return { verifier, challenge }
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
   const binary = String.fromCharCode(...bytes)
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 export interface IdTokenClaims {
   chatgpt_account_id?: string
   organizations?: Array<{ id: string }>
   email?: string
-  "https://api.openai.com/auth"?: {
+  'https://api.openai.com/auth'?: {
     chatgpt_account_id?: string
   }
 }
 
 export function parseJwtClaims(token: string): IdTokenClaims | undefined {
-  const parts = token.split(".")
+  const parts = token.split('.')
   if (parts.length !== 3) return undefined
   try {
-    return JSON.parse(Buffer.from(parts[1]!, "base64url").toString())
+    return JSON.parse(Buffer.from(parts[1]!, 'base64url').toString())
   } catch {
     return undefined
   }
 }
 
-export function extractAccountIdFromClaims(claims: IdTokenClaims): string | undefined {
+export function extractAccountIdFromClaims(
+  claims: IdTokenClaims,
+): string | undefined {
   return (
     claims.chatgpt_account_id ||
-    claims["https://api.openai.com/auth"]?.chatgpt_account_id ||
+    claims['https://api.openai.com/auth']?.chatgpt_account_id ||
     claims.organizations?.[0]?.id
   )
 }
@@ -79,18 +89,22 @@ export function extractAccountId(tokens: TokenResponse): string | undefined {
   return undefined
 }
 
-function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string): string {
+function buildAuthorizeUrl(
+  redirectUri: string,
+  pkce: PkceCodes,
+  state: string,
+): string {
   const params = new URLSearchParams({
-    response_type: "code",
+    response_type: 'code',
     client_id: CLIENT_ID,
     redirect_uri: redirectUri,
-    scope: "openid profile email offline_access",
+    scope: 'openid profile email offline_access',
     code_challenge: pkce.challenge,
-    code_challenge_method: "S256",
-    id_token_add_organizations: "true",
-    codex_cli_simplified_flow: "true",
+    code_challenge_method: 'S256',
+    id_token_add_organizations: 'true',
+    codex_cli_simplified_flow: 'true',
     state,
-    originator: "opencode",
+    originator: 'opencode',
   })
   return `${ISSUER}/oauth/authorize?${params.toString()}`
 }
@@ -120,17 +134,19 @@ interface PreparedCodexRequest {
 }
 
 function parseJsonObject(input: unknown) {
-  if (typeof input !== "string") return undefined
+  if (typeof input !== 'string') return undefined
   try {
     const parsed = JSON.parse(input)
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined
+    return typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : undefined
   } catch {
     return undefined
   }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
+  return typeof value === 'object' && value !== null
 }
 
 // Real Codex mints the session/thread id (which becomes prompt_cache_key,
@@ -153,7 +169,7 @@ function uuidV7(): string {
   bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x70
   // RFC 4122 variant (10xx) in the high bits of byte 8
   bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
@@ -164,7 +180,11 @@ function getCodexSessionMetadata(
   const existing = sessions.get(sessionID)
   if (existing) return existing
   const threadID = uuidV7()
-  const next: CodexSessionMetadata = { threadID, turnID: crypto.randomUUID(), windowID: `${threadID}:0` }
+  const next: CodexSessionMetadata = {
+    threadID,
+    turnID: crypto.randomUUID(),
+    windowID: `${threadID}:0`,
+  }
   sessions.set(sessionID, next)
   return next
 }
@@ -188,52 +208,56 @@ function prepareCodexRequest(input: {
   const turnMetadata = JSON.stringify({
     session_id: input.metadata.threadID,
     thread_id: input.metadata.threadID,
-    thread_source: "user",
+    thread_source: 'user',
     turn_id: input.metadata.turnID,
     sandbox: CODEX_SANDBOX,
     turn_started_at_unix_ms: input.metadata.turnStartedAt,
-    request_kind: "turn",
+    request_kind: 'turn',
     window_id: input.metadata.windowID,
   })
-  input.headers.set("originator", "codex_exec")
+  input.headers.set('originator', 'codex_exec')
   if (input.websocket) {
     // Codex's WebSocket upgrade carries neither Accept nor Content-Type.
-    input.headers.delete("accept")
-    input.headers.delete("content-type")
+    input.headers.delete('accept')
+    input.headers.delete('content-type')
   } else {
-    input.headers.set("accept", "text/event-stream")
+    input.headers.set('accept', 'text/event-stream')
   }
-  input.headers.set("session-id", input.metadata.threadID)
-  input.headers.delete("x-session-id")
-  input.headers.delete("x-session-affinity")
-  input.headers.set("thread-id", input.metadata.threadID)
-  input.headers.set("x-codex-window-id", input.metadata.windowID)
+  input.headers.set('session-id', input.metadata.threadID)
+  input.headers.delete('x-session-id')
+  input.headers.delete('x-session-affinity')
+  input.headers.set('thread-id', input.metadata.threadID)
+  input.headers.set('x-codex-window-id', input.metadata.windowID)
   // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
-  input.headers.set("x-client-request-id", input.metadata.threadID)
-  input.headers.set("x-codex-beta-features", CODEX_BETA_FEATURES)
-  input.headers.set("x-codex-turn-metadata", turnMetadata)
-  input.headers.set("user-agent", CODEX_USER_AGENT)
-  input.headers.set("version", CODEX_VERSION)
+  input.headers.set('x-client-request-id', input.metadata.threadID)
+  input.headers.set('x-codex-beta-features', CODEX_BETA_FEATURES)
+  input.headers.set('x-codex-turn-metadata', turnMetadata)
+  input.headers.set('user-agent', CODEX_USER_AGENT)
+  input.headers.set('version', CODEX_VERSION)
 
   const parsed = body
   if (!parsed) return { init: input.init }
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
-  if (Array.isArray(parsed.tools)) parsed.tools = parsed.tools.map(normalizeCodexTool)
+  if (Array.isArray(parsed.tools))
+    parsed.tools = parsed.tools.map(normalizeCodexTool)
   maybeInjectCacheStabilizerTool(parsed)
   maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
-    ...(typeof parsed.client_metadata === "object" && parsed.client_metadata !== null ? parsed.client_metadata : {}),
-    "x-codex-installation-id": input.installationID,
-    "x-codex-window-id": input.metadata.windowID,
+    ...(typeof parsed.client_metadata === 'object' &&
+    parsed.client_metadata !== null
+      ? parsed.client_metadata
+      : {}),
+    'x-codex-installation-id': input.installationID,
+    'x-codex-window-id': input.metadata.windowID,
   }
   if (input.websocket) {
-    clientMetadata["x-codex-turn-metadata"] = turnMetadata
-    clientMetadata["x-codex-ws-stream-request-start-ms"] = String(Date.now())
+    clientMetadata['x-codex-turn-metadata'] = turnMetadata
+    clientMetadata['x-codex-ws-stream-request-start-ms'] = String(Date.now())
   }
   parsed.client_metadata = clientMetadata
-  input.headers.delete("content-length")
-  input.headers.delete("Content-Length")
+  input.headers.delete('content-length')
+  input.headers.delete('Content-Length')
   return { init: { ...input.init, body: JSON.stringify(parsed) } }
 }
 
@@ -259,8 +283,15 @@ function prepareCodexRequest(input: {
 function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
   if (!getSettings().webSearch) return
   if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
-  if (parsed.tools.some((t) => isRecord(t) && t.type === "web_search")) return
-  parsed.tools = [...parsed.tools, { type: "web_search", external_web_access: true, search_content_types: ["text", "image"] }]
+  if (parsed.tools.some((t) => isRecord(t) && t.type === 'web_search')) return
+  parsed.tools = [
+    ...parsed.tools,
+    {
+      type: 'web_search',
+      external_web_access: true,
+      search_content_types: ['text', 'image'],
+    },
+  ]
 }
 
 // Optional native image generation (opt-in via config `imageGeneration: true` or
@@ -276,33 +307,51 @@ function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
 function maybeInjectImageGenerationTool(parsed: Record<string, unknown>) {
   if (!getSettings().imageGeneration) return
   if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
-  if (parsed.tools.some((t) => isRecord(t) && t.type === "image_generation")) return
-  parsed.tools = [...parsed.tools, { type: "image_generation", output_format: "png" }]
+  if (parsed.tools.some((t) => isRecord(t) && t.type === 'image_generation'))
+    return
+  parsed.tools = [
+    ...parsed.tools,
+    { type: 'image_generation', output_format: 'png' },
+  ]
 }
 
 // Match Codex's function-tool shape: drop the JSON-Schema `$schema` dialect marker
 // (Codex omits it) and mark function tools `strict: false` as Codex does.
 function normalizeCodexTool(tool: unknown) {
   if (!isRecord(tool)) return tool
-  if (tool.type !== "function") return tool
+  if (tool.type !== 'function') return tool
   const parameters =
-    isRecord(tool.parameters) && "$schema" in tool.parameters
+    isRecord(tool.parameters) && '$schema' in tool.parameters
       ? (() => {
-          const { $schema: _schema, ...rest } = tool.parameters as Record<string, unknown>
+          const { $schema: _schema, ...rest } = tool.parameters as Record<
+            string,
+            unknown
+          >
           return rest
         })()
       : tool.parameters
   // Codex function-tool key order: type, name, description, strict, parameters (+ any extras).
   const { type, name, description, strict, parameters: _p, ...extra } = tool
-  return { type, name, description, strict: strict ?? false, parameters, ...extra }
+  return {
+    type,
+    name,
+    description,
+    strict: strict ?? false,
+    parameters,
+    ...extra,
+  }
 }
 
-async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
+async function exchangeCodeForTokens(
+  code: string,
+  redirectUri: string,
+  pkce: PkceCodes,
+): Promise<TokenResponse> {
   const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: "authorization_code",
+      grant_type: 'authorization_code',
       code,
       redirect_uri: redirectUri,
       client_id: CLIENT_ID,
@@ -315,12 +364,15 @@ async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: Pk
   return (await response.json()) as TokenResponse
 }
 
-async function refreshAccessToken(refreshToken: string, issuer = ISSUER): Promise<TokenResponse> {
+async function refreshAccessToken(
+  refreshToken: string,
+  issuer = ISSUER,
+): Promise<TokenResponse> {
   const response = await fetch(`${issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: "refresh_token",
+      grant_type: 'refresh_token',
       refresh_token: refreshToken,
       client_id: CLIENT_ID,
     }).toString(),
@@ -431,43 +483,49 @@ interface PendingOAuth {
 let oauthServer: ReturnType<typeof createServer> | undefined
 let pendingOAuth: PendingOAuth | undefined
 
-async function startOAuthServer(): Promise<{ port: number; redirectUri: string }> {
+async function startOAuthServer(): Promise<{
+  port: number
+  redirectUri: string
+}> {
   if (oauthServer) {
-    return { port: OAUTH_PORT, redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback` }
+    return {
+      port: OAUTH_PORT,
+      redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
+    }
   }
 
   oauthServer = createServer((req, res) => {
-    const url = new URL(req.url || "/", `http://localhost:${OAUTH_PORT}`)
+    const url = new URL(req.url || '/', `http://localhost:${OAUTH_PORT}`)
 
-    if (url.pathname === "/auth/callback") {
-      const code = url.searchParams.get("code")
-      const state = url.searchParams.get("state")
-      const error = url.searchParams.get("error")
-      const errorDescription = url.searchParams.get("error_description")
+    if (url.pathname === '/auth/callback') {
+      const code = url.searchParams.get('code')
+      const state = url.searchParams.get('state')
+      const error = url.searchParams.get('error')
+      const errorDescription = url.searchParams.get('error_description')
 
       if (error) {
         const errorMsg = errorDescription || error
         pendingOAuth?.reject(new Error(errorMsg))
         pendingOAuth = undefined
-        res.writeHead(200, { "Content-Type": "text/html" })
+        res.writeHead(200, { 'Content-Type': 'text/html' })
         res.end(HTML_ERROR(errorMsg))
         return
       }
 
       if (!code) {
-        const errorMsg = "Missing authorization code"
+        const errorMsg = 'Missing authorization code'
         pendingOAuth?.reject(new Error(errorMsg))
         pendingOAuth = undefined
-        res.writeHead(400, { "Content-Type": "text/html" })
+        res.writeHead(400, { 'Content-Type': 'text/html' })
         res.end(HTML_ERROR(errorMsg))
         return
       }
 
       if (!pendingOAuth || state !== pendingOAuth.state) {
-        const errorMsg = "Invalid state - potential CSRF attack"
+        const errorMsg = 'Invalid state - potential CSRF attack'
         pendingOAuth?.reject(new Error(errorMsg))
         pendingOAuth = undefined
-        res.writeHead(400, { "Content-Type": "text/html" })
+        res.writeHead(400, { 'Content-Type': 'text/html' })
         res.end(HTML_ERROR(errorMsg))
         return
       }
@@ -475,35 +533,42 @@ async function startOAuthServer(): Promise<{ port: number; redirectUri: string }
       const current = pendingOAuth
       pendingOAuth = undefined
 
-      exchangeCodeForTokens(code, `http://localhost:${OAUTH_PORT}/auth/callback`, current.pkce)
+      exchangeCodeForTokens(
+        code,
+        `http://localhost:${OAUTH_PORT}/auth/callback`,
+        current.pkce,
+      )
         .then((tokens) => current.resolve(tokens))
         .catch((err) => current.reject(err))
 
-      res.writeHead(200, { "Content-Type": "text/html" })
+      res.writeHead(200, { 'Content-Type': 'text/html' })
       res.end(HTML_SUCCESS)
       return
     }
 
-    if (url.pathname === "/cancel") {
-      pendingOAuth?.reject(new Error("Login cancelled"))
+    if (url.pathname === '/cancel') {
+      pendingOAuth?.reject(new Error('Login cancelled'))
       pendingOAuth = undefined
       res.writeHead(200)
-      res.end("Login cancelled")
+      res.end('Login cancelled')
       return
     }
 
     res.writeHead(404)
-    res.end("Not found")
+    res.end('Not found')
   })
 
   await new Promise<void>((resolve, reject) => {
     oauthServer!.listen(OAUTH_PORT, () => {
       resolve()
     })
-    oauthServer!.on("error", reject)
+    oauthServer!.on('error', reject)
   })
 
-  return { port: OAUTH_PORT, redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback` }
+  return {
+    port: OAUTH_PORT,
+    redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
+  }
 }
 
 function stopOAuthServer() {
@@ -513,13 +578,18 @@ function stopOAuthServer() {
   }
 }
 
-function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResponse> {
+function waitForOAuthCallback(
+  pkce: PkceCodes,
+  state: string,
+): Promise<TokenResponse> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(
       () => {
         if (pendingOAuth) {
           pendingOAuth = undefined
-          reject(new Error("OAuth callback timeout - authorization took too long"))
+          reject(
+            new Error('OAuth callback timeout - authorization took too long'),
+          )
         }
       },
       5 * 60 * 1000,
@@ -540,13 +610,18 @@ function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResp
   })
 }
 
-export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPluginOptions = {}): Promise<Hooks> {
+export async function CodexAuthPlugin(
+  input: PluginInput,
+  options: CodexAuthPluginOptions = {},
+): Promise<Hooks> {
   const issuer = options.issuer ?? ISSUER
   const codexApiEndpoint = options.codexApiEndpoint ?? CODEX_API_ENDPOINT
   const installationID = crypto.randomUUID()
   const codexSessions = new Map<string, CodexSessionMetadata>()
   let websocketFetchInstalled = false
-  const websocketFetches: Array<ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>> = []
+  const websocketFetches: Array<
+    ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>
+  > = []
 
   return {
     async dispose() {
@@ -554,13 +629,14 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       websocketFetches.length = 0
     },
     async event(input) {
-      if (input.event.type !== "session.deleted") return
-      for (const websocketFetch of websocketFetches) websocketFetch.remove(input.event.properties.info.id)
+      if (input.event.type !== 'session.deleted') return
+      for (const websocketFetch of websocketFetches)
+        websocketFetch.remove(input.event.properties.info.id)
     },
     provider: {
-      id: "openai",
+      id: 'openai',
       async models(provider, ctx) {
-        if (ctx.auth?.type !== "oauth") return provider.models
+        if (ctx.auth?.type !== 'oauth') return provider.models
 
         return Object.fromEntries(
           Object.entries(provider.models)
@@ -578,7 +654,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                   output: 0,
                   cache: { read: 0, write: 0 },
                 },
-                limit: model.id.includes("gpt-5.5")
+                limit: model.id.includes('gpt-5.5')
                   ? {
                       context: 400_000,
                       input: 272_000,
@@ -591,17 +667,21 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       },
     },
     auth: {
-      provider: "openai",
+      provider: 'openai',
       async loader(getAuth) {
         const auth = await getAuth()
         const websocketFetch = options.experimentalWebSockets
-          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch, rawWebSocket: getSettings().rawWebSocket })
+          ? OpenAIWebSocketPool.createWebSocketFetch({
+              httpFetch: fetch,
+              rawWebSocket: getSettings().rawWebSocket,
+            })
           : undefined
         if (websocketFetch) {
           websocketFetches.push(websocketFetch)
           websocketFetchInstalled = true
         }
-        if (auth.type !== "oauth") return websocketFetch ? { fetch: websocketFetch } : {}
+        if (auth.type !== 'oauth')
+          return websocketFetch ? { fetch: websocketFetch } : {}
 
         let refreshPromise:
           | Promise<{
@@ -615,34 +695,42 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
             if (init?.headers) {
               if (init.headers instanceof Headers) {
-                init.headers.delete("authorization")
-                init.headers.delete("Authorization")
+                init.headers.delete('authorization')
+                init.headers.delete('Authorization')
               } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(([key]) => String(key).toLowerCase() !== "authorization")
+                init.headers = init.headers.filter(
+                  ([key]) => String(key).toLowerCase() !== 'authorization',
+                )
               } else {
-                delete init.headers["authorization"]
-                delete init.headers["Authorization"]
+                delete init.headers['authorization']
+                delete init.headers['Authorization']
               }
             }
 
             const currentAuth = await getAuth()
-            if (currentAuth.type !== "oauth")
-              return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
+            if (currentAuth.type !== 'oauth')
+              return websocketFetch
+                ? websocketFetch(requestInput, init)
+                : fetch(requestInput, init)
 
-            const authWithAccount = currentAuth as typeof currentAuth & { accountId?: string }
+            const authWithAccount = currentAuth as typeof currentAuth & {
+              accountId?: string
+            }
 
             if (!currentAuth.access || currentAuth.expires < Date.now()) {
               if (!refreshPromise) {
                 refreshPromise = refreshAccessToken(currentAuth.refresh, issuer)
                   .then(async (tokens) => {
-                    const accountId = extractAccountId(tokens) || authWithAccount.accountId
+                    const accountId =
+                      extractAccountId(tokens) || authWithAccount.accountId
                     await input.client.auth.set({
-                      path: { id: "openai" },
+                      path: { id: 'openai' },
                       body: {
-                        type: "oauth",
+                        type: 'oauth',
                         refresh: tokens.refresh_token,
                         access: tokens.access_token,
-                        expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                        expires:
+                          Date.now() + (tokens.expires_in ?? 3600) * 1000,
                         ...(accountId && { accountId }),
                       },
                     })
@@ -664,7 +752,9 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             const headers = new Headers()
             if (init?.headers) {
               if (init.headers instanceof Headers) {
-                init.headers.forEach((value, key) => headers.set(key, value))
+                init.headers.forEach((value, key) => {
+                  headers.set(key, value)
+                })
               } else if (Array.isArray(init.headers)) {
                 for (const [key, value] of init.headers) {
                   if (value !== undefined) headers.set(key, String(value))
@@ -675,19 +765,30 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                 }
               }
             }
-            headers.set("authorization", `Bearer ${currentAuth.access}`)
+            headers.set('authorization', `Bearer ${currentAuth.access}`)
             if (authWithAccount.accountId) {
-              headers.set("ChatGPT-Account-Id", authWithAccount.accountId)
+              headers.set('ChatGPT-Account-Id', authWithAccount.accountId)
             }
-            const sessionID = headers.get("x-session-affinity") ?? headers.get("x-session-id") ?? headers.get("session-id") ?? undefined
-            const codexMetadata = sessionID ? getCodexSessionMetadata(codexSessions, sessionID) : undefined
+            const sessionID =
+              headers.get('x-session-affinity') ??
+              headers.get('x-session-id') ??
+              headers.get('session-id') ??
+              undefined
+            const codexMetadata = sessionID
+              ? getCodexSessionMetadata(codexSessions, sessionID)
+              : undefined
 
             const parsed =
               requestInput instanceof URL
                 ? requestInput
-                : new URL(typeof requestInput === "string" ? requestInput : requestInput.url)
+                : new URL(
+                    typeof requestInput === 'string'
+                      ? requestInput
+                      : requestInput.url,
+                  )
             const url =
-              parsed.pathname.includes("/v1/responses") || parsed.pathname.includes("/chat/completions")
+              parsed.pathname.includes('/v1/responses') ||
+              parsed.pathname.includes('/chat/completions')
                 ? new URL(codexApiEndpoint)
                 : parsed
 
@@ -699,36 +800,45 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
               headers,
               metadata: codexMetadata,
               installationID,
-              websocket: Boolean(websocketFetch && parsed.pathname.endsWith("/responses")),
+              websocket: Boolean(
+                websocketFetch && parsed.pathname.endsWith('/responses'),
+              ),
             })
             const requestInit = prepared.init
-            if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
-            return fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit))
+            if (websocketFetch && parsed.pathname.endsWith('/responses'))
+              return websocketFetch(url, requestInit)
+            return fetch(
+              url,
+              OpenAIWebSocketPool.withoutInternalHeaders(requestInit),
+            )
           },
         }
       },
       methods: [
         {
-          label: "ChatGPT Pro/Plus (browser)",
-          type: "oauth",
+          label: 'ChatGPT Pro/Plus (browser)',
+          type: 'oauth',
           authorize: async () => {
             const { redirectUri } = await startOAuthServer()
             const pkce = await generatePKCE()
-            const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
+            const state = base64UrlEncode(
+              crypto.getRandomValues(new Uint8Array(32)).buffer,
+            )
             const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
 
             const callbackPromise = waitForOAuthCallback(pkce, state)
 
             return {
               url: authUrl,
-              instructions: "Complete authorization in your browser. This window will close automatically.",
-              method: "auto" as const,
+              instructions:
+                'Complete authorization in your browser. This window will close automatically.',
+              method: 'auto' as const,
               callback: async () => {
                 const tokens = await callbackPromise
                 stopOAuthServer()
                 const accountId = extractAccountId(tokens)
                 return {
-                  type: "success" as const,
+                  type: 'success' as const,
                   refresh: tokens.refresh_token,
                   access: tokens.access_token,
                   expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
@@ -739,44 +849,52 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
           },
         },
         {
-          label: "ChatGPT Pro/Plus (headless)",
-          type: "oauth",
+          label: 'ChatGPT Pro/Plus (headless)',
+          type: 'oauth',
           authorize: async () => {
-            const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                  "User-Agent": USER_AGENT,
+            const deviceResponse = await fetch(
+              `${ISSUER}/api/accounts/deviceauth/usercode`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': USER_AGENT,
+                },
+                body: JSON.stringify({ client_id: CLIENT_ID }),
               },
-              body: JSON.stringify({ client_id: CLIENT_ID }),
-            })
+            )
 
-            if (!deviceResponse.ok) throw new Error("Failed to initiate device authorization")
+            if (!deviceResponse.ok)
+              throw new Error('Failed to initiate device authorization')
 
             const deviceData = (await deviceResponse.json()) as {
               device_auth_id: string
               user_code: string
               interval: string
             }
-            const interval = Math.max(parseInt(deviceData.interval) || 5, 1) * 1000
+            const interval =
+              Math.max(parseInt(deviceData.interval) || 5, 1) * 1000
 
             return {
               url: `${ISSUER}/codex/device`,
               instructions: `Enter code: ${deviceData.user_code}`,
-              method: "auto" as const,
+              method: 'auto' as const,
               async callback() {
                 while (true) {
-                  const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                        "User-Agent": USER_AGENT,
+                  const response = await fetch(
+                    `${ISSUER}/api/accounts/deviceauth/token`,
+                    {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'User-Agent': USER_AGENT,
+                      },
+                      body: JSON.stringify({
+                        device_auth_id: deviceData.device_auth_id,
+                        user_code: deviceData.user_code,
+                      }),
                     },
-                    body: JSON.stringify({
-                      device_auth_id: deviceData.device_auth_id,
-                      user_code: deviceData.user_code,
-                    }),
-                  })
+                  )
 
                   if (response.ok) {
                     const data = (await response.json()) as {
@@ -785,10 +903,12 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                     }
 
                     const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
-                      method: "POST",
-                      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                      },
                       body: new URLSearchParams({
-                        grant_type: "authorization_code",
+                        grant_type: 'authorization_code',
                         code: data.authorization_code,
                         redirect_uri: `${ISSUER}/deviceauth/callback`,
                         client_id: CLIENT_ID,
@@ -797,13 +917,15 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                     })
 
                     if (!tokenResponse.ok) {
-                      throw new Error(`Token exchange failed: ${tokenResponse.status}`)
+                      throw new Error(
+                        `Token exchange failed: ${tokenResponse.status}`,
+                      )
                     }
 
                     const tokens = (await tokenResponse.json()) as TokenResponse
 
                     return {
-                      type: "success" as const,
+                      type: 'success' as const,
                       refresh: tokens.refresh_token,
                       access: tokens.access_token,
                       expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
@@ -812,7 +934,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                   }
 
                   if (response.status !== 403 && response.status !== 404) {
-                    return { type: "failed" as const }
+                    return { type: 'failed' as const }
                   }
 
                   await sleep(interval + OAUTH_POLLING_SAFETY_MARGIN_MS)
@@ -822,23 +944,25 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
           },
         },
         {
-          label: "Manually enter API Key",
-          type: "api",
+          label: 'Manually enter API Key',
+          type: 'api',
         },
       ],
     },
-    "chat.headers": async (input, output) => {
-      if (input.model.providerID !== "openai") return
-      output.headers.originator = "opencode"
-      output.headers["User-Agent"] = `${USER_AGENT} (${os.platform()} ${os.release()}; ${os.arch()})`
-      output.headers["session-id"] = input.sessionID
+    'chat.headers': async (input, output) => {
+      if (input.model.providerID !== 'openai') return
+      output.headers.originator = 'opencode'
+      output.headers['User-Agent'] =
+        `${USER_AGENT} (${os.platform()} ${os.release()}; ${os.arch()})`
+      output.headers['session-id'] = input.sessionID
       // Temporary fetch-layer hack: title generation currently shares the conversation
       // session ID, so the OpenAI plugin marks it for HTTP fallback until transport
       // context can be passed directly instead of smuggled through headers.
-      if (websocketFetchInstalled && input.agent === "title") output.headers[OpenAIWebSocketPool.TITLE_HEADER] = "true"
+      if (websocketFetchInstalled && input.agent === 'title')
+        output.headers[OpenAIWebSocketPool.TITLE_HEADER] = 'true'
     },
-    "chat.params": async (input, output) => {
-      if (input.model.providerID !== "openai") return
+    'chat.params': async (input, output) => {
+      if (input.model.providerID !== 'openai') return
       // Match codex cli
       output.maxOutputTokens = undefined
     },
@@ -849,6 +973,6 @@ export const OpenAIAuthPlugin: Plugin = async (input) =>
   CodexAuthPlugin(input, { experimentalWebSockets: getSettings().webSockets })
 
 export default {
-  id: "cortexkit-openai-auth",
+  id: 'cortexkit-openai-auth',
   server: OpenAIAuthPlugin,
 }

@@ -13,25 +13,25 @@
 // addEventListener/removeEventListener for "open"|"message"|"error"|"close",
 // send(string), close(), and a `url` field. Text frames only on receive.
 
-const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 // Codex (tokio-tungstenite) application-header order. WS control headers
 // (host/connection/upgrade/sec-websocket-version/sec-websocket-key) are written
 // first by us in Codex's exact order; Sec-WebSocket-Extensions would go last but
 // we omit it (no permessage-deflate).
 const CODEX_APP_HEADER_ORDER = [
-  "chatgpt-account-id",
-  "authorization",
-  "user-agent",
-  "originator",
-  "openai-beta",
-  "version",
-  "x-codex-beta-features",
-  "x-codex-turn-metadata",
-  "x-client-request-id",
-  "session-id",
-  "thread-id",
-  "x-codex-window-id",
+  'chatgpt-account-id',
+  'authorization',
+  'user-agent',
+  'originator',
+  'openai-beta',
+  'version',
+  'x-codex-beta-features',
+  'x-codex-turn-metadata',
+  'x-client-request-id',
+  'session-id',
+  'thread-id',
+  'x-codex-window-id',
 ]
 
 type Listener = (event: any) => void
@@ -40,7 +40,9 @@ export class RawWebSocket {
   url: string
   readyState = 0 // CONNECTING
   // Bun.Socket; typed loosely to avoid Bun.connect overload friction in plugin tsconfig.
-  private socket: { write(data: Uint8Array | string): number; end(): void } | undefined
+  private socket:
+    | { write(data: Uint8Array | string): number; end(): void }
+    | undefined
   private listeners: Record<string, Set<Listener>> = {
     open: new Set(),
     message: new Set(),
@@ -49,7 +51,7 @@ export class RawWebSocket {
   }
   private rxBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0)
   private handshakeDone = false
-  private expectedAccept = ""
+  private expectedAccept = ''
   // message reassembly across fragmented frames
   private fragOpcode = 0
   private fragChunks: Uint8Array<ArrayBufferLike>[] = []
@@ -59,7 +61,11 @@ export class RawWebSocket {
     void this.connect(url, headers)
   }
 
-  addEventListener(type: string, fn: Listener, _opts?: { once?: boolean }): void {
+  addEventListener(
+    type: string,
+    fn: Listener,
+    _opts?: { once?: boolean },
+  ): void {
     this.listeners[type]?.add(fn)
   }
   removeEventListener(type: string, fn: Listener): void {
@@ -75,15 +81,23 @@ export class RawWebSocket {
     }
   }
 
-  private async connect(url: string, headers: Record<string, string>): Promise<void> {
-    const u = new URL(url.replace(/^ws:/, "http:").replace(/^wss:/, "https:"))
+  private async connect(
+    url: string,
+    headers: Record<string, string>,
+  ): Promise<void> {
+    const u = new URL(url.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:'))
     const host = u.hostname
-    const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80
+    const port = u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80
     const path = `${u.pathname}${u.search}`
     const keyBytes = crypto.getRandomValues(new Uint8Array(16))
-    const key = Buffer.from(keyBytes).toString("base64")
-    const acceptDigest = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(key + WS_GUID))
-    this.expectedAccept = Buffer.from(new Uint8Array(acceptDigest)).toString("base64")
+    const key = Buffer.from(keyBytes).toString('base64')
+    const acceptDigest = await crypto.subtle.digest(
+      'SHA-1',
+      new TextEncoder().encode(key + WS_GUID),
+    )
+    this.expectedAccept = Buffer.from(new Uint8Array(acceptDigest)).toString(
+      'base64',
+    )
 
     const lower: Record<string, string> = {}
     for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v
@@ -97,63 +111,76 @@ export class RawWebSocket {
       `Sec-WebSocket-Key: ${key}`,
     ]
     for (const name of CODEX_APP_HEADER_ORDER) {
-      if (lower[name] !== undefined) lines.push(`${canonical(name)}: ${lower[name]}`)
+      if (lower[name] !== undefined)
+        lines.push(`${canonical(name)}: ${lower[name]}`)
     }
     for (const [k, v] of Object.entries(headers)) {
-      if (!CODEX_APP_HEADER_ORDER.includes(k.toLowerCase()) && k.toLowerCase() !== "content-length") {
+      if (
+        !CODEX_APP_HEADER_ORDER.includes(k.toLowerCase()) &&
+        k.toLowerCase() !== 'content-length'
+      ) {
         lines.push(`${k}: ${v}`)
       }
     }
-    const request = lines.join("\r\n") + "\r\n\r\n"
+    const request = lines.join('\r\n') + '\r\n\r\n'
 
     try {
-      const connectFn = Bun.connect as unknown as (opts: unknown) => Promise<unknown>
+      const connectFn = Bun.connect as unknown as (
+        opts: unknown,
+      ) => Promise<unknown>
       this.socket = (await connectFn({
         hostname: host,
         port,
         tls: { serverName: host, rejectUnauthorized: false },
         socket: {
-          open: (s: { write(d: Uint8Array | string): number }) => s.write(request),
+          open: (s: { write(d: Uint8Array | string): number }) =>
+            s.write(request),
           data: (_s: unknown, d: Uint8Array) => this.onData(d),
           error: (_s: unknown, e: unknown) => {
             this.readyState = 3
-            this.emit("error", { message: e instanceof Error ? e.message : String(e) })
+            this.emit('error', {
+              message: e instanceof Error ? e.message : String(e),
+            })
           },
           close: () => {
             this.readyState = 3
-            this.emit("close", { code: 1006, reason: "socket closed" })
+            this.emit('close', { code: 1006, reason: 'socket closed' })
           },
         },
       })) as unknown as typeof this.socket
     } catch (e) {
       this.readyState = 3
-      this.emit("error", { message: e instanceof Error ? e.message : String(e) })
+      this.emit('error', {
+        message: e instanceof Error ? e.message : String(e),
+      })
     }
   }
 
   private onData(d: Uint8Array): void {
     this.rxBuffer = concat(this.rxBuffer, d)
     if (!this.handshakeDone) {
-      const text = Buffer.from(this.rxBuffer).toString("latin1")
-      const idx = text.indexOf("\r\n\r\n")
+      const text = Buffer.from(this.rxBuffer).toString('latin1')
+      const idx = text.indexOf('\r\n\r\n')
       if (idx === -1) return
       const headerText = text.slice(0, idx)
-      const statusLine = headerText.split("\r\n")[0] ?? ""
+      const statusLine = headerText.split('\r\n')[0] ?? ''
       const acceptMatch = headerText.match(/sec-websocket-accept:\s*(\S+)/i)
-      if (!statusLine.includes(" 101")) {
+      if (!statusLine.includes(' 101')) {
         this.readyState = 3
-        this.emit("error", { message: `WS upgrade failed: ${statusLine}` })
+        this.emit('error', { message: `WS upgrade failed: ${statusLine}` })
         return
       }
       if (!acceptMatch || acceptMatch[1] !== this.expectedAccept) {
         this.readyState = 3
-        this.emit("error", { message: "WS upgrade Sec-WebSocket-Accept mismatch" })
+        this.emit('error', {
+          message: 'WS upgrade Sec-WebSocket-Accept mismatch',
+        })
         return
       }
       this.handshakeDone = true
       this.readyState = 1
       this.rxBuffer = this.rxBuffer.slice(idx + 4)
-      this.emit("open", {})
+      this.emit('open', {})
     }
     this.drainFrames()
   }
@@ -198,10 +225,10 @@ export class RawWebSocket {
     if (opcode === 0x8) {
       // close
       let code = 1005
-      let reason = ""
+      let reason = ''
       if (payload.length >= 2) {
         code = (payload[0]! << 8) | payload[1]!
-        reason = Buffer.from(payload.slice(2)).toString("utf-8")
+        reason = Buffer.from(payload.slice(2)).toString('utf-8')
       }
       this.readyState = 3
       try {
@@ -209,7 +236,7 @@ export class RawWebSocket {
       } catch {
         /* ignore */
       }
-      this.emit("close", { code, reason })
+      this.emit('close', { code, reason })
       return
     }
     // data frame: 0x1 text, 0x2 binary, 0x0 continuation
@@ -223,8 +250,8 @@ export class RawWebSocket {
     const full = concatAll(this.fragChunks)
     this.fragChunks = []
     if (this.fragOpcode === 0x1) {
-      const text = Buffer.from(full).toString("utf-8")
-      this.emit("message", { data: text })
+      const text = Buffer.from(full).toString('utf-8')
+      this.emit('message', { data: text })
     }
   }
 
@@ -238,7 +265,8 @@ export class RawWebSocket {
     const mask = crypto.getRandomValues(new Uint8Array(4))
     let header: number[]
     if (len < 126) header = [0x80 | opcode, 0x80 | len]
-    else if (len < 65536) header = [0x80 | opcode, 0x80 | 126, (len >> 8) & 0xff, len & 0xff]
+    else if (len < 65536)
+      header = [0x80 | opcode, 0x80 | 126, (len >> 8) & 0xff, len & 0xff]
     else {
       header = [0x80 | opcode, 0x80 | 127]
       for (let i = 7; i >= 0; i--) header.push((len / 2 ** (8 * i)) & 0xff)

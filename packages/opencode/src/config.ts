@@ -10,9 +10,9 @@
 // Resolution per setting: an explicitly-set env var wins; otherwise the config
 // file value; otherwise the default.
 
-import { readFileSync } from "node:fs"
-import { homedir } from "node:os"
-import { join } from "node:path"
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 /** Shape of ~/.config/opencode/openai-auth.json (all fields optional). */
 export interface OpenAIAuthConfig {
@@ -33,31 +33,40 @@ export interface ResolvedSettings {
   imageGeneration: boolean
 }
 
-const CONFIG_FILE_NAME = "openai-auth.json"
+const CONFIG_FILE_NAME = 'openai-auth.json'
 
 const ENV = {
   // Negative for back-compat: presence disables the (default-on) web_search cache fix.
-  noWebSearch: "CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH",
-  webSockets: "CORTEXKIT_OPENAI_AUTH_WEBSOCKETS",
-  rawWebSocket: "CORTEXKIT_OPENAI_AUTH_RAW_WS",
-  imageGeneration: "CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION",
-  configFile: "OPENCODE_OPENAI_AUTH_FILE",
-  configDir: "OPENCODE_CONFIG_DIR",
+  noWebSearch: 'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
+  webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
+  rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
+  imageGeneration: 'CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION',
+  configFile: 'OPENCODE_OPENAI_AUTH_FILE',
+  configDir: 'OPENCODE_CONFIG_DIR',
 } as const
 
 function getConfigDir(): string {
-  if (process.env[ENV.configDir]?.trim()) return process.env[ENV.configDir]!.trim()
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")
+  if (process.env[ENV.configDir]?.trim())
+    return process.env[ENV.configDir]!.trim()
+  return join(
+    process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
+    'opencode',
+  )
 }
 
 export function getConfigPath(): string {
-  return process.env[ENV.configFile]?.trim() || join(getConfigDir(), CONFIG_FILE_NAME)
+  return (
+    process.env[ENV.configFile]?.trim() ||
+    join(getConfigDir(), CONFIG_FILE_NAME)
+  )
 }
 
 function readConfigFile(): OpenAIAuthConfig {
   try {
-    const parsed = JSON.parse(readFileSync(getConfigPath(), "utf8"))
-    return parsed != null && typeof parsed === "object" && !Array.isArray(parsed)
+    const parsed = JSON.parse(readFileSync(getConfigPath(), 'utf8'))
+    return parsed != null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed)
       ? (parsed as OpenAIAuthConfig)
       : {}
   } catch {
@@ -71,15 +80,20 @@ function envBool(name: string): boolean | undefined {
   const raw = process.env[name]
   if (raw === undefined) return undefined
   const v = raw.trim().toLowerCase()
-  if (v === "" || v === "0" || v === "false" || v === "no" || v === "off") return false
+  if (v === '' || v === '0' || v === 'false' || v === 'no' || v === 'off')
+    return false
   return true
 }
 
 /** env (if explicitly set) overrides config (if set) overrides default. */
-function resolveBool(envName: string, configValue: boolean | undefined, def: boolean): boolean {
+function resolveBool(
+  envName: string,
+  configValue: boolean | undefined,
+  def: boolean,
+): boolean {
   const fromEnv = envBool(envName)
   if (fromEnv !== undefined) return fromEnv
-  if (typeof configValue === "boolean") return configValue
+  if (typeof configValue === 'boolean') return configValue
   return def
 }
 
@@ -89,12 +103,20 @@ function resolve(): ResolvedSettings {
   // explicitly set it always wins; otherwise the positive config field, otherwise default true.
   const noWebSearchEnv = envBool(ENV.noWebSearch)
   const webSearch =
-    noWebSearchEnv !== undefined ? !noWebSearchEnv : typeof config.webSearch === "boolean" ? config.webSearch : true
+    noWebSearchEnv !== undefined
+      ? !noWebSearchEnv
+      : typeof config.webSearch === 'boolean'
+        ? config.webSearch
+        : true
   return {
     webSearch,
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
-    imageGeneration: resolveBool(ENV.imageGeneration, config.imageGeneration, false),
+    imageGeneration: resolveBool(
+      ENV.imageGeneration,
+      config.imageGeneration,
+      false,
+    ),
   }
 }
 
