@@ -1,8 +1,10 @@
+import { createServer } from 'node:http'
 import os from 'node:os'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
-import { createServer } from 'http'
+
 import { getSettings } from './config'
+import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import { PackageVersion } from './version'
 import { OpenAIWebSocketPool } from './ws-pool'
 
@@ -195,6 +197,7 @@ function prepareCodexRequest(input: {
   metadata: CodexSessionMetadata | undefined
   installationID: string
   websocket: boolean
+  dumpSessionID?: string
 }): PreparedCodexRequest {
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
@@ -234,6 +237,8 @@ function prepareCodexRequest(input: {
   input.headers.set('x-codex-turn-metadata', turnMetadata)
   input.headers.set('user-agent', CODEX_USER_AGENT)
   input.headers.set('version', CODEX_VERSION)
+  if (input.dumpSessionID)
+    input.headers.set(DUMP_SESSION_HEADER, input.dumpSessionID)
 
   const parsed = body
   if (!parsed) return { init: input.init }
@@ -803,14 +808,41 @@ export async function CodexAuthPlugin(
               websocket: Boolean(
                 websocketFetch && parsed.pathname.endsWith('/responses'),
               ),
+              dumpSessionID: sessionID,
             })
             const requestInit = prepared.init
             if (websocketFetch && parsed.pathname.endsWith('/responses'))
               return websocketFetch(url, requestInit)
-            return fetch(
-              url,
-              OpenAIWebSocketPool.withoutInternalHeaders(requestInit),
-            )
+            const finalInit =
+              OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
+            if (typeof finalInit?.body !== 'string')
+              return fetch(url, finalInit)
+            try {
+              const response = await fetch(url, finalInit)
+              await dumpCodexRequest({
+                sessionID,
+                transport: 'http',
+                phase: 'http',
+                bodyText: finalInit.body,
+                url: url.toString(),
+                method: finalInit.method,
+                headers: finalInit.headers,
+                status: response.status,
+              })
+              return response
+            } catch (error) {
+              await dumpCodexRequest({
+                sessionID,
+                transport: 'http',
+                phase: 'http',
+                bodyText: finalInit.body,
+                url: url.toString(),
+                method: finalInit.method,
+                headers: finalInit.headers,
+                error: error instanceof Error ? error.message : String(error),
+              })
+              throw error
+            }
           },
         }
       },

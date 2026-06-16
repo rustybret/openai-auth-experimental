@@ -1,8 +1,10 @@
+import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
 import { OpenAIWebSocket } from './ws'
 
 export const TITLE_HEADER = 'x-opencode-title'
+const INTERNAL_HEADERS = new Set([TITLE_HEADER, DUMP_SESSION_HEADER])
 
 export interface CreateWebSocketFetchOptions {
   httpFetch?: typeof globalThis.fetch
@@ -96,6 +98,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
 
     const sessionID =
       internalHeaders['x-session-affinity'] ?? internalHeaders['session-id']
+    const dumpSessionID = internalHeaders[DUMP_SESSION_HEADER] ?? sessionID
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
@@ -135,7 +138,12 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         init?.signal,
       )
       if (!entry.continuation) {
-        await prewarm(entry, sourceBody, idleTimeout, init?.signal ?? undefined)
+        await prewarm(entry, sourceBody, idleTimeout, {
+          signal: init?.signal ?? undefined,
+          sessionID: dumpSessionID,
+          url: options?.url ?? url,
+          headers: httpInit?.headers,
+        })
       }
       let resolveFirstEvent: (
         event: boolean | OpenAIWebSocket.WrappedError,
@@ -150,6 +158,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       const requestBody = orderCodexBody(
         applyTurnId(entry, withContinuation(entry, sourceBody)),
       )
+      await dumpCodexRequest({
+        sessionID: dumpSessionID,
+        transport: 'websocket',
+        phase: 'main',
+        bodyText: JSON.stringify(requestBody),
+        url: options?.url ?? url,
+        method: httpInit?.method,
+        headers: httpInit?.headers,
+      })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body: requestBody,
@@ -169,7 +186,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             invalidate(entry)
           }
         },
-        onConnectionInvalid: (error) => {
+        onConnectionInvalid: () => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
           if (!entry.fallback) recordStreamFailure(entry)
@@ -188,6 +205,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         onRetryableTerminal: async (event) => {
           const error = connectionLimitError(event)
           if (!error) return undefined
+          entry.fallback = true
           throw error
         },
       })
@@ -333,16 +351,30 @@ async function prewarm(
   entry: PoolEntry,
   body: Record<string, unknown>,
   idleTimeout: number,
-  signal?: AbortSignal,
+  options: {
+    signal?: AbortSignal
+    sessionID?: string
+    url?: string
+    headers?: HeadersInit
+  },
 ) {
   if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
     return
   const request = prewarmBody(body)
+  await dumpCodexRequest({
+    sessionID: options.sessionID,
+    transport: 'websocket',
+    phase: 'prewarm',
+    bodyText: JSON.stringify(request),
+    url: options.url,
+    method: 'POST',
+    headers: options.headers,
+  })
   const response = OpenAIWebSocket.streamResponsesWebSocket({
     socket: entry.socket,
     body: request,
     idleTimeout,
-    signal,
+    signal: options.signal,
     onComplete: (event) => updateContinuation(entry, request, event),
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
@@ -446,11 +478,6 @@ function normalizeResponseBody(body: Record<string, unknown>) {
   const next: Record<string, unknown> = { ...body }
   if (Array.isArray(body.input))
     next.input = body.input.map(normalizeResponseInputItem)
-  // Codex WS sends reasoning as { effort } only; it never requests reasoning summaries.
-  if (isRecord(body.reasoning) && 'summary' in body.reasoning) {
-    const { summary: _summary, ...reasoning } = body.reasoning
-    next.reasoning = reasoning
-  }
   return next
 }
 
@@ -551,6 +578,12 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
     entry.continuation = undefined
     return body
   }
+  if (entry.continuation.input.length === 0) {
+    return {
+      ...body,
+      previous_response_id: entry.continuation.responseID,
+    }
+  }
   const suffix = input.slice(entry.continuation.input.length)
   const nextInput = continuationInput(suffix)
   if (nextInput.length === 0) return body
@@ -635,7 +668,7 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   if (!init?.headers) return init
   if (init.headers instanceof Headers) {
     const headers = new Headers(init.headers)
-    headers.delete(TITLE_HEADER)
+    for (const header of INTERNAL_HEADERS) headers.delete(header)
     return { ...init, headers }
   }
 
@@ -643,7 +676,7 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
     return {
       ...init,
       headers: init.headers.filter(
-        (item) => item[0].toLowerCase() !== TITLE_HEADER,
+        (item) => !INTERNAL_HEADERS.has(item[0].toLowerCase()),
       ),
     }
   }
@@ -652,7 +685,7 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
     ...init,
     headers: Object.fromEntries(
       Object.entries(init.headers).filter(
-        ([key]) => key.toLowerCase() !== TITLE_HEADER,
+        ([key]) => !INTERNAL_HEADERS.has(key.toLowerCase()),
       ),
     ),
   }

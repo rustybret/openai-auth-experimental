@@ -38,6 +38,8 @@ Settings resolve as environment variable → config file (`~/.config/opencode/op
 | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of HTTP. |
 | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | Use a hand-rolled `Bun.connect` client with Codex-style incremental streaming. |
 | `imageGeneration` | `CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION` | `false` | Declare Codex's native `image_generation` tool. |
+| `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Dump final Codex request bodies for cache debugging. |
+| `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Directory for request dump files. |
 
 See the [repository README](https://github.com/cortexkit/openai-auth#readme) for transport differences and why `web_search` is needed.
 

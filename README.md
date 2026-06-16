@@ -62,7 +62,8 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
   "webSearch": true,
   "webSockets": false,
   "rawWebSocket": false,
-  "imageGeneration": false
+  "imageGeneration": false,
+  "dump": false
 }
 ```
 
@@ -72,6 +73,8 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 | WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](#transports). |
 | Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use a hand-rolled `Bun.connect` client that surfaces Codex-style incremental streaming. |
 | Image generation | `imageGeneration` | `CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION` | `false` | Declare Codex's native `image_generation` tool. End-to-end rendering in OpenCode is not yet verified — leave off unless you are testing it. |
+| Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt/session content. |
+| Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json`, and `.request.json` dump files. |
 
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
 
@@ -89,6 +92,14 @@ Example — disable the cache fix for one run via env:
 ```sh
 CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 opencode
 ```
+
+Example — capture request bodies while debugging cache behavior:
+
+```sh
+CORTEXKIT_OPENAI_AUTH_DUMP=1 opencode
+```
+
+Turn dumps off after debugging; `.body.json` files contain the full rewritten prompt/request body.
 
 ## Transports
 

@@ -11,7 +11,7 @@
 // file value; otherwise the default.
 
 import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 /** Shape of ~/.config/opencode/openai-auth.json (all fields optional). */
@@ -24,6 +24,10 @@ export interface OpenAIAuthConfig {
   rawWebSocket?: boolean
   /** Declare the native image_generation tool. Default false. */
   imageGeneration?: boolean
+  /** Dump final Codex request bodies for cache debugging. Default false. */
+  dump?: boolean
+  /** Directory for request dumps. Defaults to the OS temp directory. */
+  dumpDir?: string
 }
 
 export interface ResolvedSettings {
@@ -31,6 +35,8 @@ export interface ResolvedSettings {
   webSockets: boolean
   rawWebSocket: boolean
   imageGeneration: boolean
+  dump: boolean
+  dumpDir: string
 }
 
 const CONFIG_FILE_NAME = 'openai-auth.json'
@@ -41,6 +47,8 @@ const ENV = {
   webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
   imageGeneration: 'CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION',
+  dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
+  dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
   configDir: 'OPENCODE_CONFIG_DIR',
 } as const
@@ -117,6 +125,12 @@ function resolve(): ResolvedSettings {
       config.imageGeneration,
       false,
     ),
+    dump: resolveBool(ENV.dump, config.dump, false),
+    dumpDir:
+      process.env[ENV.dumpDir]?.trim() ||
+      (typeof config.dumpDir === 'string' && config.dumpDir.trim()
+        ? config.dumpDir.trim()
+        : join(tmpdir(), 'opencode-openai-auth-dumps')),
   }
 }
 
