@@ -2,19 +2,19 @@
 
 ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained by CortexKit.
 
-This repository extracts OpenCode's built-in OpenAI/Codex OAuth handling into a standalone OpenCode plugin so CortexKit can iterate on Codex HTTP/WebSocket transport behavior independently from OpenCode core.
+This plugin lets OpenCode talk to the OpenAI **Codex** backend (`https://chatgpt.com/backend-api/codex/responses`) using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, zeroes provider costs for those models, and adds a prompt-cache stabilizer that keeps tool-continuation requests on the backend's cached path.
 
-The plugin intentionally registers the built-in `openai` provider id. OpenCode loads external server plugins after internal plugins, so this package is designed to supersede OpenCode's internal OpenAI auth hook without changing user model configuration.
+The plugin intentionally registers the built-in `openai` provider id. OpenCode loads external server plugins after its internal ones, so this package supersedes OpenCode's internal OpenAI auth hook without any change to your model configuration.
 
 ## Package
 
 | Package | Agent | Purpose |
 | --- | --- | --- |
-| `@cortexkit/opencode-openai-auth` | OpenCode | OpenCode plugin for ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, and OpenAI Responses WebSocket transport. |
+| `@cortexkit/opencode-openai-auth` | OpenCode | ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, prompt-cache stabilizer, and an optional OpenAI Responses WebSocket transport. |
 
 ## Install
 
-Add the plugin to your OpenCode configuration:
+Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json`):
 
 ```json
 {
@@ -22,7 +22,34 @@ Add the plugin to your OpenCode configuration:
 }
 ```
 
+Pinning is strongly recommended for any OpenCode plugin:
+
+```json
+{
+  "plugin": ["@cortexkit/opencode-openai-auth@0.1.0"]
+}
+```
+
 After changing plugin config, restart OpenCode.
+
+> [!TIP]
+> If OpenCode keeps using an old build, clear OpenCode's plugin cache with `rm -rf ~/.cache/opencode` and restart.
+
+### Authenticate
+
+Log in with OpenCode's normal auth command and pick the `openai` provider:
+
+```text
+/login openai
+```
+
+Three methods are offered:
+
+- **ChatGPT Pro/Plus (browser)** — opens the OpenAI authorization page and completes the login through a local callback. Use this on a machine with a browser.
+- **ChatGPT Pro/Plus (headless)** — device-code flow for remote or headless machines: you're shown a code to enter at the OpenAI device page from any browser.
+- **Manually enter API Key** — falls back to a standard pay-as-you-go OpenAI API key (no OAuth, normal billing).
+
+OAuth tokens are stored and refreshed by OpenCode's own auth store.
 
 ## Configuration
 
@@ -41,20 +68,123 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 
 | Setting | Config field | Environment variable | Default | Purpose |
 | --- | --- | --- | --- | --- |
-| Prompt-cache fix | `webSearch` | `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` (set to disable) | `true` | Injects a native `web_search` tool so Codex keeps tool-continuation requests on the stable prompt cache. The model does not invoke it on coding tasks; turning it off reintroduces intermittent cache "cliffs" (cached tokens dropping to 0 mid-turn). |
-| WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. |
+| Prompt-cache fix | `webSearch` | `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` (set to disable) | `true` | Appends a native `web_search` tool to the wire request so Codex keeps tool-continuation requests on the stable prompt cache. See [Why `web_search`](#why-web_search). |
+| WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](#transports). |
 | Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use a hand-rolled `Bun.connect` client that surfaces Codex-style incremental streaming. |
-| Image generation | `imageGeneration` | `CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION` | `false` | Declare Codex's native `image_generation` tool. |
+| Image generation | `imageGeneration` | `CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION` | `false` | Declare Codex's native `image_generation` tool. End-to-end rendering in OpenCode is not yet verified — leave off unless you are testing it. |
 
-Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty.
+Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
 
-## Transport
+Example — opt into the WebSocket transport via the config file:
 
-The plugin includes the OpenAI Responses WebSocket transport and request handling needed for stable Codex sessions. HTTP is the default; enable WebSockets with `webSockets`, and the hand-rolled streaming client with `rawWebSocket`.
+```json
+{
+  "webSockets": true,
+  "rawWebSocket": true
+}
+```
+
+Example — disable the cache fix for one run via env:
+
+```sh
+CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 opencode
+```
+
+## Transports
+
+The plugin can reach the Codex backend over plain HTTP or over the OpenAI Responses WebSocket. The transport choice does **not** affect prompt-cache behavior (the cache fix applies to all three); it only affects connection style and streaming.
+
+| Transport | Enable with | Streaming | Notes |
+| --- | --- | --- | --- |
+| HTTP (default) | — | Server-sent events | Simplest and the default. One request/response per turn step. |
+| Native WebSocket | `webSockets: true` | Coarse | Uses Bun's built-in WebSocket with a session-keyed connection pool and `previous_response_id` continuation chaining. Bun's native client batches frames, so streaming is coarser than Codex's. |
+| Hand-rolled WebSocket | `webSockets: true` + `rawWebSocket: true` | Codex-style incremental | A hand-rolled RFC 6455 client over `Bun.connect`. Exists only to surface Codex-style incremental streaming (token-by-token rather than batched); it is not required for the cache fix. |
+
+WebSocket continuation chaining relies on `previous_response_id`, which only resolves on the connection that produced it. A dropped or reconnected socket discards its continuation and starts a fresh chain.
+
+## Why `web_search`
+
+The Codex/OAuth backend has a prompt-cache quirk: on tool-continuation requests whose `tools` array contains **only** custom `function`-type tools (no OpenAI-native tool type), the cached prefix intermittently drops to zero mid-turn, re-billing the full prefix as uncached. Measured on a clean build, this happens on roughly 8–20% of tool-bearing requests across every transport.
+
+Appending a single native `web_search` tool to the wire `tools` array flips every tool-bearing request onto the backend's stable cache path and eliminates the drops. The behavior is specific to `web_search` — adding other native tools (image generation, extra dummy function tools) does not fix it — and it is independent of transport.
+
+Two things make this safe:
+
+- The model does not invoke `web_search` on coding tasks, so it acts as an invisible cache anchor. (It is server-executed, so a hypothetical invocation would run a real search — acceptable given it never fires in practice.)
+- Beyond removing the drops, anchoring the request also roughly doubles the steady cached prefix, so it is a net cost win, not just a stability fix.
+
+The fix is on by default. Disable it only for diagnostics, with `webSearch: false` or `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1`.
 
 ## Development
 
-```sh
-bun run typecheck
-bun run build
+Workspace layout:
+
+```text
+packages/opencode  OpenCode plugin
+scripts            Release and dev tooling
 ```
+
+Install dependencies:
+
+```bash
+bun install
+```
+
+Run checks:
+
+```bash
+bun run typecheck
+bun run test
+bun run build
+bun run lint
+bun run format:check
+```
+
+Inspect package contents before publishing:
+
+```bash
+bun run pack:opencode:dry
+```
+
+Test a local build with OpenCode:
+
+```bash
+bun run dev
+```
+
+This builds the plugin, symlinks the output into `.opencode/plugins/`, and starts `tsc --watch`. Restart OpenCode after starting the dev script and after rebuilds. Clean the local dev symlink with:
+
+```bash
+bun run dev:clean
+```
+
+## Release
+
+This repo uses CortexKit's tag-driven release workflow.
+
+Preview a release:
+
+```bash
+./scripts/release.sh 0.2.0 --dry
+```
+
+Create and push the release tag:
+
+```bash
+./scripts/release.sh 0.2.0
+```
+
+Wait for GitHub Actions:
+
+```bash
+./scripts/wait-release.sh v0.2.0
+```
+
+The release workflow runs checks, publishes `@cortexkit/opencode-openai-auth` to npm with provenance (npm Trusted Publishing / OIDC), and creates the GitHub release.
+
+> [!NOTE]
+> npm Trusted Publishing can only be configured after the package already exists on npm, so the **first** version must be published manually (`npm publish --access public` from `packages/opencode/`). Configure OIDC trusted publishing for the package afterward; subsequent tagged releases then publish through the workflow. The publish job already skips any version that is already on npm.
+
+## License
+
+MIT
