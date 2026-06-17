@@ -9,6 +9,7 @@
     "build": "cd packages/opencode && bun run build && cd ../pi && bun run build",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
+    "analyze:cache": "bun scripts/analyze-cache-cliffs.mjs",
     "test": "cd packages/opencode && bun run test",
     "typecheck": "cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck",
     "types": "bun run typecheck",

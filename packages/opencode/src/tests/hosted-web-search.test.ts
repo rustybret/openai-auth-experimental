@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
-  injectRecordedHostedWebSearchCalls,
-  recordHostedWebSearchEvent,
   rewriteHostedWebSearchReplay,
+  translateHostedWebSearchEvent,
+  translateHostedWebSearchResponse,
 } from '../hosted-web-search'
 
 describe('hosted web search replay', () => {
@@ -39,23 +39,74 @@ describe('hosted web search replay', () => {
     ])
   })
 
-  test('rewrites hosted item_reference from recorded raw web_search_call event', () => {
-    recordHostedWebSearchEvent(
-      {
-        type: 'response.output_item.done',
-        item: {
-          type: 'web_search_call',
-          id: 'ws_recorded',
-          status: 'completed',
-          action: { type: 'open_page', url: 'https://example.com' },
-        },
+  test('translates hosted web_search_call done event into a local function_call', () => {
+    const translated = translateHostedWebSearchEvent({
+      type: 'response.output_item.done',
+      item: {
+        type: 'web_search_call',
+        id: 'ws_recorded',
+        status: 'completed',
+        action: { type: 'open_page', url: 'https://example.com' },
       },
-      'session-a',
+    })
+
+    expect(translated).toEqual({
+      type: 'response.output_item.done',
+      item: {
+        type: 'function_call',
+        id: 'ws_recorded',
+        call_id: 'ws_recorded',
+        name: 'web_search',
+        arguments: '{"type":"open_page","url":"https://example.com"}',
+      },
+    })
+  })
+
+  test('drops hosted web_search_call lifecycle events', () => {
+    expect(
+      translateHostedWebSearchEvent({
+        type: 'response.output_item.added',
+        item: { type: 'web_search_call', id: 'ws_lifecycle' },
+      }),
+    ).toBeUndefined()
+    expect(
+      translateHostedWebSearchEvent({
+        type: 'response.web_search_call.searching',
+        item_id: 'ws_lifecycle',
+      }),
+    ).toBeUndefined()
+  })
+
+  test('translates hosted web_search_call SSE responses on HTTP fallback', async () => {
+    const response = translateHostedWebSearchResponse(
+      new Response(
+        [
+          'data: {"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_http"}}\n\n',
+          'data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_http","status":"completed","action":{"type":"search","query":"OpenAI docs"}}}\n\n',
+        ].join(''),
+        { headers: { 'content-type': 'text/event-stream' } },
+      ),
     )
+
+    await expect(response.text()).resolves.toBe(
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"ws_http","call_id":"ws_http","name":"web_search","arguments":"{\\"type\\":\\"search\\",\\"query\\":\\"OpenAI docs\\"}"}}\n\n',
+    )
+  })
+
+  test('rewrites hosted item_reference from translated raw web_search_call event', () => {
+    translateHostedWebSearchEvent({
+      type: 'response.output_item.done',
+      item: {
+        type: 'web_search_call',
+        id: 'ws_recorded_ref',
+        status: 'completed',
+        action: { type: 'open_page', url: 'https://example.com' },
+      },
+    })
 
     const body: Record<string, unknown> = {
       input: [
-        { type: 'item_reference', id: 'ws_recorded' },
+        { type: 'item_reference', id: 'ws_recorded_ref' },
         { role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
       ],
     }
@@ -68,44 +119,6 @@ describe('hosted web search replay', () => {
         action: { type: 'open_page', url: 'https://example.com' },
       },
       { role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
-    ])
-  })
-
-  test('injects recorded hosted web_search_call before latest assistant answer when OpenCode drops it', () => {
-    recordHostedWebSearchEvent(
-      {
-        type: 'response.output_item.done',
-        item: {
-          type: 'web_search_call',
-          id: 'ws_inject',
-          status: 'completed',
-          action: { type: 'search', query: 'OpenAI Responses' },
-        },
-      },
-      'session-b',
-    )
-
-    const body: Record<string, unknown> = {
-      input: [
-        { role: 'user', content: [{ type: 'input_text', text: 'search' }] },
-        {
-          role: 'assistant',
-          content: [{ type: 'output_text', text: 'answer' }],
-        },
-        { role: 'user', content: [{ type: 'input_text', text: 'follow up' }] },
-      ],
-    }
-
-    expect(injectRecordedHostedWebSearchCalls(body, 'session-b')).toBe(true)
-    expect(body.input).toEqual([
-      { role: 'user', content: [{ type: 'input_text', text: 'search' }] },
-      {
-        type: 'web_search_call',
-        status: 'completed',
-        action: { type: 'search', query: 'OpenAI Responses' },
-      },
-      { role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
-      { role: 'user', content: [{ type: 'input_text', text: 'follow up' }] },
     ])
   })
 

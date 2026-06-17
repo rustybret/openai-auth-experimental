@@ -4,14 +4,10 @@ import { isRecord } from './util/record'
 
 const HOSTED_WEB_SEARCH_ID_PREFIX = 'ws_'
 const hostedWebSearchItems = new Map<string, Record<string, unknown>>()
-const hostedWebSearchItemsBySession = new Map<
-  string,
-  Array<{ id: string; item: Record<string, unknown> }>
->()
 
 export const HostedWebSearchTool: ToolDefinition = tool({
   description:
-    'Provider-executed OpenAI web search. This tool is handled server-side by OpenAI; the local plugin only records the hosted item for replay.',
+    'Provider-executed OpenAI web search. This tool is handled server-side by OpenAI; the local plugin records the hosted action for deterministic replay.',
   args: {
     type: tool.schema.string().optional(),
     query: tool.schema.string().optional(),
@@ -21,13 +17,38 @@ export const HostedWebSearchTool: ToolDefinition = tool({
     return {
       title: 'OpenAI Web Search',
       output: JSON.stringify({ action: args }),
-      metadata: {
-        providerExecuted: true,
-        action: args,
-      },
+      metadata: { action: args },
     }
   },
 })
+
+export function translateHostedWebSearchEvent(event: Record<string, unknown>) {
+  if (isHostedWebSearchLifecycleEvent(event)) return undefined
+  if (!isHostedWebSearchDoneEvent(event)) return event
+  const item = event.item
+  hostedWebSearchItems.set(item.id, item)
+  return {
+    ...event,
+    item: {
+      type: 'function_call',
+      id: item.id,
+      call_id: item.id,
+      name: 'web_search',
+      arguments: JSON.stringify(isRecord(item.action) ? item.action : {}),
+    },
+  }
+}
+
+export function translateHostedWebSearchResponse(response: Response) {
+  if (!response.body) return response
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('text/event-stream')) return response
+  return new Response(translateHostedWebSearchSSE(response.body), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  })
+}
 
 export function rewriteHostedWebSearchReplay(body: Record<string, unknown>) {
   if (!Array.isArray(body.input)) return false
@@ -69,62 +90,95 @@ export function rewriteHostedWebSearchReplay(body: Record<string, unknown>) {
   return changed
 }
 
-export function recordHostedWebSearchEvent(
-  event: unknown,
-  sessionID: string | undefined,
-) {
-  if (!isRecord(event)) return
-  if (event.type !== 'response.output_item.done') return
-  if (!isRecord(event.item)) return
-  if (event.item.type !== 'web_search_call') return
-  if (typeof event.item.id !== 'string') return
-  const item = event.item
-  const id = event.item.id
-  hostedWebSearchItems.set(id, item)
-  if (!sessionID) return
-  const items = hostedWebSearchItemsBySession.get(sessionID) ?? []
-  if (!items.some((recorded) => recorded.id === id)) {
-    items.push({ id, item })
-    hostedWebSearchItemsBySession.set(sessionID, items)
+function isHostedWebSearchLifecycleEvent(event: Record<string, unknown>) {
+  if (
+    typeof event.type === 'string' &&
+    event.type.startsWith('response.web_search_call.')
+  ) {
+    return true
+  }
+  return (
+    event.type === 'response.output_item.added' &&
+    isRecord(event.item) &&
+    event.item.type === 'web_search_call'
+  )
+}
+
+function translateHostedWebSearchSSE(body: ReadableStream<Uint8Array>) {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let buffer = ''
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true })
+        let boundary = sseBoundary(buffer)
+        while (boundary) {
+          const frame = buffer.slice(0, boundary.index)
+          buffer = buffer.slice(boundary.index + boundary.length)
+          const translated = translateSSEFrame(frame)
+          if (translated) controller.enqueue(encoder.encode(translated))
+          boundary = sseBoundary(buffer)
+        }
+      },
+      flush(controller) {
+        buffer += decoder.decode()
+        if (!buffer) return
+        const translated = translateSSEFrame(buffer)
+        if (translated) controller.enqueue(encoder.encode(translated))
+      },
+    }),
+  )
+}
+
+function sseBoundary(
+  buffer: string,
+): { index: number; length: number } | undefined {
+  const lf = buffer.indexOf('\n\n')
+  const crlf = buffer.indexOf('\r\n\r\n')
+  if (lf === -1) return crlf === -1 ? undefined : { index: crlf, length: 4 }
+  if (crlf === -1 || lf < crlf) return { index: lf, length: 2 }
+  return { index: crlf, length: 4 }
+}
+
+function translateSSEFrame(frame: string) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trimStart())
+    .join('\n')
+  if (!data) return `${frame}\n\n`
+  if (data === '[DONE]') return `data: [DONE]\n\n`
+  try {
+    const event = JSON.parse(data)
+    if (!isRecord(event)) return `${frame}\n\n`
+    const translated = translateHostedWebSearchEvent(event)
+    if (!translated) return ''
+    return `data: ${JSON.stringify(translated)}\n\n`
+  } catch {
+    return `${frame}\n\n`
   }
 }
 
-export function injectRecordedHostedWebSearchCalls(
-  body: Record<string, unknown>,
-  sessionID: string | undefined,
-) {
-  if (!sessionID) return false
-  if (!Array.isArray(body.input)) return false
-  const recorded = hostedWebSearchItemsBySession.get(sessionID)
-  if (!recorded?.length) return false
-
-  const existingActionKeys = new Set<string>()
-  for (const item of body.input) {
-    if (!isRecord(item) || item.type !== 'web_search_call') continue
-    if (isRecord(item.action))
-      existingActionKeys.add(stableActionKey(item.action))
-  }
-
-  const missing = recorded
-    .map(({ item }) => toCodexWebSearchCall(String(item.id ?? ''), item))
-    .filter((item) => {
-      if (!isRecord(item.action)) return true
-      return !existingActionKeys.has(stableActionKey(item.action))
-    })
-  if (!missing.length) return false
-
-  const insertAt = insertionIndex(body.input)
-  body.input = [
-    ...body.input.slice(0, insertAt),
-    ...missing,
-    ...body.input.slice(insertAt),
-  ]
-  return true
+function isHostedWebSearchDoneEvent(
+  event: Record<string, unknown>,
+): event is Record<string, unknown> & {
+  item: Record<string, unknown> & { id: string; action?: unknown }
+} {
+  return (
+    event.type === 'response.output_item.done' &&
+    isRecord(event.item) &&
+    event.item.type === 'web_search_call' &&
+    typeof event.item.id === 'string'
+  )
 }
 
-function isHostedWebSearchFunctionCall(
-  item: unknown,
-): item is { type: 'function_call'; call_id: string; name: string } {
+function isHostedWebSearchFunctionCall(item: unknown): item is {
+  type: 'function_call'
+  call_id: string
+  name: string
+  arguments?: string
+} {
   return (
     isRecord(item) &&
     item.type === 'function_call' &&
@@ -167,9 +221,7 @@ function toCodexWebSearchCall(
   const parsed = parseOutput(output)
   const action = isRecord(parsed?.action)
     ? parsed.action
-    : isRecord(call?.arguments)
-      ? call.arguments
-      : undefined
+    : parseArguments(call?.arguments)
 
   return {
     type: 'web_search_call',
@@ -189,23 +241,13 @@ function parseOutput(output: unknown): Record<string, unknown> | undefined {
   }
 }
 
-function insertionIndex(input: unknown[]) {
-  let lastUserIndex = -1
-  for (let index = input.length - 1; index >= 0; index--) {
-    const item = input[index]
-    if (isRecord(item) && item.role === 'user') {
-      lastUserIndex = index
-      break
-    }
+function parseArguments(args: unknown): Record<string, unknown> | undefined {
+  if (isRecord(args)) return args
+  if (typeof args !== 'string') return undefined
+  try {
+    const parsed = JSON.parse(args)
+    return isRecord(parsed) ? parsed : undefined
+  } catch {
+    return undefined
   }
-  if (lastUserIndex === -1) return input.length
-  for (let index = lastUserIndex - 1; index >= 0; index--) {
-    const item = input[index]
-    if (isRecord(item) && item.role === 'assistant') return index
-  }
-  return lastUserIndex
-}
-
-function stableActionKey(action: Record<string, unknown>) {
-  return JSON.stringify(action, Object.keys(action).sort())
 }

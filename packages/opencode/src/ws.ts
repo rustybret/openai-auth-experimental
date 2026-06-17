@@ -3,7 +3,7 @@
 
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
-import { recordHostedWebSearchEvent } from './hosted-web-search'
+import { translateHostedWebSearchEvent } from './hosted-web-search'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
 import { errorMessage } from './util/error'
@@ -344,14 +344,23 @@ export function streamResponsesWebSocket(
     }
 
     if (event) {
-      recordHostedWebSearchEvent(event, options.sessionID)
       void logProviderNativeWebSearchEvent(event, options.sessionID)
     }
+
+    const translatedEvent = event ? translateHostedWebSearchEvent(event) : event
+    if (!translatedEvent) {
+      if (!emitted) options.onFirstEvent?.()
+      emitted = true
+      resetIdleTimeout('idle timeout waiting for websocket')
+      return
+    }
+    const outputText =
+      translatedEvent === event ? text : JSON.stringify(translatedEvent)
 
     if (!emitted) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
-        `${text
+        `${outputText
           .split(/\r?\n/)
           .map((line) => `data: ${line}`)
           .join('\n')}\n\n`,
@@ -360,23 +369,26 @@ export function streamResponsesWebSocket(
     emitted = true
     resetIdleTimeout('idle timeout waiting for websocket')
 
-    if (!event) return
+    if (!translatedEvent) return
 
-    if (event.type === 'response.completed' || event.type === 'response.done') {
+    if (
+      translatedEvent.type === 'response.completed' ||
+      translatedEvent.type === 'response.done'
+    ) {
       completed = true
-      options.onComplete?.(event)
-      options.onTerminal?.(event)
+      options.onComplete?.(translatedEvent)
+      options.onTerminal?.(translatedEvent)
       closeCompleted()
       return
     }
 
     if (
-      event.type === 'response.failed' ||
-      event.type === 'response.incomplete' ||
-      event.type === 'error'
+      translatedEvent.type === 'response.failed' ||
+      translatedEvent.type === 'response.incomplete' ||
+      translatedEvent.type === 'error'
     ) {
       completed = true
-      options.onTerminal?.(event)
+      options.onTerminal?.(translatedEvent)
       closeCompleted()
     }
   }

@@ -9,8 +9,8 @@ import { getConfigDir, getSettings } from './config'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import {
   HostedWebSearchTool,
-  injectRecordedHostedWebSearchCalls,
   rewriteHostedWebSearchReplay,
+  translateHostedWebSearchResponse,
 } from './hosted-web-search'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
@@ -338,7 +338,6 @@ function prepareCodexRequest(input: {
   removeHostedWebSearchFunctionTool(parsed)
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
-  injectRecordedHostedWebSearchCalls(parsed, input.dumpSessionID)
   maybeInjectCacheStabilizerTool(parsed)
   maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
@@ -965,7 +964,7 @@ export async function CodexAuthPlugin(
                 headers: finalInit.headers,
                 status: response.status,
               })
-              return response
+              return translateHostedWebSearchResponse(response)
             } catch (error) {
               await dumpCodexRequest({
                 sessionID,
