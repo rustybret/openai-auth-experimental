@@ -7,6 +7,11 @@ import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
 
 import { getConfigDir, getSettings } from './config'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
+import {
+  HostedWebSearchTool,
+  injectRecordedHostedWebSearchCalls,
+  rewriteHostedWebSearchReplay,
+} from './hosted-web-search'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
@@ -330,6 +335,10 @@ function prepareCodexRequest(input: {
   parsed.parallel_tool_calls ??= true
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
+  removeHostedWebSearchFunctionTool(parsed)
+  removeExaWebSearchFunctionTool(parsed)
+  rewriteHostedWebSearchReplay(parsed)
+  injectRecordedHostedWebSearchCalls(parsed, input.dumpSessionID)
   maybeInjectCacheStabilizerTool(parsed)
   maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
@@ -377,10 +386,34 @@ function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
     ...parsed.tools,
     {
       type: 'web_search',
-      external_web_access: true,
+      external_web_access: false,
       search_content_types: ['text', 'image'],
     },
   ]
+}
+
+function removeHostedWebSearchFunctionTool(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.tools)) return
+  parsed.tools = parsed.tools.filter(
+    (item) =>
+      !(
+        isRecord(item) &&
+        item.type === 'function' &&
+        item.name === 'web_search'
+      ),
+  )
+}
+
+function removeExaWebSearchFunctionTool(parsed: Record<string, unknown>) {
+  if (!Array.isArray(parsed.tools)) return
+  parsed.tools = parsed.tools.filter(
+    (item) =>
+      !(
+        isRecord(item) &&
+        item.type === 'function' &&
+        item.name === 'websearch_web_search_exa'
+      ),
+  )
 }
 
 // Optional native image generation (opt-in via config `imageGeneration: true` or
@@ -769,6 +802,9 @@ export async function CodexAuthPlugin(
             ]),
         )
       },
+    },
+    tool: {
+      web_search: HostedWebSearchTool,
     },
     auth: {
       provider: 'openai',

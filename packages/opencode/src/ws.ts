@@ -2,7 +2,8 @@
 // fallback, and continuation state intentionally live above this file.
 
 import { APICallError } from 'ai'
-import { DUMP_SESSION_HEADER } from './dump'
+import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
+import { recordHostedWebSearchEvent } from './hosted-web-search'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
 import { errorMessage } from './util/error'
@@ -76,6 +77,7 @@ export interface ConnectResponsesWebSocketOptions {
 export interface StreamResponsesWebSocketOptions {
   socket: WebSocket
   body: Record<string, unknown>
+  sessionID?: string
   idleTimeout?: number
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
@@ -341,6 +343,11 @@ export function streamResponsesWebSocket(
       return
     }
 
+    if (event) {
+      recordHostedWebSearchEvent(event, options.sessionID)
+      void logProviderNativeWebSearchEvent(event, options.sessionID)
+    }
+
     if (!emitted) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
@@ -458,6 +465,38 @@ export function streamResponsesWebSocket(
       headers: { 'content-type': 'text/event-stream' },
     },
   )
+}
+
+async function logProviderNativeWebSearchEvent(
+  event: Record<string, unknown>,
+  sessionID: string | undefined,
+) {
+  if (!isProviderNativeWebSearchEvent(event)) return
+  await dumpDiagnostic({
+    component: 'ws',
+    event: 'provider_native_web_search_event',
+    sessionID,
+    serverEventType: event.type,
+    itemType: isRecord(event.item) ? event.item.type : undefined,
+    serverEvent: event,
+  })
+}
+
+function isProviderNativeWebSearchEvent(event: Record<string, unknown>) {
+  if (
+    typeof event.type === 'string' &&
+    (event.type.startsWith('response.web_search_call.') ||
+      event.type.startsWith('response.web_search_preview_call.'))
+  ) {
+    return true
+  }
+  if (isRecord(event.item) && typeof event.item.type === 'string') {
+    return (
+      event.item.type === 'web_search_call' ||
+      event.item.type === 'web_search_preview_call'
+    )
+  }
+  return false
 }
 
 function parseWrappedError(

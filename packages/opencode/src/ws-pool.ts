@@ -1,4 +1,4 @@
-import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
+import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
@@ -177,10 +177,20 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body: requestBody,
+        sessionID: dumpSessionID ?? undefined,
         idleTimeout,
         signal: init?.signal ?? undefined,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
-        onComplete: (event) => updateContinuation(entry, sourceBody, event),
+        onComplete: (event) => {
+          void dumpDiagnostic({
+            component: 'ws-pool',
+            event: 'main_completed',
+            sessionID: dumpSessionID,
+            responseID: responseID(event),
+            usage: responseUsage(event),
+          })
+          updateContinuation(entry, sourceBody, event)
+        },
         onTerminal: (event) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
@@ -396,9 +406,19 @@ async function prewarm(
   const response = OpenAIWebSocket.streamResponsesWebSocket({
     socket: entry.socket,
     body: request,
+    sessionID: options.sessionID,
     idleTimeout,
     signal: options.signal,
-    onComplete: (event) => updateContinuation(entry, request, event),
+    onComplete: (event) => {
+      void dumpDiagnostic({
+        component: 'ws-pool',
+        event: 'prewarm_completed',
+        sessionID: options.sessionID,
+        responseID: responseID(event),
+        usage: responseUsage(event),
+      })
+      updateContinuation(entry, request, event)
+    },
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
         entry.continuation = undefined
@@ -411,6 +431,18 @@ async function prewarm(
     },
   })
   await drain(response)
+}
+
+function responseID(event: Record<string, unknown>) {
+  const response = event.response
+  if (!isRecord(response)) return undefined
+  return typeof response.id === 'string' ? response.id : undefined
+}
+
+function responseUsage(event: Record<string, unknown>) {
+  const response = event.response
+  if (!isRecord(response)) return undefined
+  return isRecord(response.usage) ? response.usage : undefined
 }
 
 async function drain(response: Response) {
