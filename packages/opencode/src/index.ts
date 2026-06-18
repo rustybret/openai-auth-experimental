@@ -20,7 +20,6 @@ import { OpenAIWebSocketPool } from './ws-pool'
 
 const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const ISSUER = 'https://auth.openai.com'
-const CODEX_API_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses'
 const OAUTH_PORT = 1455
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set([
@@ -724,8 +723,9 @@ export async function CodexAuthPlugin(
   input: PluginInput,
   options: CodexAuthPluginOptions = {},
 ): Promise<Hooks> {
+  const settings = getSettings()
   const issuer = options.issuer ?? ISSUER
-  const codexApiEndpoint = options.codexApiEndpoint ?? CODEX_API_ENDPOINT
+  const codexApiEndpoint = options.codexApiEndpoint ?? settings.codexApiEndpoint
   const installationID = crypto.randomUUID()
   const codexSessions = loadCodexSessions()
   const persistCodexSessions = () => saveCodexSessions(codexSessions)
@@ -792,7 +792,7 @@ export async function CodexAuthPlugin(
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
-              rawWebSocket: getSettings().rawWebSocket,
+              rawWebSocket: settings.rawWebSocket,
             })
           : undefined
         if (websocketFetch) {
@@ -1114,8 +1114,13 @@ export async function CodexAuthPlugin(
   }
 }
 
-export const OpenAIAuthPlugin: Plugin = async (input) =>
-  CodexAuthPlugin(input, { experimentalWebSockets: getSettings().webSockets })
+export const OpenAIAuthPlugin: Plugin = async (input) => {
+  const settings = getSettings()
+  return CodexAuthPlugin(input, {
+    codexApiEndpoint: settings.codexApiEndpoint,
+    experimentalWebSockets: settings.webSockets,
+  })
+}
 
 export default {
   id: 'cortexkit-openai-auth',

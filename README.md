@@ -62,7 +62,8 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
   "webSearch": true,
   "webSockets": false,
   "rawWebSocket": false,
-  "dump": false
+  "dump": false,
+  "codexApiEndpoint": "https://chatgpt.com/backend-api/codex/responses"
 }
 ```
 
@@ -73,6 +74,7 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 | Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. |
 | Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt/session content. |
 | Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json`, and `.request.json` dump files. |
+| Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy/relay instead of ChatGPT's backend endpoint. |
 
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
 
@@ -89,6 +91,12 @@ Example — disable the cache fix for one run via env:
 
 ```sh
 CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 opencode
+```
+
+Example — route OAuth/Codex traffic through a local Codex-compatible proxy:
+
+```sh
+CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT=http://127.0.0.1:8899/v1/responses opencode
 ```
 
 Example — capture request bodies while debugging cache behavior:

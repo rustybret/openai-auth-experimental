@@ -1,14 +1,122 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PluginInput } from '@opencode-ai/plugin'
 
-import { resetSettingsForTest } from '../config'
+import {
+  DEFAULT_CODEX_API_ENDPOINT,
+  getSettings,
+  resetSettingsForTest,
+} from '../config'
 import { resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin } from '../index'
 
 describe('request dumps', () => {
+  test('resolves configured Codex endpoint with env-over-config precedence', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'openai-auth-endpoint-test-'))
+    const configPath = join(dir, 'openai-auth.json')
+    const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    const originalEndpoint = process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT
+    try {
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          codexApiEndpoint: 'http://127.0.0.1:8899/v1/responses',
+        }),
+      )
+      process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
+      delete process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT
+      resetSettingsForTest()
+      expect(getSettings().codexApiEndpoint).toBe(
+        'http://127.0.0.1:8899/v1/responses',
+      )
+
+      process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT =
+        'http://127.0.0.1:9900/v1/responses'
+      resetSettingsForTest()
+      expect(getSettings().codexApiEndpoint).toBe(
+        'http://127.0.0.1:9900/v1/responses',
+      )
+    } finally {
+      restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
+      restoreEnv('CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT', originalEndpoint)
+      resetSettingsForTest()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('routes Codex HTTP requests to configured endpoint without changing body shape', async () => {
+    const originalFetch = globalThis.fetch
+    const originalEndpoint = process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT
+    const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    const seen: Array<{ url: string; body: Record<string, unknown> }> = []
+    process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT =
+      'http://127.0.0.1:8899/v1/responses'
+    process.env.OPENCODE_OPENAI_AUTH_FILE = join(
+      tmpdir(),
+      'missing-openai-auth.json',
+    )
+    resetSettingsForTest()
+    globalThis.fetch = Object.assign(
+      async (url: RequestInfo | URL, init?: RequestInit) => {
+        seen.push({
+          url: url.toString(),
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+        })
+        return new Response('ok', { status: 200 })
+      },
+      { preconnect: () => {} },
+    )
+    try {
+      const hooks = await CodexAuthPlugin(pluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetch = await pluginFetch(hooks)
+      await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-session-affinity': 'ses_endpoint',
+        },
+        body: JSON.stringify({ ...toolRequestBody(), store: false }),
+      })
+
+      expect(seen).toHaveLength(1)
+      expect(seen[0]?.url).toBe('http://127.0.0.1:8899/v1/responses')
+      expect(seen[0]?.body.store).toBe(false)
+      expect(typeof seen[0]?.body.prompt_cache_key).toBe('string')
+      expect(
+        (seen[0]?.body.tools as Array<Record<string, unknown>>).some(
+          (tool) => tool.type === 'web_search',
+        ),
+      ).toBe(true)
+    } finally {
+      globalThis.fetch = originalFetch
+      restoreEnv('CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT', originalEndpoint)
+      restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
+      resetSettingsForTest()
+    }
+  })
+
+  test('defaults Codex endpoint to ChatGPT backend', () => {
+    const originalEndpoint = process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT
+    const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_FILE = join(
+      tmpdir(),
+      'missing-openai-auth.json',
+    )
+    delete process.env.CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT
+    resetSettingsForTest()
+    try {
+      expect(getSettings().codexApiEndpoint).toBe(DEFAULT_CODEX_API_ENDPOINT)
+    } finally {
+      restoreEnv('CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT', originalEndpoint)
+      restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
+      resetSettingsForTest()
+    }
+  })
+
   test('does not install the Codex/WebSocket fetch for manual API-key auth', async () => {
     const hooks = await CodexAuthPlugin(pluginInput(), {
       experimentalWebSockets: true,

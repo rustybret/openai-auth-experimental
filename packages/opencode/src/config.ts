@@ -14,6 +14,9 @@ import { readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+export const DEFAULT_CODEX_API_ENDPOINT =
+  'https://chatgpt.com/backend-api/codex/responses'
+
 /** Shape of ~/.config/opencode/openai-auth.json (all fields optional). */
 export interface OpenAIAuthConfig {
   /** Inject the native web_search tool to keep the Codex prompt cache stable. Default true. */
@@ -26,6 +29,8 @@ export interface OpenAIAuthConfig {
   dump?: boolean
   /** Directory for request dumps. Defaults to the OS temp directory. */
   dumpDir?: string
+  /** Codex-compatible Responses endpoint. Defaults to ChatGPT's Codex backend. */
+  codexApiEndpoint?: string
 }
 
 export interface ResolvedSettings {
@@ -34,6 +39,7 @@ export interface ResolvedSettings {
   rawWebSocket: boolean
   dump: boolean
   dumpDir: string
+  codexApiEndpoint: string
 }
 
 const CONFIG_FILE_NAME = 'openai-auth.json'
@@ -45,6 +51,7 @@ const ENV = {
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
   dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
+  codexApiEndpoint: 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
   configDir: 'OPENCODE_CONFIG_DIR',
 } as const
@@ -122,6 +129,12 @@ function resolve(): ResolvedSettings {
       (typeof config.dumpDir === 'string' && config.dumpDir.trim()
         ? config.dumpDir.trim()
         : join(tmpdir(), 'opencode-openai-auth-dumps')),
+    codexApiEndpoint:
+      process.env[ENV.codexApiEndpoint]?.trim() ||
+      (typeof config.codexApiEndpoint === 'string' &&
+      config.codexApiEndpoint.trim()
+        ? config.codexApiEndpoint.trim()
+        : DEFAULT_CODEX_API_ENDPOINT),
   }
 }
 
