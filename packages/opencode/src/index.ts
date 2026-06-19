@@ -1358,6 +1358,28 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            // Guard: only intercept requests destined for OpenAI or the
+            // configured Codex endpoint. Any other host (Google, Anthropic,
+            // OpenCode provider proxies, etc.) must pass through untouched so
+            // we don't strip their auth headers or inject a Codex token.
+            const reqUrl =
+              requestInput instanceof URL
+                ? requestInput
+                : new URL(
+                    typeof requestInput === 'string'
+                      ? requestInput
+                      : requestInput.url,
+                  )
+            const codexHost = new URL(codexApiEndpoint).hostname
+            const openaiHosts = new Set([
+              'api.openai.com',
+              'chatgpt.com',
+              codexHost,
+            ])
+            if (!openaiHosts.has(reqUrl.hostname)) {
+              return fetch(requestInput, init)
+            }
+
             // Select the active primary account for this request.
             const reqStorage = await loadRequestAccounts()
             const activeId = reqStorage?.routing?.activeId ?? 'main'
