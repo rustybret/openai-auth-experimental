@@ -35,8 +35,8 @@ The plugin intentionally registers the built-in `openai` provider id. OpenCode l
 **1. Build the plugin:**
 
 ```bash
-git clone https://github.com/rustybret/openai-auth.git
-cd openai-auth
+git clone https://github.com/rustybret/openai-auth-experimental.git
+cd openai-auth-experimental
 git checkout local/fork
 bun install
 bun run build   # output: packages/opencode/dist/index.js
