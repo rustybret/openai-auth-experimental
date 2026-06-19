@@ -416,7 +416,13 @@ describe('OAuth server concurrency (C1/C2)', () => {
       res.writeHead(200)
       res.end('busy')
     })
-    await new Promise<void>((resolve) => blocker.listen(OAUTH_PORT, resolve))
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject)
+      blocker.listen(OAUTH_PORT, '127.0.0.1', () => {
+        blocker.off('error', reject)
+        resolve()
+      })
+    })
 
     await expect(startOAuthServer()).rejects.toThrow()
 

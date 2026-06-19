@@ -433,12 +433,15 @@ export function stopOAuthServer() {
   if (oauthServer) {
     const server = oauthServer
     oauthServer = undefined
-    server.close(() => {})
     server.closeIdleConnections?.()
-    const closeConnections = setTimeout(() => {
+    server.close(() => {})
+    // Force-close any still-active connection (e.g. the in-flight response that
+    // triggered this stop) on the next tick, so the response can flush first but
+    // the port is released well within the test's 1s wait.
+    const forceClose = setTimeout(() => {
       server.closeAllConnections?.()
-    }, 25)
-    closeConnections.unref?.()
+    }, 0)
+    forceClose.unref?.()
   }
 }
 
