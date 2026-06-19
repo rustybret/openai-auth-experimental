@@ -1,6 +1,19 @@
+# openai-auth-experimental
+
+> **Fork notice:** This is a personal experimental fork of [cortexkit/openai-auth](https://github.com/cortexkit/openai-auth), maintained by [@rustybret](https://github.com/rustybret). All credit for the original plugin, architecture, and implementation goes to [CortexKit](https://github.com/cortexkit). This fork tracks the upstream `main` branch on the `local/fork` branch and integrates PRs ahead of their upstream release.
+>
+> **What's different from upstream:**
+> - PR #7 (`feat/parity`) — multi-account fallback, quota tracking, cache keep-warm, `/openai-account`, `/openai-quota`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-routing` commands, `openai-auth` CLI
+> - PR #6 — `@opencode-ai/plugin` bumped to 1.17.7
+> - PR #2 — `ai` package bumped to v6 (major)
+>
+> **Installation:** loaded from a local build path, not npm (see [Install](#install)).
+
+---
+
 # CortexKit OpenAI Auth for OpenCode
 
-ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained by CortexKit.
+ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained by [CortexKit](https://github.com/cortexkit).
 
 This plugin lets OpenCode talk to the OpenAI **Codex** backend (`https://chatgpt.com/backend-api/codex/responses`) using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, zeroes provider costs for those models, and adds a prompt-cache stabilizer that keeps tool-continuation requests on the backend's cached path.
 
@@ -16,26 +29,34 @@ The plugin intentionally registers the built-in `openai` provider id. OpenCode l
 
 ## Install
 
-Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json`):
+> [!NOTE]
+> This fork is loaded from a local build, not published to npm. The install steps below are for the local path workflow. For the upstream published package see [cortexkit/openai-auth](https://github.com/cortexkit/openai-auth).
+
+**1. Build the plugin:**
+
+```bash
+git clone https://github.com/rustybret/openai-auth.git
+cd openai-auth
+git checkout local/fork
+bun install
+bun run build   # output: packages/opencode/dist/index.js
+```
+
+**2. Point OpenCode at the local build** (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-openai-auth"]
+  "plugin": ["file:///path/to/openai-auth/packages/opencode/dist/index.js"]
 }
 ```
 
-Pinning is strongly recommended for any OpenCode plugin:
+**3. Clear the plugin cache and restart OpenCode:**
 
-```json
-{
-  "plugin": ["@cortexkit/opencode-openai-auth@0.1.0"]
-}
+```bash
+rm -rf ~/.cache/opencode
 ```
 
-After changing plugin config, restart OpenCode.
-
-> [!TIP]
-> If OpenCode keeps using an old build, clear OpenCode's plugin cache with `rm -rf ~/.cache/opencode` and restart.
+After any code change, re-run `bun run build` (from `packages/opencode/`) and restart OpenCode.
 
 ### Authenticate
 
