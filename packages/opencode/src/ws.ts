@@ -551,9 +551,18 @@ function cancelError(reason: unknown) {
 function abortError(signal: AbortSignal | undefined) {
   const reason = signal?.reason
   if (isAbortError(reason)) return reason
+  if (isProviderRetryableAbortReason(reason)) return reason
   return new DOMException(
     reason instanceof Error ? reason.message : 'Aborted',
     'AbortError',
+  )
+}
+
+function isProviderRetryableAbortReason(reason: unknown): reason is Error {
+  return (
+    reason instanceof Error &&
+    (reason.name === 'ProviderHeaderTimeoutError' ||
+      reason.name === 'ProviderResponseStreamError')
   )
 }
 

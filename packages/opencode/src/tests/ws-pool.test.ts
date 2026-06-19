@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
+import { connectResponsesWebSocket } from '../ws'
 import { applyTurnId, createWebSocketFetch } from '../ws-pool'
 
 function entry() {
@@ -483,6 +485,69 @@ describe('createWebSocketFetch', () => {
       },
     )
   })
+
+  test('surfaces websocket stream failures as retryable AI SDK API errors', async () => {
+    await withFakeWebSocket(
+      ({ close }) => ({
+        send() {
+          close(1006, 'connection dropped')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          firstEventGraceMs: 0,
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const error = await response.text().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(APICallError.isInstance(error)).toBe(true)
+        expect(error).toMatchObject({
+          isRetryable: true,
+          name: 'ProviderResponseStreamError',
+        })
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('preserves provider header timeout abort reason so OpenCode can retry it', async () => {
+    class HeaderTimeoutError extends Error {
+      override readonly name = 'ProviderHeaderTimeoutError'
+      readonly ms = 10_000
+    }
+
+    await withFakeWebSocket(
+      () => ({ autoOpen: false }),
+      async () => {
+        const controller = new AbortController()
+        const reason = new HeaderTimeoutError(
+          'Provider response headers timed out after 10000ms',
+        )
+        const connection = connectResponsesWebSocket({
+          url: 'wss://example.test/backend-api/codex/responses',
+          headers: {},
+          signal: controller.signal,
+        })
+
+        controller.abort(reason)
+        let caught: unknown
+        try {
+          await connection
+        } catch (error) {
+          caught = error
+        }
+        expect(caught).toBe(reason)
+      },
+    )
+  })
 })
 
 function streamRequest(body: Record<string, unknown>): RequestInit {
@@ -499,6 +564,7 @@ type FakeWebSocketContext = {
 }
 
 type FakeWebSocketBehavior = {
+  autoOpen?: boolean
   send?: (data: string) => void
   close?: () => void
 }
@@ -530,10 +596,12 @@ async function withFakeWebSocket(
           this.emit('close', { code, reason })
         },
       })
-      queueMicrotask(() => {
-        this.readyState = FakeWebSocket.OPEN
-        this.emit('open', {})
-      })
+      if (this.behavior.autoOpen !== false) {
+        queueMicrotask(() => {
+          this.readyState = FakeWebSocket.OPEN
+          this.emit('open', {})
+        })
+      }
     }
 
     addEventListener(
