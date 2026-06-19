@@ -53,6 +53,16 @@ Three methods are offered:
 
 The account you log in with via `/login openai` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
 
+**Quick reference:**
+
+| Action | Command |
+| --- | --- |
+| Log in (first / main account) | `/login openai` |
+| Add a second (or third) account | `/openai-account add` |
+| Add with a label | `/openai-account add work` |
+| Add from a shell / headless machine | `openai-auth login [--label work] [--headless]` |
+| List accounts + quota | `/openai-quota` |
+
 ## Multiple accounts
 
 The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
