@@ -39,6 +39,6 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "ai": "^5.0.88"
+    "ai": "^6.0.208"
   }
 }
