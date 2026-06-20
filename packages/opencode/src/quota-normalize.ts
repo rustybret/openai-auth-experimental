@@ -68,17 +68,15 @@ interface WsRateLimits {
   secondary?: WsRateLimitWindow
 }
 
-interface WsAdditionalRateLimit {
-  metered_limit_name: string
-  used_percent: number
-  window_minutes: number
-  reset_at?: string | number
-}
-
+// The live codex.rate_limits frame also carries `additional_rate_limits`, but on
+// the wire it is a map keyed by model name whose values are nested
+// { primary, secondary } buckets (NOT a flat array of metered limits). Nothing
+// downstream reads those per-model windows, and they do not fit AccountQuotaWindow,
+// so we intentionally do not parse them — iterating the real object shape with
+// for..of is also what crashed ("{} is not iterable").
 interface WsRateLimitsFrame {
   type: string
   rate_limits: WsRateLimits
-  additional_rate_limits?: WsAdditionalRateLimit[]
   plan_type?: string
 }
 
@@ -104,22 +102,6 @@ export function normalizeWsFrame(event: WsRateLimitsFrame): OAuthQuotaSnapshot {
   if (primary) snapshot.primary = primary
   const secondary = windowFromWs(event.rate_limits?.secondary)
   if (secondary) snapshot.secondary = secondary
-
-  if (event.additional_rate_limits) {
-    for (const entry of event.additional_rate_limits) {
-      const name = entry.metered_limit_name
-      if (!name) continue
-      // Skip entries with a non-finite used_percent to avoid bogus windows
-      // that would silently bypass quota-gate checks.
-      if (!Number.isFinite(entry.used_percent)) continue
-      snapshot[name] = {
-        usedPercent: entry.used_percent,
-        remainingPercent: 100 - entry.used_percent,
-        resetsAt: toResetIso(entry.reset_at),
-        checkedAt: Date.now(),
-      }
-    }
-  }
   return snapshot
 }
 
@@ -138,17 +120,12 @@ interface WhamRateLimits {
   secondary_window?: WhamRateLimitWindow
 }
 
-interface WhamAdditionalRateLimit {
-  metered_limit_name: string
-  used_percent: number
-  limit_window_seconds: number
-  reset_at?: string | number
-}
-
+// As with the WS frame, wham/usage may carry per-model windows alongside the
+// primary/secondary pair. They are not consumed anywhere and their on-wire shape
+// is not a flat metered-limit array, so we do not parse them.
 interface WhamUsageResponse {
   plan_type?: string
   rate_limit: WhamRateLimits
-  additional_rate_limits?: WhamAdditionalRateLimit[]
 }
 
 function windowFromWham(
@@ -173,21 +150,5 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
   if (primary) snapshot.primary = primary
   const secondary = windowFromWham(json.rate_limit?.secondary_window)
   if (secondary) snapshot.secondary = secondary
-
-  if (json.additional_rate_limits) {
-    for (const entry of json.additional_rate_limits) {
-      const name = entry.metered_limit_name
-      if (!name) continue
-      // Skip entries with a non-finite used_percent to avoid bogus windows
-      // that would silently bypass quota-gate checks.
-      if (!Number.isFinite(entry.used_percent)) continue
-      snapshot[name] = {
-        usedPercent: entry.used_percent,
-        remainingPercent: 100 - entry.used_percent,
-        resetsAt: toResetIso(entry.reset_at),
-        checkedAt: Date.now(),
-      }
-    }
-  }
   return snapshot
 }
