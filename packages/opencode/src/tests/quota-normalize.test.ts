@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import type { AccountQuotaWindow } from '../core/accounts.ts'
+
 import {
   normalizeQuotaHeaders,
   normalizeWham,
@@ -7,15 +7,6 @@ import {
   toResetIso,
 } from '../quota-normalize.ts'
 import { formatResetIn } from '../tui.tsx'
-
-// U-7: QuotaWindowName will be widened to string in Phase 4 — cast for
-// additional_rate_limits entries until then.
-function win(
-  snap: Record<string, unknown>,
-  key: string,
-): AccountQuotaWindow | undefined {
-  return snap[key] as AccountQuotaWindow | undefined
-}
 
 describe('quota normalize → QuotaSnapshot', () => {
   it('HTTP x-codex-* headers (minutes)', () => {
@@ -64,23 +55,60 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.primary?.checkedAt).toBeGreaterThan(0)
   })
 
-  it('U-4: scans additional_rate_limits[] families (WS frame)', () => {
+  it('WS frame: real object-shaped additional_rate_limits does not crash and is ignored', () => {
     const s = normalizeWsFrame({
       type: 'codex.rate_limits',
+      plan_type: 'pro',
       rate_limits: {
-        primary: { used_percent: 1, window_minutes: 300, reset_at: '1' },
-      },
-      additional_rate_limits: [
-        {
-          metered_limit_name: 'metered_x',
-          used_percent: 12,
-          window_minutes: 60,
-          reset_at: '9',
+        allowed: true,
+        limit_reached: false,
+        primary: {
+          used_percent: 17,
+          window_minutes: 300,
+          reset_after_seconds: 5725,
+          reset_at: 1781625766,
         },
-      ],
-    })
-    expect(win(s, 'metered_x')?.usedPercent).toBe(12)
-    expect(win(s, 'metered_x')?.remainingPercent).toBe(88)
+        secondary: {
+          used_percent: 73,
+          window_minutes: 10080,
+          reset_after_seconds: 140256,
+          reset_at: 1781760298,
+        },
+      },
+      code_review_rate_limits: null,
+      additional_rate_limits: {
+        'GPT-5.3-Codex-Spark': {
+          allowed: true,
+          limit_reached: false,
+          primary: {
+            used_percent: 0,
+            window_minutes: 300,
+            reset_at: 1781638042,
+          },
+          secondary: {
+            used_percent: 0,
+            window_minutes: 10080,
+            reset_at: 1782224842,
+          },
+        },
+      },
+    } as unknown as Parameters<typeof normalizeWsFrame>[0])
+    expect(s.primary?.usedPercent).toBe(17)
+    expect(s.primary?.remainingPercent).toBe(83)
+    expect(s.secondary?.usedPercent).toBe(73)
+    expect(Object.keys(s)).toEqual(['primary', 'secondary'])
+  })
+
+  it('WS frame: empty-object additional_rate_limits does not throw', () => {
+    expect(() =>
+      normalizeWsFrame({
+        type: 'codex.rate_limits',
+        rate_limits: {
+          primary: { used_percent: 1, window_minutes: 300, reset_at: '1' },
+        },
+        additional_rate_limits: {},
+      } as unknown as Parameters<typeof normalizeWsFrame>[0]),
+    ).not.toThrow()
   })
 
   it('wham/usage JSON (seconds)', () => {
@@ -106,7 +134,7 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.primary?.checkedAt).toBeGreaterThan(0)
   })
 
-  it('U-4: scans additional_rate_limits[] families (wham)', () => {
+  it('wham: object-shaped additional_rate_limits does not crash and is ignored', () => {
     const s = normalizeWham({
       plan_type: 'plus',
       rate_limit: {
@@ -116,17 +144,14 @@ describe('quota normalize → QuotaSnapshot', () => {
           reset_at: '1',
         },
       },
-      additional_rate_limits: [
-        {
-          metered_limit_name: 'metered_y',
-          used_percent: 77,
-          limit_window_seconds: 3600,
-          reset_at: '5',
+      additional_rate_limits: {
+        'GPT-5.3-Codex-Spark': {
+          primary: { used_percent: 0, limit_window_seconds: 18000 },
         },
-      ],
-    })
-    expect(win(s, 'metered_y')?.usedPercent).toBe(77)
-    expect(win(s, 'metered_y')?.remainingPercent).toBe(23)
+      },
+    } as unknown as Parameters<typeof normalizeWham>[0])
+    expect(s.primary?.usedPercent).toBe(1)
+    expect(Object.keys(s)).toEqual(['primary'])
   })
 
   it('empty/missing rate_limits → empty snapshot', () => {

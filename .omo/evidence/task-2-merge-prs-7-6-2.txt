@@ -1,0 +1,74 @@
+TASK-2: Create local branch local/fork off main
+Working directory: /Volumes/Topper2TB/Git/openai-auth
+Date: Fri Jun 19 2026
+
+========================================================================
+COMMAND: git fetch origin
+EXIT: 0
+OUTPUT: (origin already up to date; no new refs)
+
+------------------------------------------------------------------------
+COMMAND: git fetch upstream
+EXIT: 0
+OUTPUT:
+From https://github.com/cortexkit/openai-auth
+ * [new branch]      dependabot/bun/ai-6.0.207 -> upstream/dependabot/bun/ai-6.0.207
+ * [new branch]      dependabot/bun/biomejs/biome-2.5.0 -> upstream/dependabot/bun/biomejs/biome-2.5.0
+ * [new branch]      dependabot/bun/earendil-works/pi-ai-0.79.6 -> upstream/dependabot/bun/earendil-works/pi-ai-0.79.6
+ * [new branch]      dependabot/bun/earendil-works/pi-coding-agent-0.79.6 -> upstream/dependabot/bun/earendil-works/pi-coding-agent-0.79.6
+ * [new branch]      dependabot/bun/earendil-works/pi-tui-0.79.6 -> upstream/dependabot/bun/earendil-works/pi-tui-0.79.6
+ * [new branch]      dependabot/bun/opencode-ai/plugin-1.17.7 -> upstream/dependabot/bun/opencode-ai/plugin-1.17.7
+
+------------------------------------------------------------------------
+COMMAND: git status --porcelain     # confirm clean tree
+EXIT: 0
+OUTPUT:
+?? .omo/
+(clean tree — only untracked .omo/ present, which is OK)
+
+------------------------------------------------------------------------
+COMMAND: git branch --list local/fork     # check existence
+EXIT: 0
+OUTPUT: (empty — branch does NOT exist; safe to create)
+
+------------------------------------------------------------------------
+COMMAND: git switch -c local/fork main
+EXIT: 0
+OUTPUT: Switched to a new branch 'local/fork'
+
+------------------------------------------------------------------------
+COMMAND: git branch --show-current
+EXIT: 0
+OUTPUT: local/fork
+
+------------------------------------------------------------------------
+COMMAND: git rev-parse local/fork
+EXIT: 0
+OUTPUT: 4f7beb7140b6b3433888eda97f43733810e3dace
+
+------------------------------------------------------------------------
+COMMAND: git rev-parse main
+EXIT: 0
+OUTPUT: 4f7beb7140b6b3433888eda97f43733810e3dace
+
+------------------------------------------------------------------------
+COMMAND: git status --porcelain     # must be empty (or only untracked .omo/)
+EXIT: 0
+OUTPUT:
+?? .omo/
+(only untracked .omo/ — OK)
+
+========================================================================
+SHA COMPARISON:
+  local/fork = 4f7beb7140b6b3433888eda97f43733810e3dace
+  main       = 4f7beb7140b6b3433888eda97f43733810e3dace
+  MATCH: YES (both at 4f7beb7 "release: v0.1.2")
+
+VERIFICATION CHECKLIST:
+  [x] Branch local/fork created off main at commit 4f7beb7
+  [x] git branch --show-current == local/fork
+  [x] git rev-parse local/fork == git rev-parse main
+  [x] git status --porcelain empty (only untracked .omo/)
+  [x] Evidence written
+
+TASK-2: OK

@@ -1,0 +1,107 @@
+# Task 1 — Pre-Merge Baseline Evidence
+# Repo: /Volumes/Topper2TB/Git/openai-auth
+# Purpose: Capture true pre-merge baseline of `main` before merging PR#7/#6/#2.
+#          Attribution anchor — proves whether CURRENT main is already broken.
+
+## HEAD (git log -1 --oneline)
+4f7beb7 release: v0.1.2
+
+## Working tree (git status --porcelain) — BEFORE
+?? .omo/
+# (only untracked .omo/ evidence dir; no tracked file modified)
+
+## Working tree (git status --porcelain) — AFTER all commands
+?? .omo/
+# (unchanged; no tracked source file modified)
+
+================================================================================
+COMMAND RESULTS (in order)
+================================================================================
+
+-------------------------------------------------------------------------------
+[1] bun install
+EXIT CODE: 0
+-------------------------------------------------------------------------------
+bun install v1.3.14 (0d9b296a)
+
+Checked 169 installs across 198 packages (no changes) [3.00ms]
+
+-------------------------------------------------------------------------------
+[2] bun run typecheck   (root: packages/opencode + packages/pi)
+EXIT CODE: 0
+-------------------------------------------------------------------------------
+$ cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck
+$ tsc
+$ tsc
+
+-------------------------------------------------------------------------------
+[3] bun run test   (packages/opencode)
+EXIT CODE: 0
+-------------------------------------------------------------------------------
+$ cd packages/opencode && bun run test
+$ bun test src/tests
+bun test v1.3.14 (0d9b296a)
+
+src/tests/hosted-web-search.test.ts:
+(pass) hosted web search replay > rewrites local web_search function replay to Codex web_search_call item [1.57ms]
+(pass) hosted web search replay > translates hosted web_search_call done event into a local function_call [0.10ms]
+(pass) hosted web search replay > drops hosted web_search_call lifecycle events [0.32ms]
+(pass) hosted web search replay > translates hosted web_search_call SSE responses on HTTP fallback [8.96ms]
+(pass) hosted web search replay > rewrites hosted item_reference from translated raw web_search_call event [0.04ms]
+(pass) hosted web search replay > does not rewrite regular function tool calls [0.04ms]
+
+src/tests/ws-pool.test.ts:
+(pass) applyTurnId > keeps one turn_id across a tool-loop and ignores the per-request base id [0.86ms]
+(pass) applyTurnId > rotates turn_id when a new (non-output) message starts a turn [0.07ms]
+(pass) applyTurnId > turn_started_at is stable across the tool-loop [0.05ms]
+(pass) createWebSocketFetch > preserves reasoning summaries on websocket requests and forwards reasoning deltas [4.96ms]
+(pass) createWebSocketFetch > falls back to HTTP immediately when the websocket lane hits the connection limit [0.79ms]
+(pass) createWebSocketFetch > keeps the full first request after prewarm so historical tool outputs keep their tool calls [0.87ms]
+(pass) createWebSocketFetch > prewarms again for a fresh user turn instead of continuing from the prior turn response [0.57ms]
+(pass) createWebSocketFetch > removes websocket pool entries by original OpenCode session id [0.34ms]
+(pass) createWebSocketFetch > idle-prunes websocket fallback entries so a later turn can retry websocket [21.12ms]
+(pass) createWebSocketFetch > returns response headers without waiting for first websocket event [21.47ms]
+(pass) createWebSocketFetch > surfaces websocket stream failures as retryable AI SDK API errors [0.70ms]
+(pass) createWebSocketFetch > preserves provider header timeout abort reason so OpenCode can retry it [0.38ms]
+
+src/tests/dump.test.ts:
+(pass) request dumps > resolves configured Codex endpoint with env-over-config precedence [1.86ms]
+(pass) request dumps > routes Codex HTTP requests to configured endpoint without changing body shape [2.73ms]
+(pass) request dumps > defaults Codex endpoint to ChatGPT backend [0.05ms]
+(pass) request dumps > does not install the Codex/WebSocket fetch for manual API-key auth [0.16ms]
+(pass) request dumps > drops cached Codex session metadata when OpenCode deletes a session [3.62ms]
+(pass) request dumps > persists Codex prompt_cache_key mapping across plugin restarts [1.65ms]
+(pass) request dumps > rotates HTTP turn metadata for a new user turn and keeps it during tool continuations [2.07ms]
+(pass) request dumps > dumps final HTTP body and redacted request metadata when enabled [1.51ms]
+(pass) request dumps > dumps final WebSocket prewarm and main bodies when enabled [2.09ms]
+
+ 27 pass
+ 0 fail
+ 65 expect() calls
+Ran 27 tests across 3 files. [197.00ms]
+
+-------------------------------------------------------------------------------
+[4] bun run build   (packages/opencode + packages/pi)
+EXIT CODE: 0
+-------------------------------------------------------------------------------
+$ cd packages/opencode && bun run build && cd ../pi && bun run build
+$ rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly
+Bundled 162 modules in 22ms
+
+  index.js                0.40 MB    (entry point)
+  index-xqe8xm96.js       8.80 KB    (chunk)
+  index-6z8w05g9.js       336 bytes  (chunk)
+  token-util-fs3z8kkp.js  88 bytes   (chunk)
+  token-yyjm093c.js       1.18 KB    (chunk)
+
+$ rm -rf dist && tsc -p tsconfig.build.json
+
+================================================================================
+SUMMARY
+================================================================================
+install   EXIT 0
+typecheck EXIT 0
+test      EXIT 0  (27 pass / 0 fail across 3 files)
+build     EXIT 0
+
+BASELINE: GREEN

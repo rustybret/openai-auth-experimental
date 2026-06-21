@@ -1286,7 +1286,7 @@ describe('#12 NaN used_percent → no quota window', () => {
     expect(snap.secondary?.remainingPercent).toBe(95)
   })
 
-  it('normalizeWsFrame: NaN in additional_rate_limits entry → entry skipped', async () => {
+  it('normalizeWsFrame: real object-shaped additional_rate_limits is ignored, not crashed', async () => {
     const { normalizeWsFrame } = await import('../quota-normalize.ts')
 
     const snap = normalizeWsFrame({
@@ -1294,33 +1294,15 @@ describe('#12 NaN used_percent → no quota window', () => {
       rate_limits: {
         primary: { used_percent: 10, window_minutes: 300 },
       },
-      additional_rate_limits: [
-        {
-          metered_limit_name: 'bad_entry',
-          used_percent: Number.NaN,
-          window_minutes: 60,
+      additional_rate_limits: {
+        'GPT-5.3-Codex-Spark': {
+          primary: { used_percent: Number.NaN, window_minutes: 60 },
         },
-        {
-          metered_limit_name: 'good_entry',
-          used_percent: 30,
-          window_minutes: 60,
-        },
-      ],
-    })
-
-    expect((snap as Record<string, unknown>).bad_entry).toBeUndefined()
-    expect(
-      (snap as Record<string, unknown>).good_entry as {
-        usedPercent: number
       },
-    ).toBeDefined()
-    expect(
-      (
-        (snap as Record<string, unknown>).good_entry as {
-          usedPercent: number
-        }
-      ).usedPercent,
-    ).toBe(30)
+    } as unknown as Parameters<typeof normalizeWsFrame>[0])
+
+    expect(snap.primary?.usedPercent).toBe(10)
+    expect(Object.keys(snap)).toEqual(['primary'])
   })
 
   it('normalizeWham: NaN primary used_percent → no primary window in snapshot', async () => {
@@ -1343,23 +1325,22 @@ describe('#12 NaN used_percent → no quota window', () => {
     expect(snap.secondary?.usedPercent).toBe(20)
   })
 
-  it('normalizeWham: NaN in additional_rate_limits entry → entry skipped', async () => {
+  it('normalizeWham: object-shaped additional_rate_limits is ignored, not crashed', async () => {
     const { normalizeWham } = await import('../quota-normalize.ts')
 
     const snap = normalizeWham({
       rate_limit: {
         primary_window: { used_percent: 5, limit_window_seconds: 18000 },
       },
-      additional_rate_limits: [
-        {
-          metered_limit_name: 'nan_entry',
-          used_percent: Number.NaN,
-          limit_window_seconds: 3600,
+      additional_rate_limits: {
+        'GPT-5.3-Codex-Spark': {
+          primary: { used_percent: Number.NaN, limit_window_seconds: 3600 },
         },
-      ],
-    })
+      },
+    } as unknown as Parameters<typeof normalizeWham>[0])
 
-    expect((snap as Record<string, unknown>).nan_entry).toBeUndefined()
+    expect(snap.primary?.usedPercent).toBe(5)
+    expect(Object.keys(snap)).toEqual(['primary'])
   })
 
   it('Infinity used_percent → no window (also non-finite)', async () => {

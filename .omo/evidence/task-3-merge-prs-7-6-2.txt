@@ -1,0 +1,556 @@
+=== TASK-3 EVIDENCE: merge PR#7 feat/parity into local/fork ===
+Date: Fri Jun 19 11:53:52 PDT 2026
+
+### git branch --show-current (pre-checkout)
+local/fork
+
+### gh pr checkout 7 --branch pr-7-parity
+From https://github.com/cortexkit/openai-auth
+ * [new ref]  refs/pull/7/head -> pr-7-parity ; EXIT:0
+
+### git switch local/fork ; git merge --no-ff pr-7-parity
+Merge made by the 'ort' strategy. 62 files changed, +21518/-673. EXIT_MERGE:0 (no conflicts)
+
+=== bun install ===
+bun install v1.3.14 (0d9b296a)
+
++ @opencode-ai/plugin@1.17.1
+
+198 packages installed [512.00ms]
+EXIT_INSTALL:0
+
+=== bun run typecheck ===
+$ cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck
+$ tsc
+$ tsc
+EXIT_TYPECHECK:0
+
+=== bun run test ===
+$ cd packages/opencode && bun run test
+$ bun test src/tests
+bun test v1.3.14 (0d9b296a)
+
+src/tests/cachekeep.test.ts:
+(pass) buildKeepwarmBody > does not set unsupported max_output_tokens [1.31ms]
+(pass) buildKeepwarmBody > sets store to false [0.36ms]
+(pass) buildKeepwarmBody > preserves streaming warm bodies and removes incompatible token fields [0.45ms]
+(pass) buildKeepwarmBody > keeps rest of body identical (same input/messages/tools/instructions) [0.07ms]
+(pass) buildKeepwarmBody > JSON parse copy isolates original from mutation [0.03ms]
+(pass) CacheKeepManager.track > stores a target with correct fields [1.22ms]
+(pass) CacheKeepManager.track > sets cacheExpiresAt to now + TTL_MS [0.06ms]
+(pass) CacheKeepManager.track > replace-on-retrack: freshest body wins [5.09ms]
+(pass) CacheKeepManager.track > replace-on-retrack resets cacheExpiresAt [0.07ms]
+(pass) CacheKeepManager.track > prunes targets past maxIdleWarmMs from last real request [0.06ms]
+(pass) CacheKeepManager.track > caps Map size at default maxTargets (32) [0.74ms]
+(pass) CacheKeepManager.track > caps total bytes at default maxBytes [0.05ms]
+(pass) CacheKeepManager.track > rejects an oversized body without evicting existing targets [0.05ms]
+(pass) CacheKeepManager.track > evicts least-recently-used target instead of oldest inserted target [0.91ms]
+(pass) CacheKeepManager subagent pruneStale > subagent target pruned at 31min (past 30min cap) [0.08ms]
+(pass) CacheKeepManager subagent pruneStale > subagent target survives at 29min (within 30min cap) [0.54ms]
+(pass) CacheKeepManager subagent pruneStale > main target survives at 31min (within 1h cap) [0.05ms]
+(pass) CacheKeepManager subagent pruneStale > main target pruned past 1h [0.84ms]
+(pass) CacheKeepManager subagent pruneStale > re-captures a subagent target after it was pruned [0.11ms]
+(pass) buildKeepwarmCapture > skips capture when cachekeep is disabled [0.27ms]
+(pass) buildKeepwarmCapture > skips subagent requests fail-safe when subagent warming is off [0.04ms]
+(pass) buildKeepwarmCapture > captures subagent requests when includeSubagents is true [0.05ms]
+(pass) buildKeepwarmCapture > main request (no x-parent-session-id) is captured regardless of includeSubagents [0.21ms]
+(pass) buildKeepwarmCapture > skips requests that cannot be positively associated with a session [0.02ms]
+(pass) buildKeepwarmCapture > captures the finalized body and cache-relevant headers for main requests [0.03ms]
+(pass) CacheKeepManager tick/prewarm > fallback warm resolves token by storage id but sends real ChatGPT account id header [1.35ms]
+(pass) CacheKeepManager tick/prewarm > subagent warm sends the real ChatGPT account id header [0.13ms]
+(pass) CacheKeepManager tick/prewarm > main warm uses real ChatGPT account id when present and omits stale replay header when absent [0.17ms]
+(pass) CacheKeepManager tick/prewarm > idle cap prunes targets even when active backoff would otherwise skip pruning [0.25ms]
+(pass) CacheKeepManager tick/prewarm > idle cap prunes expired-backoff targets before retrying warm [0.16ms]
+(pass) CacheKeepManager tick/prewarm > track self-arms an unstarted manager and the timer fires a due target [21.34ms]
+(pass) CacheKeepManager tick/prewarm > a reconstructed unstarted manager arms itself when it captures [20.66ms]
+(pass) CacheKeepManager tick/prewarm > track-driven start is idempotent and does not bump startedAt [0.23ms]
+(pass) CacheKeepManager tick/prewarm > status running reflects the actual timer presence [0.05ms]
+(pass) CacheKeepManager tick/prewarm > fires prewarm only within LEAD window of cacheExpiresAt [0.21ms]
+(pass) CacheKeepManager tick/prewarm > backoff suppresses prewarm after failure [0.93ms]
+(pass) CacheKeepManager tick/prewarm > prewarm fires again after backoff expires [0.28ms]
+(pass) CacheKeepManager tick/prewarm > does not reenter tick while a previous prewarm is still in flight [0.32ms]
+(pass) CacheKeepManager tick/prewarm > sets backoff for malformed captured bodies and continues warming other targets [0.20ms]
+(pass) CacheKeepManager tick/prewarm > stays armed across an idle tick and later warms a captured request [0.10ms]
+(pass) CacheKeepManager tick/prewarm > tick prunes expired targets without disarming cachekeep [0.07ms]
+(pass) CacheKeepManager tick/prewarm > per-target idle cap prunes old captures while cachekeep stays enabled [0.10ms]
+(pass) CacheKeepManager tick/prewarm > a real request after the idle cap resumes warming [0.08ms]
+(pass) CacheKeepManager tick/prewarm > on success: resets cacheExpiresAt and lastWarmedAt [0.11ms]
+(pass) CacheKeepManager tick/prewarm > logs cost from mock usage [0.10ms]
+(pass) CacheKeepManager tick/prewarm > logs cached tokens from prompt_tokens_details fallback usage [0.61ms]
+(pass) CacheKeepManager tick/prewarm > sends cache-relevant captured headers on warm requests [0.39ms]
+(pass) CacheKeepManager tick/prewarm > backs off on non-2xx responses without resetting expiry [0.13ms]
+(pass) CacheKeepManager tick/prewarm > parses SSE response.completed usage and logs cache hit metrics [0.37ms]
+(pass) CacheKeepManager tick/prewarm > parses SSE usage when completion type is only on the event line [0.10ms]
+(pass) CacheKeepManager tick/prewarm > sniffs SSE by body when content-type is not text/event-stream [0.10ms]
+(pass) CacheKeepManager tick/prewarm > logs fired without throwing when SSE has no usage event [0.07ms]
+(pass) CacheKeepManager tick/prewarm > prewarm drains the response body without canceling a locked body [0.07ms]
+(pass) CacheKeepManager status > does not expose captured body text [0.04ms]
+(pass) CacheKeepManager start/stop > start sets running flag [0.03ms]
+(pass) CacheKeepManager start/stop > stop clears targets and timer [0.03ms]
+(pass) CacheKeepManager start/stop > status shows max idle warm time [0.02ms]
+(pass) CacheKeepManager token resolution > uses getMainToken for main account [0.13ms]
+(pass) CacheKeepManager token resolution > uses refreshFallback for non-main accountId [0.12ms]
+(pass) CacheKeepManager token resolution > skips warm if no token resolves [0.09ms]
+
+src/tests/sidebar-state.test.ts:
+(pass) normalizeSidebarState > empty object {} returns well-formed default shape [0.16ms]
+(pass) normalizeSidebarState > {"SENTINEL":true} (exact crash trigger) returns well-formed default shape [0.02ms]
+(pass) normalizeSidebarState > {"main":{}} — main present but no quota — fills in quota:null, killed:false [0.01ms]
+(pass) normalizeSidebarState > {"fallbacks":"notarray"} — fallbacks coerced to [] [0.02ms]
+(pass) normalizeSidebarState > "hello" (string) returns DEFAULT_SIDEBAR_STATE
+(pass) normalizeSidebarState > 42 (number) returns DEFAULT_SIDEBAR_STATE
+(pass) normalizeSidebarState > null returns DEFAULT_SIDEBAR_STATE
+(pass) normalizeSidebarState > valid full state round-trips with all fields preserved [0.11ms]
+(pass) getSidebarState — malformed file never throws > file containing {} returns well-formed state (no throw) [2.05ms]
+(pass) getSidebarState — malformed file never throws > file containing {"SENTINEL":true} returns well-formed state (no throw) [0.28ms]
+(pass) resolveActiveAccount > activeId "main" resolves to the main account [0.08ms]
+(pass) resolveActiveAccount > activeId matching an enabled fallback resolves to that fallback (label name) [0.04ms]
+(pass) resolveActiveAccount > fallback without a label uses its id as the name [0.02ms]
+(pass) resolveActiveAccount > activeId matching a DISABLED fallback falls back to main [0.03ms]
+(pass) resolveActiveAccount > undefined activeId resolves to main [0.01ms]
+(pass) resolveActiveAccount > unmatched activeId resolves to main [0.02ms]
+(pass) resolveActiveAccount > carries through the killed flag for the active main account [0.01ms]
+(pass) resolveActiveAccount > carries through the killed flag for the active fallback account [0.01ms]
+(pass) getCollapsedQuotaSummary > formats both active-account quota windows [0.03ms]
+(pass) getCollapsedQuotaSummary > formats different 5h and 7d percentages [0.01ms]
+(pass) getCollapsedQuotaSummary > uses a dash for a missing collapsed quota window [0.14ms]
+(pass) getCollapsedQuotaSummary > returns no collapsed quota text when no windows are available [0.01ms]
+(pass) computeQuotaPacing > reserve: under even-burn pace, lasts until reset [0.11ms]
+(pass) computeQuotaPacing > deficit: over pace, projects runout before reset [0.03ms]
+(pass) computeQuotaPacing > screenshot case: 7d window, 12h elapsed, 17% used [0.03ms]
+(pass) computeQuotaPacing > on-pace when |delta| < 1 [0.01ms]
+(pass) computeQuotaPacing > zero usage is reserve and lasts [0.01ms]
+(pass) computeQuotaPacing > projection landing exactly at reset means lasts [0.02ms]
+(pass) computeQuotaPacing > null when resetsAt missing or invalid [0.02ms]
+(pass) computeQuotaPacing > null in the early-window noise guard [0.02ms]
+(pass) computeQuotaPacing > null when elapsed reaches or exceeds the window [0.02ms]
+(pass) sidebar isolation: getSidebarStateFile never returns the live default while the preload floor is active > getSidebarStateFile() returns the floor temp path, not the live default
+(pass) sidebar isolation: getSidebarStateFile never returns the live default while the preload floor is active > a write after env restore goes to the floor temp path, not the live default [1.19ms]
+(pass) sidebar isolation: setSidebarState serializes concurrent writes > 5 concurrent writes with different lastUpdated values — last-chained state wins [1.24ms]
+
+src/tests/accounts-store.test.ts:
+(pass) accounts store > load/save round-trip: accounts, main provider, version [15.83ms]
+(pass) accounts store > state file has 0600 permissions [1.70ms]
+(pass) accounts store > atomic write: no partial/tmp file left behind [1.15ms]
+(pass) accounts store > saveAccountState writes state that loadAccounts merges back [2.13ms]
+(pass) accounts store > saveAccounts waits for the file lock and merges with the latest on-disk accounts [106.25ms]
+
+src/tests/commands.test.ts:
+(pass) commands > routing command builds dialog payload with mode knob [0.90ms]
+(pass) commands > routing command apply changes mode [2.05ms]
+(pass) commands > /openai-cachekeep status reflects persisted enabled and state-aware knobs [1.73ms]
+(pass) commands > /openai-cachekeep on/off persists enabled and toggles the manager [3.13ms]
+(pass) commands > /openai-cachekeep subagents on/off persists and flips the live gate [4.06ms]
+(pass) commands > /openai-cachekeep on creates a store when none exists [1.41ms]
+(pass) commands > switch to fallback → activeId set, client.auth.set NOT called (non-destructive) [2.78ms]
+(pass) commands > switch fallback → switch main: round-trip is non-destructive [2.91ms]
+(pass) commands > switch main → sets activeId=main + persists [1.98ms]
+(pass) commands > switch main → persisted activeId is main [2.17ms]
+(pass) commands > remove active account selects the next OAuth fallback instead of an API account [2.73ms]
+(pass) commands > remove the last active OAuth fallback resets activeId to main [2.02ms]
+(pass) commands > refreshSidebar called after switch [2.27ms]
+(pass) commands > refreshSidebar called after switch main [2.32ms]
+(pass) commands > refreshSidebar called after remove [1.86ms]
+(pass) commands > refreshSidebar called after order [2.70ms]
+(pass) commands > /openai-logging debug → setLogLevel updates effective level (runtime) [2.52ms]
+(pass) commands > dump command toggles enabled state [1.66ms]
+(pass) commands > killswitch command shows status with knobs [0.56ms]
+(pass) commands > quota command returns text (quota snapshot) [0.43ms]
+(pass) commands > refreshAllQuota populates main + 2 fallbacks → output shows quota [1.36ms]
+(pass) commands > refreshAllQuota with one failure → ⚠ line for failing account [0.26ms]
+(pass) commands > refreshAllQuota undefined → falls back to cached display [0.18ms]
+(pass) commands (add) > /openai-account add returns dialog with auth URL [0.62ms]
+(pass) commands (add) > /openai-account add completion writes account to storage (detached) [51.41ms]
+(pass) commands (add) > /openai-account add is idempotent by label [103.37ms]
+(pass) commands (add) > INVARIANT: accounts[] does not contain "main" after add [52.43ms]
+(pass) commands (add) > main-account rejection: adding same ChatGPT account as main does NOT push [53.62ms]
+(pass) commands (add) > C3/M3: main-rejection calls notify with error message [53.73ms]
+(pass) commands (add) > C3/M3: failure path calls notify with error message [52.33ms]
+(pass) commands (add) > /openai-account add returns knobs.url + knobs.instructions for browser flow [0.72ms]
+(pass) commands (add) > /openai-account add --headless returns knobs.verificationUrl + knobs.userCode [0.50ms]
+(pass) commands (add) > /openai-account add completion calls refreshSidebar [52.44ms]
+(pass) commands (add) > /openai-account add passes label to beginAccountLogin [0.66ms]
+(pass) commands (add) > /openai-account add --headless passes headless:true to beginAccountLogin [0.35ms]
+(pass) commands (add) > /openai-account add completion notifies the session that started the add [51.08ms]
+
+src/tests/refresh-all-quota.test.ts:
+(pass) refreshAllQuota > main + 2 fallbacks all succeed → setMain + setFallback called with snapshots [0.71ms]
+(pass) refreshAllQuota > one fallback wham throws 401 → that account ok:false, others succeed [0.27ms]
+(pass) refreshAllQuota > expired main token → codexRefreshFn called before wham [0.12ms]
+(pass) refreshAllQuota > expired fallback token → refreshAccount invoked before wham [0.10ms]
+(pass) refreshAllQuota > disabled fallback is skipped [0.07ms]
+(pass) refreshAllQuota > API-key accounts are skipped (only OAuth) [0.06ms]
+(pass) refreshAllQuota > main auth is not oauth → main ok:false, fallbacks still processed [0.06ms]
+(pass) refreshAllQuota > respectBackoff skips wham for main when quota API is backed off [0.10ms]
+(pass) refreshAllQuota > respectBackoff: false (default) still fetches main even when backed off [0.09ms]
+(pass) refreshAllQuota > respectBackoff skips wham for fallback when quota API is backed off [0.97ms]
+
+src/tests/hosted-web-search.test.ts:
+(pass) hosted web search replay > rewrites local web_search function replay to Codex web_search_call item [0.15ms]
+(pass) hosted web search replay > translates hosted web_search_call done event into a local function_call [0.05ms]
+(pass) hosted web search replay > drops hosted web_search_call lifecycle events [0.02ms]
+(pass) hosted web search replay > translates hosted web_search_call SSE responses on HTTP fallback [7.30ms]
+(pass) hosted web search replay > rewrites hosted item_reference from translated raw web_search_call event [0.06ms]
+(pass) hosted web search replay > does not rewrite regular function tool calls [0.03ms]
+
+src/tests/rpc-dir.test.ts:
+(pass) getRpcDir > relative override is anchored to projectDirectory, not cwd [0.09ms]
+(pass) getRpcDir > relative override with subdirectory path is anchored to projectDirectory [0.01ms]
+(pass) getRpcDir > absolute override passes through unchanged regardless of projectDirectory [0.01ms]
+(pass) getRpcDir > no override falls back to XDG hashed path [0.39ms]
+(pass) getRpcDir > same projectDirectory always produces same no-override path [0.03ms]
+(pass) getRpcDir > different projectDirectories produce different no-override paths [0.02ms]
+
+src/tests/error-contract.test.ts:
+(pass) error contract > Codex refreshFn throws ProviderHttpError carrying .status + .retryAfter [0.56ms]
+(pass) error contract > Codex refreshFn throws ProviderHttpError without retryAfter when header missing [0.10ms]
+(pass) error contract > isTransientRefreshError: {status:429} → true [0.03ms]
+(pass) error contract > isTransientRefreshError: {status:500} → true
+(pass) error contract > isTransientRefreshError: {status:503} → true
+(pass) error contract > isTransientRefreshError: {status:401} → false
+(pass) error contract > isTransientRefreshError: network Error('fetch failed') → true [0.01ms]
+(pass) error contract > isTransientRefreshError: network error ECONNRESET → true [0.01ms]
+(pass) error contract > isTransientRefreshError: network error ETIMEDOUT → true
+(pass) error contract > isTransientRefreshError: plain Error → false
+(pass) error contract > isTransientRefreshError: non-object → false
+(pass) error contract > U-3: buildRefreshOperationError applies 24h non-transient backoff when status===401 [0.08ms]
+(pass) error contract > buildRefreshOperationError uses retryAfter when present (numeric) [0.03ms]
+(pass) error contract > buildRefreshOperationError increments retryCount for same token [0.02ms]
+
+src/tests/command-registration.test.ts:
+(pass) command-registration: config hook stays in sync with MODAL_COMMANDS > registered openai-* command keys exactly equal MODAL_COMMANDS (bidirectional) [1.55ms]
+
+src/tests/migration.test.ts:
+(pass) migration > seeds account store from a settings-only openai-auth.json without dropping transport keys [2.41ms]
+(pass) migration > is idempotent — second run does not re-migrate or duplicate [3.28ms]
+(pass) migration > tolerates expired token — still migrates [1.44ms]
+(pass) migration > no-op when no token provided [0.71ms]
+
+src/tests/rpc-port-file.test.ts:
+(pass) port-file > writePortFile then discover returns the entry for a live pid [0.87ms]
+(pass) port-file > discover ignores dead pids [0.46ms]
+(pass) port-file > discover picks the newest startedAt among live entries [6.66ms]
+(pass) port-file > discover returns live entry matching the expected pid instead of newer live entry [2.55ms]
+(pass) port-file > discover falls back to newest live entry when expected pid matches none [0.63ms]
+(pass) port-file > discover still picks newest live entry when expected pid is undefined [0.54ms]
+(pass) port-file > discover never returns a dead pid even when it matches expected pid [0.49ms]
+(pass) port-file > writePortFile keeps the liveness pid available for matching [1.21ms]
+
+src/tests/ws-pool.test.ts:
+(pass) applyTurnId > keeps one turn_id across a tool-loop and ignores the per-request base id [0.19ms]
+(pass) applyTurnId > rotates turn_id when a new (non-output) message starts a turn [0.04ms]
+(pass) applyTurnId > turn_started_at is stable across the tool-loop [0.03ms]
+(pass) createWebSocketFetch > preserves reasoning summaries on websocket requests and forwards reasoning deltas [2.40ms]
+(pass) createWebSocketFetch > falls back to HTTP immediately when the websocket lane hits the connection limit [0.60ms]
+(pass) createWebSocketFetch > keeps the full first request after prewarm so historical tool outputs keep their tool calls [0.43ms]
+(pass) createWebSocketFetch > prewarms again for a fresh user turn instead of continuing from the prior turn response [0.54ms]
+(pass) createWebSocketFetch > removes websocket pool entries by original OpenCode session id [0.34ms]
+(pass) createWebSocketFetch > idle-prunes websocket fallback entries so a later turn can retry websocket [21.17ms]
+(pass) createWebSocketFetch > returns response headers without waiting for first websocket event [21.61ms]
+(pass) createWebSocketFetch > surfaces websocket stream failures as retryable AI SDK API errors [0.58ms]
+(pass) createWebSocketFetch > preserves provider header timeout abort reason so OpenCode can retry it [0.24ms]
+
+src/tests/fallback-select.test.ts:
+(pass) fallback selection > fail-open: unknown-quota fallback IS in getUsableFallbackAccounts when failClosedOnUnknownQuota=false [1.30ms]
+(pass) fallback selection > fail-closed: unknown-quota fallback is excluded when failClosedOnUnknownQuota=true [0.37ms]
+(pass) fallback selection > getUsableFallbackAccounts fires NO quota fetch when wham supplement OFF [0.49ms]
+(pass) fallback selection > refreshAccountQuota throws when fetchQuotaFn not injected (passive guard) [0.36ms]
+(pass) fallback selection > refreshQuotaForDueAccounts is a no-op when fetchQuotaFn not injected [0.20ms]
+(pass) fallback selection > refreshQuotaForAllAccounts returns early when fetchQuotaFn not injected [0.41ms]
+
+src/tests/oauth.test.ts:
+(pass) upsertAccount > pushes a new account onto an empty array [0.05ms]
+(pass) upsertAccount > deduplicates by id — merge-updates preserving addedAt [0.03ms]
+(pass) upsertAccount > deduplicates by label when ids differ [0.03ms]
+(pass) upsertAccount > does not deduplicate when label is undefined [0.01ms]
+(pass) upsertAccount > returns the correct index [0.02ms]
+(pass) upsertAccount > deduplicates by accountId — same ChatGPT account, different ids and labels [0.02ms]
+(pass) upsertAccount > accountId dedup wins over label conflict [0.02ms]
+(pass) upsertAccount > two genuinely different accounts both kept [0.01ms]
+(pass) generatePKCE > returns verifier and challenge [1.21ms]
+(pass) base64UrlEncode > encodes to url-safe base64 [0.03ms]
+(pass) parseJwtClaims > parses a valid JWT [0.11ms]
+(pass) parseJwtClaims > returns undefined for malformed input [0.01ms]
+(pass) extractAccountId > extracts from id_token [0.04ms]
+(pass) extractAccountId > extracts from https://api.openai.com/auth nested claim [0.02ms]
+(pass) extractAccountId > falls back to access_token when id_token has no account id [0.02ms]
+(pass) extractAccountId > returns undefined when no account id is present [0.01ms]
+(pass) buildAuthorizeUrl > builds a URL with required params [0.04ms]
+(pass) escapeHtml > escapes dangerous characters [0.02ms]
+(pass) HTML_SUCCESS > contains success message
+(pass) HTML_ERROR > contains error message [0.02ms]
+(pass) OAuth server concurrency (C1/C2) > C1: two concurrent waitForOAuthCallback flows both resolve correctly via state-keyed map [17.97ms]
+(pass) OAuth server concurrency (C1/C2) > concurrent startOAuthServer callers share one listen attempt [3.99ms]
+416 |       res.writeHead(200)
+417 |       res.end('busy')
+418 |     })
+419 |     await new Promise<void>((resolve) => blocker.listen(OAUTH_PORT, resolve))
+420 | 
+421 |     await expect(startOAuthServer()).rejects.toThrow()
+                                                   ^
+error: 
+
+Expected promise that rejects
+Received promise that resolved: Promise { <resolved> }
+
+      at <anonymous> (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:421:46)
+(fail) OAuth server concurrency (C1/C2) > startOAuthServer clears failed in-flight starts so a later retry can succeed [9.33ms]
+(pass) OAuth server concurrency (C1/C2) > C1: unknown-state callback returns 400 and does not disturb pending flows [4.38ms]
+(pass) OAuth server concurrency (C1/C2) > C1: missing state parameter returns 400 [3.91ms]
+(pass) OAuth server concurrency (C1/C2) > C2: server stops when no flows are pending after flowCleanup [4.40ms]
+(pass) OAuth server concurrency (C1/C2) > cancel for one state rejects that flow and keeps the server for other pending flows [3.92ms]
+51 |       })
+52 |     })
+53 |     if (closed) return
+54 |     await new Promise((resolve) => setTimeout(resolve, 10))
+55 |   }
+56 |   throw new Error(`OAuth port ${OAUTH_PORT} was still accepting listeners`)
+                 ^
+error: OAuth port 1455 was still accepting listeners
+      at expectOAuthPortClosed (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:56:13)
+      at async <anonymous> (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:543:11)
+(fail) OAuth server concurrency (C1/C2) > cancel without state rejects all flows and stops the server [1012.40ms]
+51 |       })
+52 |     })
+53 |     if (closed) return
+54 |     await new Promise((resolve) => setTimeout(resolve, 10))
+55 |   }
+56 |   throw new Error(`OAuth port ${OAUTH_PORT} was still accepting listeners`)
+                 ^
+error: OAuth port 1455 was still accepting listeners
+      at expectOAuthPortClosed (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:56:13)
+      at async <anonymous> (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:554:11)
+(fail) OAuth server concurrency (C1/C2) > unknown-state callback with no pending flows stops the idle server [1015.97ms]
+51 |       })
+52 |     })
+53 |     if (closed) return
+54 |     await new Promise((resolve) => setTimeout(resolve, 10))
+55 |   }
+56 |   throw new Error(`OAuth port ${OAUTH_PORT} was still accepting listeners`)
+                 ^
+error: OAuth port 1455 was still accepting listeners
+      at expectOAuthPortClosed (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:56:13)
+      at async <anonymous> (/Volumes/Topper2TB/Git/openai-auth/packages/opencode/src/tests/oauth.test.ts:566:11)
+(fail) OAuth server concurrency (C1/C2) > timeout cleans up the last pending flow and stops the server [1005.39ms]
+(pass) U1: IdTokenClaims type includes email [0.08ms]
+(pass) extractAccountIdFromClaims validation (U2) > rejects non-string accountId candidates [0.03ms]
+(pass) extractAccountIdFromClaims validation (U2) > validates nested claims object shape [0.02ms]
+(pass) extractAccountIdFromClaims validation (U2) > validates organizations array shape [0.02ms]
+(pass) upsertAccount U5 — label-tier guard > differing accountId + same label → two entries (no label-merge) [0.05ms]
+(pass) upsertAccount U5 — label-tier guard > no accountId + same label → label-merge (backward compat) [0.04ms]
+
+src/tests/dump.test.ts:
+(pass) request dumps > resolves configured Codex endpoint with env-over-config precedence [0.72ms]
+(pass) request dumps > routes Codex HTTP requests to configured endpoint without changing body shape [3.57ms]
+(pass) request dumps > defaults Codex endpoint to ChatGPT backend [0.07ms]
+(pass) request dumps > does not install the Codex/WebSocket fetch for manual API-key auth [0.15ms]
+(pass) request dumps > drops cached Codex session metadata when OpenCode deletes a session [3.67ms]
+(pass) request dumps > persists Codex prompt_cache_key mapping across plugin restarts [3.35ms]
+(pass) request dumps > rotates HTTP turn metadata for a new user turn and keeps it during tool continuations [3.42ms]
+(pass) request dumps > dumps final HTTP body and redacted request metadata when enabled [2.33ms]
+(pass) request dumps > dumps final WebSocket prewarm and main bodies when enabled [4.67ms]
+
+src/tests/rpc-server.test.ts:
+(pass) rpc-server > health is open; pending-notifications requires bearer and drains [7.48ms]
+(pass) rpc-server > rejects body exceeding 1 MB byte limit [6.15ms]
+(pass) rpc-server > rejects multibyte body where byte length exceeds limit but string length does not [6.77ms]
+
+src/tests/transport-quota.test.ts:
+(pass) ws codex.rate_limits → onQuota > emits onQuota when a codex.rate_limits frame arrives, and does NOT relay it as model output [11.61ms]
+(pass) ws codex.rate_limits → onQuota > no onQuota registered → codex.rate_limits frame is silently dropped [12.01ms]
+(pass) ws codex.rate_limits → onQuota > normalizeWsFrame maps the frame into the snapshot shape [0.12ms]
+(pass) HTTP quota push from x-codex-* headers > full x-codex-* headers → normalizeQuotaHeaders returns a snapshot [0.08ms]
+(pass) HTTP quota push from x-codex-* headers > absent x-codex-* headers → empty snapshot → setMain push skipped (conditional guard) [0.02ms]
+(pass) HTTP quota push from x-codex-* headers > partial x-codex-* headers → only the present windows [0.02ms]
+(pass) single-account path intact > normalizeQuotaHeaders works on a standard 200 response header set [0.02ms]
+(pass) ws-pool onQuota wiring > createWebSocketFetch threads onQuota into streamResponsesWebSocket [28.25ms]
+
+src/tests/review-fixes.test.ts:
+(pass) #1 refresh-file-lock: stale-lock steal guard > a fresh lock (different ownerId) written between reads causes the steal to abort [0.92ms]
+(pass) #1 refresh-file-lock: stale-lock steal guard > a stale lock with the same ownerId on re-read is correctly stolen [1.55ms]
+(pass) #3 QuotaManager.refreshMain: token-keyed deduplication > two concurrent calls with DIFFERENT tokens each trigger their own fetch [1023.42ms]
+(pass) #3 QuotaManager.refreshMain: token-keyed deduplication > two concurrent calls with the SAME token share one in-flight fetch [22.02ms]
+(pass) #5 saveAccountState: concurrent writes are serialized > concurrent saveAccountState calls complete without throwing (lock serializes them) [105.91ms]
+(pass) #5 saveAccountState: concurrent writes are serialized > saveAccountState with a held lock waits rather than corrupting the file [54.70ms]
+(pass) #6 readJsonIfPresent error handling > ENOENT → saveAccountState treats file as absent (no throw) [0.72ms]
+(pass) #6 readJsonIfPresent error handling > corrupt JSON in state file → saveAccountState throws instead of silently overwriting [0.70ms]
+(pass) #10 refreshSidebar rejection is swallowed > a throwing refreshSidebar does not propagate an unhandled rejection [11.95ms]
+(pass) MUST 1 — refresh-file-lock: atomic steal elects a single owner > two concurrent steals of the same stale lock elect exactly one owner [1.78ms]
+(pass) MUST 1 — refresh-file-lock: atomic steal elects a single owner > read-back loser returns null (different ownerId written after our rename) [0.18ms]
+(pass) MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd-race interleaving > refresh file lock stale-marker steal has a single winner under forced recreate race [5.25ms]
+(pass) MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd-race interleaving > refresh file lock stale-marker steal has a single winner across high-volume contention [12846.95ms]
+(pass) MUST 2 (R2) — saveAccounts: state-lock held across state-file read > interleaved saveAccounts + saveAccountState: saveAccountState update is not lost [1511.77ms]
+(pass) MUST 2 (R2) — saveAccounts: state-lock held across state-file read > externally-held state-lock blocks saveAccounts before it reads the state file [106.66ms]
+(pass) MUST 2 (R2) — saveAccountState: reads state file after acquiring lock > externally-held state-lock blocks saveAccountState before it reads [106.11ms]
+(pass) MUST 2 — QuotaManager._fetchMain: token-scoped inflight clear > second token's inflight slot survives the first token's finally [1023.36ms]
+(pass) MUST 2 — QuotaManager._fetchMain: token-scoped inflight clear > first token's finally does NOT clear second token's inflight (regression guard) [1013.88ms]
+(pass) MUST 3 — ws-pool: account-scoped pool key > same session + different account → different pool key (no socket reuse) [0.40ms]
+(pass) MUST 3 — ws-pool: account-scoped pool key > same session + same account → same pool key (socket reuse preserved) [0.43ms]
+(pass) MUST 3 — ws-pool: account-scoped pool key > remove() clears all entries for a session regardless of account [0.18ms]
+(pass) MUST 4 — saveAccounts: state-file write is protected by state-path lock > concurrent saveAccounts + saveAccountState do not lose the state-file update [993.22ms]
+(pass) MUST 4 — saveAccounts: state-file write is protected by state-path lock > saveAccounts holds state-lock: a concurrent saveAccountState waits [107.42ms]
+(pass) saveAccounts: honors OPENCODE_OPENAI_AUTH_STATE_FILE override > writes state to the override path, not the derived-default path [2.12ms]
+(pass) REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only on refresh-step failures > RED→GREEN: non-401 token-refresh failure (500, isRefreshError) during quota loop arms refresh backoff [2.54ms]
+(pass) REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only on refresh-step failures > quota-endpoint 401 (no isRefreshError) does NOT arm refresh backoff, only quota backoff [1.84ms]
+(pass) REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only on refresh-step failures > pure quota-fetch failure (non-401, no isRefreshError) does NOT arm refresh backoff [2.05ms]
+(pass) #12 NaN used_percent → no quota window > normalizeWsFrame: NaN primary used_percent → no primary window in snapshot [0.21ms]
+(pass) #12 NaN used_percent → no quota window > normalizeWsFrame: NaN in additional_rate_limits entry → entry skipped [0.18ms]
+(pass) #12 NaN used_percent → no quota window > normalizeWham: NaN primary used_percent → no primary window in snapshot [0.40ms]
+(pass) #12 NaN used_percent → no quota window > normalizeWham: NaN in additional_rate_limits entry → entry skipped [0.17ms]
+(pass) #12 NaN used_percent → no quota window > Infinity used_percent → no window (also non-finite) [0.31ms]
+
+src/tests/tui-preferences.test.ts:
+(pass) getTuiPreferencesFile > env override wins [0.54ms]
+(pass) getTuiPreferencesFile > OPENCODE_CONFIG_DIR beats XDG_CONFIG_HOME [0.33ms]
+(pass) getTuiPreferencesFile > XDG_CONFIG_HOME fallback appends opencode/ [0.39ms]
+(pass) readTuiPreferencesFile > missing file returns empty object [0.50ms]
+(pass) readTuiPreferencesFile > parses JSONC with comments and trailing commas [2.10ms]
+(pass) readTuiPreferencesFile > malformed file returns empty object [0.50ms]
+(pass) readTuiPreferencesFile > unterminated object returns empty object [0.41ms]
+(pass) readTuiPreferencesFile > trailing garbage after object returns empty object [0.34ms]
+(pass) readTuiPreferencesFile > non-object root returns empty object [0.62ms]
+(pass) resolveOpenaiAuthPrefs > empty root yields defaults [1.00ms]
+(pass) resolveOpenaiAuthPrefs > valid values pass through [0.32ms]
+(pass) resolveOpenaiAuthPrefs > numbers are clamped to their ranges [0.22ms]
+(pass) resolveOpenaiAuthPrefs > errorThreshold is forced above warnThreshold [0.36ms]
+(pass) resolveOpenaiAuthPrefs > warnThreshold is clamped to 0..99 so error can stay strictly above it [0.24ms]
+(pass) resolveOpenaiAuthPrefs > label is truncated to 20 chars and empty label falls back [0.20ms]
+(pass) resolveOpenaiAuthPrefs > bar chars reduce to first code point [0.45ms]
+(pass) resolveOpenaiAuthPrefs > wrong types fall back per key, unknown keys ignored [0.18ms]
+(pass) resolveOpenaiAuthPrefs > non-object plugin entry yields defaults [0.16ms]
+(pass) resolveOpenaiAuthPrefs > sections.pacing defaults true, accepts false, rejects wrong type [0.16ms]
+(pass) computeEffectiveOrder > missing key returns default order [0.14ms]
+(pass) computeEffectiveOrder > explicit order knob is used and clamped [0.19ms]
+(pass) computeEffectiveOrder > forceToTop beats any explicit order [0.14ms]
+(pass) computeEffectiveOrder > multiple forced plugins order by key position in file [0.14ms]
+(pass) computeEffectiveOrder > non-boolean forceToTop is ignored [0.14ms]
+(pass) queueTuiPreferenceUpdate > creates file with template on first write [1.42ms]
+(pass) queueTuiPreferenceUpdate > preserves comments and unrelated keys on update [0.78ms]
+(pass) queueTuiPreferenceUpdate > writes nested paths [0.78ms]
+(pass) queueTuiPreferenceUpdate > rapid sequential updates land the final value [1.63ms]
+(pass) queueTuiPreferenceUpdate > no temp files are left behind [1.04ms]
+(pass) watchTuiPreferences > fires after the file changes [458.68ms]
+(pass) watchTuiPreferences > debounces bursts into few callbacks [457.79ms]
+(pass) watchTuiPreferences > missing directory returns a no-op disposer [1.63ms]
+(pass) watchTuiPreferences > dispose stops callbacks [354.20ms]
+(pass) watchTuiPreferences > ignores sibling files that share the preferences name as a prefix [755.84ms]
+(pass) watchTuiPreferences > does not fire when the file is rewritten with identical content [454.04ms]
+
+src/tests/quota-push.test.ts:
+(pass) QuotaManager push > setMain push updates getMain without any network [0.57ms]
+(pass) QuotaManager push > conditional push: empty snapshot does NOT overwrite a valid cached one [0.28ms]
+(pass) QuotaManager push > setFallback push updates getFallback without any network [1.01ms]
+(pass) QuotaManager push > conditional push: empty fallback snapshot does NOT overwrite a valid cached one [0.20ms]
+
+src/tests/rpc-notifications.test.ts:
+(pass) notifications > push then drain returns the item once, ordered [0.09ms]
+(pass) notifications > session scoping: a session only drains its own + global [0.04ms]
+(pass) notifications > isTuiConnected reflects a recent drain within the window [0.03ms]
+(pass) notifications > queue cap evicts oldest beyond 100 [0.13ms]
+(pass) notifications > a global notification reaches every session and is not pruned by one ack [0.03ms]
+
+src/tests/quota-normalize.test.ts:
+(pass) quota normalize → QuotaSnapshot > HTTP x-codex-* headers (minutes) [0.97ms]
+(pass) quota normalize → QuotaSnapshot > HTTP headers: missing optional fields → undefined in snapshot [0.03ms]
+(pass) quota normalize → QuotaSnapshot > WS codex.rate_limits frame (minutes) [0.03ms]
+(pass) quota normalize → QuotaSnapshot > U-4: scans additional_rate_limits[] families (WS frame) [0.03ms]
+(pass) quota normalize → QuotaSnapshot > wham/usage JSON (seconds) [0.03ms]
+(pass) quota normalize → QuotaSnapshot > U-4: scans additional_rate_limits[] families (wham) [0.02ms]
+(pass) quota normalize → QuotaSnapshot > empty/missing rate_limits → empty snapshot [0.02ms]
+(pass) toResetIso > epoch seconds → ISO
+(pass) toResetIso > epoch seconds as string → ISO
+(pass) toResetIso > ms timestamp → ISO
+(pass) toResetIso > already ISO string → ISO (passthrough normalise) [0.01ms]
+(pass) toResetIso > undefined / null / empty → undefined [0.01ms]
+(pass) toResetIso > garbage string → undefined
+(pass) formatResetIn (NaN regression) > returns a non-NaN string for an ISO resetsAt [0.05ms]
+(pass) formatResetIn (NaN regression) > returns empty string for undefined
+(pass) formatResetIn (NaN regression) > returns empty string for garbage input (NaN guard)
+
+src/tests/integration.test.ts:
+(pass) integration: migration > seeds account store from a settings-only openai-auth.json without dropping transport keys [1.60ms]
+(pass) integration: migration > is idempotent — second run does not re-migrate or duplicate [1.17ms]
+(pass) integration: HTTP quota push > pushes main quota from x-codex-* headers into sidebar state [2.19ms]
+(pass) integration: WS quota push > onQuota fires for codex.rate_limits frame and the frame is NOT relayed as SSE output [11.36ms]
+(pass) integration: 429 → reactive fallback > retries through a fallback account when main returns 429 [57.29ms]
+(pass) integration: active fallback routing > uses the active fallback token without writing it to the auth slot [1.79ms]
+(pass) integration: active fallback routing > waits on a held main refresh file lock and uses the rotated auth token [65.00ms]
+(pass) integration: active fallback routing > deduplicates concurrent in-process main refreshes and releases the lock on success [32.61ms]
+(pass) integration: active fallback routing > uses a stale main token on refresh failure and releases the lock [4.73ms]
+(pass) integration: active fallback routing > captures cachekeep fallback targets by storage id, not ChatGPT account id [2.69ms]
+(pass) integration: active fallback routing > keeps capture enabled across loader reconstruction so the new manager can self-arm [2.30ms]
+(pass) integration: active fallback routing > persists cachekeep enabled on and off [2.57ms]
+(pass) integration: active fallback routing > resolves cachekeep fallback accounts by storage id or ChatGPT account id [0.36ms]
+(pass) integration: active fallback routing > attributes active fallback quota to the fallback and keeps the fresh sidebar activeId [0.97ms]
+(pass) integration: active fallback routing > refreshes an expired active fallback without writing the auth slot [1.38ms]
+(pass) integration: active fallback routing > does not throw when active fallback refresh fails and falls back to stale fallback access [1.05ms]
+(pass) integration: active fallback routing > captures cachekeep bodies before the WebSocket transport early return [3.12ms]
+(pass) integration: active fallback routing > does not capture subagent cachekeep bodies with x-parent-session-id [2.33ms]
+(pass) integration: active fallback routing > demotes to main when active fallback has no usable access token [1.40ms]
+(pass) integration: active fallback routing > sends the refreshed main token when main primary starts expired [2.68ms]
+(pass) integration: active fallback routing > uses main before other fallbacks when routing mode is unset [0.80ms]
+(pass) integration: no real config read > getConfigPath uses the isolated temp file, not the real user config [0.32ms]
+(pass) integration: no real config read > getAccountStoragePath uses the isolated temp file [0.09ms]
+(pass) integration: no real config read > getAccountStatePath uses the isolated temp file [0.08ms]
+(pass) integration: no real config read > getSidebarStateFile uses the isolated temp file [0.07ms]
+(pass) integration: models cost-zeroing > OAuth + no costZeroing key → costs ZEROED (default-on preserved) [0.47ms]
+(pass) integration: models cost-zeroing > OAuth + costZeroing.enabled === false → original cost PRESERVED [0.25ms]
+(pass) integration: models cost-zeroing > OAuth + costZeroing.enabled === true → costs ZEROED [0.25ms]
+(pass) integration: models cost-zeroing > non-OAuth → provider.models returned untouched (no storage read) [0.11ms]
+
+src/tests/cli.test.ts:
+(pass) CLI browser opener > uses cmd /c start on Windows because start is a cmd.exe builtin [0.70ms]
+(pass) CLI browser opener > uses open on macOS and xdg-open elsewhere [0.07ms]
+
+src/tests/logger.test.ts:
+(pass) logger levels > suppresses debug when level=info, includes warn [0.37ms]
+(pass) logger safety > circular payload preserves non-circular fields and marks [Circular] [11.46ms]
+(pass) logger safety > diamond shared ref (no cycle) serializes fully without [Circular] [11.55ms]
+(pass) logger safety > degrade-catch net still catches non-cycle throws (BigInt) and emits [unserializable] [12.09ms]
+(pass) logger redaction > redacts compound secret keys (accessToken, apiKey, clientSecret, bearerToken, refreshToken) [0.44ms]
+(pass) logger redaction > keeps non-secret camelCase keys (sessionKey, cacheKey, lastAccessAt, accountId) [0.27ms]
+(pass) logger redaction > keeps token COUNT keys (input_tokens, cached_tokens, output_tokens) unredacted [0.24ms]
+(pass) logger redaction > redacts simple secret keys (authorization, x-api-key, cookie, refresh, token) [0.24ms]
+(pass) logger redaction > masks token-shaped values and secret keys in structured data [0.23ms]
+
+src/tests/command-dialogs.test.ts:
+(pass) command dialogs > cachekeep modal shows Turn on when disabled [0.14ms]
+(pass) command dialogs > cachekeep modal shows Turn off when enabled [0.05ms]
+
+4 tests failed:
+(fail) OAuth server concurrency (C1/C2) > startOAuthServer clears failed in-flight starts so a later retry can succeed [9.33ms]
+(fail) OAuth server concurrency (C1/C2) > cancel without state rejects all flows and stops the server [1012.40ms]
+(fail) OAuth server concurrency (C1/C2) > unknown-state callback with no pending flows stops the idle server [1015.97ms]
+(fail) OAuth server concurrency (C1/C2) > timeout cleans up the last pending flow and stops the server [1005.39ms]
+
+ 388 pass
+ 4 fail
+ 6977 expect() calls
+Ran 392 tests across 26 files. [26.28s]
+error: script "test" exited with code 1
+error: script "test" exited with code 1
+EXIT_TEST:1
+
+=== ISOLATED RE-RUN: bun test src/tests/oauth.test.ts ===
+32 pass / 4 fail (deterministic). lsof -iTCP:1455 = none (not a stray-port env issue).
+
+FAILING TESTS (OAuth server concurrency C1/C2), first error block:
+  1) startOAuthServer clears failed in-flight starts so a later retry can succeed
+     oauth.test.ts:421  await expect(startOAuthServer()).rejects.toThrow()
+     error: Expected promise that rejects / Received promise that resolved
+  2) cancel without state rejects all flows and stops the server
+  3) unknown-state callback with no pending flows stops the idle server
+  4) timeout cleans up the last pending flow and stops the server
+     oauth.test.ts:56  error: OAuth port 1455 was still accepting listeners
+
+QUARTET RESULTS:
+  bun install   EXIT 0
+  bun typecheck EXIT 0
+  bun test      EXIT 1  <-- FAILED (388 pass, 4 fail, 392 total across 26 files)
+  bun build     NOT RUN (gate blocked before build)
+
+Merge commit SHA: 6445633420b782aced4213adbaee5db252027355
+git log --merges -1 --oneline:
+6445633 merge: PR#7 feat/parity (multi-account, quota, cachekeep, modals, CLI)
+
+TASK-3: FAILED — PRIORITY GATE BLOCKED — 'bun run test' failed (4 OAuth-server concurrency tests in packages/opencode/src/tests/oauth.test.ts). First error: startOAuthServer() resolved instead of rejecting when port 1455 was already bound, and the OAuth server kept accepting listeners after cancel/timeout/unknown-state. Merge commit 6445633420b782aced4213adbaee5db252027355 is present on local/fork but the validation quartet is NOT green. STOPPING — do not proceed to subsequent tasks.

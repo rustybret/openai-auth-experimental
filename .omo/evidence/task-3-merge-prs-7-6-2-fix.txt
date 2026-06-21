@@ -1,0 +1,103 @@
+=== TASK-3-FIX EVIDENCE: fix 4 failing OAuth-server tests after PR#7 merge ===
+Branch: local/fork (on top of merge commit 6445633)
+Files changed: 2 (packages/opencode/src/core/oauth.ts, packages/opencode/src/tests/oauth.test.ts)
+
+---------------------------------------------------------------------------
+CHANGE 1 — packages/opencode/src/tests/oauth.test.ts (~line 419)
+Test: "startOAuthServer clears failed in-flight starts so a later retry can succeed"
+Blocker now binds to 127.0.0.1 (matching startOAuthServer) so the port actually conflicts.
+
+OLD:
+    await new Promise<void>((resolve) => blocker.listen(OAUTH_PORT, resolve))
+
+NEW:
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject)
+      blocker.listen(OAUTH_PORT, '127.0.0.1', () => {
+        blocker.off('error', reject)
+        resolve()
+      })
+    })
+
+---------------------------------------------------------------------------
+CHANGE 2 — packages/opencode/src/core/oauth.ts  stopOAuthServer()
+
+OLD (PR#7 original):
+  export function stopOAuthServer() {
+    if (oauthServer) {
+      const server = oauthServer
+      oauthServer = undefined
+      server.close(() => {})
+      server.closeIdleConnections?.()
+      const closeConnections = setTimeout(() => {
+        server.closeAllConnections?.()
+      }, 25)
+      closeConnections.unref?.()
+    }
+  }
+
+NEW (applied fix):
+  export function stopOAuthServer() {
+    if (oauthServer) {
+      const server = oauthServer
+      oauthServer = undefined
+      server.closeIdleConnections?.()
+      server.close(() => {})
+      // Force-close any still-active connection (e.g. the in-flight response that
+      // triggered this stop) on the next tick, so the response can flush first but
+      // the port is released well within the test's 1s wait.
+      const forceClose = setTimeout(() => {
+        server.closeAllConnections?.()
+      }, 0)
+      forceClose.unref?.()
+    }
+  }
+
+DEVIATION FROM PRESCRIBED FIX (important — read this):
+The task prescribed a SYNCHRONOUS force-close: call server.closeAllConnections?.()
+immediately BEFORE server.close(). I applied that verbatim first and it REGRESSED
+6 previously-passing tests with ECONNRESET / ConnectionRefused (30 pass / 6 fail).
+
+Root cause the prescription missed: stopOAuthServer() is invoked from INSIDE the
+HTTP request handler in oauth.ts (lines ~341, ~344, ~361, ~364, ~375, ~403) and in
+several paths it runs BEFORE/around res.end() flushes. A synchronous
+closeAllConnections() destroys the very socket that is mid-response, so the client's
+fetch() sees a reset connection. The original code deferred the force-close exactly
+to avoid this.
+
+Empirical verification (Bun probe, /tmp/probe2.ts, since removed):
+  - orig 25ms deferred force-close: port freed within 1s = true
+  - next-tick (setTimeout 0) deferred force-close: port freed within 1s = true
+So the deferral interval was never the problem; the broken case was the synchronous
+close killing the in-flight response. The minimal correct fix keeps the force-close
+DEFERRED (next tick) so the response flushes, while still releasing the port far
+inside the 1s expectOAuthPortClosed() window. The reorder (closeIdleConnections +
+close scheduled before deferred force-close) plus the test-side 127.0.0.1 bind make
+all 4 originally-failing tests pass without regressing the other 32.
+
+---------------------------------------------------------------------------
+VERIFICATION RESULTS
+---------------------------------------------------------------------------
+
+bun test packages/opencode/src/tests/oauth.test.ts
+  36 pass / 0 fail / 88 expect() calls / 36 tests in 1 file
+  EXIT 0   (was 32 pass / 4 fail before the fix)
+
+bun run typecheck
+  $ cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck
+  $ tsc   $ tsc
+  EXIT 0
+
+bun run test  (full suite)
+  392 pass / 0 fail / 6978 expect() calls / 392 tests across 26 files
+  EXIT 0   (was 388 pass / 4 fail)
+
+bun run build
+  index.js  0.44 MB (entry point) + chunks + cli.js/sidebar-state.js/tui-preferences.js/rpc entry points
+  rm -rf dist && tsc -p tsconfig.build.json
+  EXIT 0
+  dist artifact: -rw-r--r-- packages/opencode/dist/index.js  435475 bytes  (exists)
+
+QUARTET (post-fix): install=0  typecheck=0  test=0  build=0  -> ALL GREEN
+
+TASK-3-FIX: OK
