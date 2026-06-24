@@ -240,6 +240,11 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       const requestBody = orderCodexBody(
         applyTurnId(entry, withContinuation(entry, sourceBody)),
       )
+      // The request chained to the prior continuation iff it carries a
+      // previous_response_id (withContinuation only sets it when it actually
+      // trimmed against the prior response; an empty-suffix full replay does not).
+      const mainChainedToPrior =
+        typeof requestBody.previous_response_id === 'string'
       await dumpCodexRequest({
         sessionID: dumpSessionID,
         transport: 'websocket',
@@ -266,7 +271,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             responseID: responseID(event),
             usage,
           })
-          updateContinuation(entry, sourceBody, event, finalizedCallIds)
+          updateContinuation(
+            entry,
+            sourceBody,
+            event,
+            finalizedCallIds,
+            mainChainedToPrior,
+          )
         },
         onTerminal: (event) => {
           entry.busy = false
@@ -499,7 +510,9 @@ async function prewarm(
         responseID: responseID(event),
         usage: responseUsage(event),
       })
-      updateContinuation(entry, request, event, finalizedCallIds)
+      // A prewarm always starts a fresh chain (previous_response_id:null), so it
+      // never inherits the prior turn's finalized set.
+      updateContinuation(entry, request, event, finalizedCallIds, false)
     },
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
@@ -643,6 +656,10 @@ function updateContinuation(
   fullBody: Record<string, unknown>,
   event: Record<string, unknown>,
   finalizedCallIds: Set<string>,
+  // Whether the request that produced this response actually chained via
+  // previous_response_id to the PRIOR continuation. Only then does this response's
+  // reconstructable context include the prior chain's finalized calls.
+  chainedToPrior: boolean,
 ) {
   const response = event.response
   const responseID =
@@ -653,17 +670,17 @@ function updateContinuation(
     entry.continuation = undefined
     return
   }
-  // Accumulate finalized call ids across the whole previous_response_id chain, not
-  // just the latest response. A continuation suffix can carry the output of a call
-  // finalized several responses back (delayed/parallel tool output); that call is
-  // already in the chained context, so it must still be trimmed — re-sending its
-  // function_call inline would duplicate it. A prewarm (generate:false) starts a
-  // fresh chain (previous_response_id:null), so it resets the set rather than
-  // inheriting the prior turn's ids; this also bounds the set to one turn.
-  const isPrewarm = fullBody.generate === false
-  const chainFinalized = isPrewarm
-    ? new Set<string>()
-    : new Set(entry.continuation?.finalizedCallIds)
+  // Accumulate finalized call ids across the previous_response_id chain, not just
+  // the latest response: a suffix can carry the output of a call finalized several
+  // responses back (delayed/parallel tool output) — already in the chained context,
+  // so still safe to trim. CRUCIAL: only inherit the prior set when THIS request
+  // actually chained to it. A request sent WITHOUT previous_response_id (a prewarm,
+  // or a full replay emitted when the continuation suffix filtered to empty) starts
+  // a fresh reconstructable context; inheriting a stale set there could later trim a
+  // function_call this response's context does not contain → re-orphan → 400.
+  const chainFinalized = chainedToPrior
+    ? new Set(entry.continuation?.finalizedCallIds)
+    : new Set<string>()
   for (const id of finalizedCallIds) chainFinalized.add(id)
   entry.continuation = {
     responseID,

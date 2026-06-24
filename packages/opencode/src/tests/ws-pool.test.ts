@@ -561,6 +561,96 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('resets the finalized set after an unchained full replay so a later continuation does not trim a call the chain target lacks', async () => {
+    // Guards the round-2 hole: the cumulative finalized set must NOT be inherited
+    // across a request that was sent WITHOUT previous_response_id. Sequence:
+    //  - R1 finalizes call_B.
+    //  - A turn appends only a droppable item (an assistant message), so the
+    //    continuation suffix filters to empty -> withContinuation sends the full
+    //    body UNCHAINED (no previous_response_id). Its response (R2) does NOT
+    //    contain call_B.
+    //  - A later turn sends call_B's function_call+output. If the finalized set had
+    //    been inherited across the unchained break, call_B would be trimmed and
+    //    chained to R2 (which lacks it) -> orphan -> 400. It must be kept inline.
+    const sent: Array<Record<string, unknown>> = []
+    let main = 0
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          sent.push(parsed)
+          if (parsed.generate === false) {
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'resp_prewarm' },
+              }),
+            )
+            return
+          }
+          main += 1
+          // Only R1 finalizes call_B. R2 (the unchained full replay) finalizes nothing.
+          if (main === 1) {
+            message(
+              JSON.stringify({
+                type: 'response.output_item.done',
+                item: {
+                  type: 'function_call',
+                  call_id: 'call_B',
+                  name: 'read',
+                },
+              }),
+            )
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_main_${main}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const url = 'https://example.test/backend-api/codex/responses'
+        const user = {
+          role: 'user',
+          content: [{ type: 'input_text', text: 'go' }],
+        }
+        const assistant = {
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'thinking' }],
+        }
+        const fcB = { type: 'function_call', call_id: 'call_B', name: 'read' }
+        const outB = {
+          type: 'function_call_output',
+          call_id: 'call_B',
+          output: 'b',
+        }
+
+        // Turn 1: [user] -> prewarm + R1 (finalizes call_B).
+        await websocketFetch(url, streamRequest({ input: [user] }))
+        // Turn 2: appends only an assistant message -> suffix filters to empty ->
+        // sent as an UNCHAINED full replay (no previous_response_id). R2 response.
+        await websocketFetch(url, streamRequest({ input: [user, assistant] }))
+        const r2 = sent[sent.length - 1]
+        expect(r2?.previous_response_id).toBeUndefined()
+        // Turn 3: call_B's invocation+output land. Must be kept inline (chained to
+        // R2, which does not contain call_B).
+        await websocketFetch(
+          url,
+          streamRequest({ input: [user, assistant, fcB, outB] }),
+        )
+        const r3 = sent[sent.length - 1]
+        expect(r3?.previous_response_id).toBe('resp_main_2')
+        expect(r3?.input).toEqual([fcB, outB])
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('treats custom_tool_call symmetrically: trims finalized, keeps unfinalized inline', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(
