@@ -892,9 +892,16 @@ function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
   try {
     const parsed = JSON.parse(body)
     if (!isRecord(parsed) || !isRecord(parsed.client_metadata)) return body
-    if (!('x-codex-ws-stream-request-start-ms' in parsed.client_metadata))
+    if (
+      !(
+        'x-codex-turn-metadata' in parsed.client_metadata ||
+        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
+      )
+    ) {
       return body
+    }
     const clientMetadata = { ...parsed.client_metadata }
+    delete clientMetadata['x-codex-turn-metadata']
     delete clientMetadata['x-codex-ws-stream-request-start-ms']
     return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
   } catch {

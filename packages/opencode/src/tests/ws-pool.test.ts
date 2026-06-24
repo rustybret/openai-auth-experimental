@@ -255,6 +255,9 @@ describe('createWebSocketFetch', () => {
             input: [],
             client_metadata: {
               keep: 'stable',
+              'x-codex-installation-id': 'install-1',
+              'x-codex-window-id': 'window-1',
+              'x-codex-turn-metadata': '{"turn_id":"ws-only"}',
               'x-codex-ws-stream-request-start-ms': '12345',
             },
           }),
@@ -269,7 +272,11 @@ describe('createWebSocketFetch', () => {
           string,
           unknown
         >
-        expect(fallbackBody.client_metadata).toEqual({ keep: 'stable' })
+        expect(fallbackBody.client_metadata).toEqual({
+          keep: 'stable',
+          'x-codex-installation-id': 'install-1',
+          'x-codex-window-id': 'window-1',
+        })
         websocketFetch.close()
       },
     )
