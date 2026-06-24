@@ -108,11 +108,24 @@ export async function codexRefreshFn(input: {
     }) as ProviderHttpError
   }
   const tokens = (await response.json()) as TokenResponse
+  if (
+    !tokens ||
+    typeof tokens.access_token !== 'string' ||
+    !tokens.access_token ||
+    typeof tokens.refresh_token !== 'string' ||
+    !tokens.refresh_token ||
+    typeof tokens.expires_in !== 'number'
+  ) {
+    throw Object.assign(new Error('Token refresh failed: malformed response'), {
+      status: response.status,
+      isRefreshError: true,
+    }) as ProviderHttpError
+  }
   return {
     access: tokens.access_token,
     refresh: tokens.refresh_token,
-    expires: tokens.expires_in ? input.now() + tokens.expires_in * 1000 : 0,
-    expiresIn: tokens.expires_in ?? 3600,
+    expires: input.now() + tokens.expires_in * 1000,
+    expiresIn: tokens.expires_in,
   }
 }
 
