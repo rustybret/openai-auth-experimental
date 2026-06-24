@@ -133,12 +133,19 @@ export function buildQuotaOperationError(input: {
 } {
   const previousRetryCount = input.previous?.retryCount ?? 0
   const retryCount = previousRetryCount + 1
-  const delay = isTransientQuotaError(input.error)
-    ? Math.min(
-        MAX_QUOTA_RETRY_DELAY_MS,
-        MIN_QUOTA_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
-      )
-    : NON_TRANSIENT_QUOTA_RETRY_DELAY_MS
+  let delay: number
+  const retryAfter = (input.error as { retryAfter?: number } | null | undefined)
+    ?.retryAfter
+  if (typeof retryAfter === 'number' && retryAfter > 0) {
+    delay = retryAfter * 1000
+  } else if (isTransientQuotaError(input.error)) {
+    delay = Math.min(
+      MAX_QUOTA_RETRY_DELAY_MS,
+      MIN_QUOTA_RETRY_DELAY_MS * 2 ** Math.min(retryCount - 1, 6),
+    )
+  } else {
+    delay = NON_TRANSIENT_QUOTA_RETRY_DELAY_MS
+  }
   return {
     message: formatErrorMessage(input.error),
     checkedAt: input.now,

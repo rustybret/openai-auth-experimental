@@ -166,6 +166,43 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(normalizeWham({ rate_limit: {} })).toEqual({})
     expect(normalizeQuotaHeaders(new Headers({}))).toEqual({})
   })
+
+  it('out-of-range used_percent values are treated as undefined/absent', () => {
+    const h1 = new Headers({ 'x-codex-primary-used-percent': '-10' })
+    expect(normalizeQuotaHeaders(h1).primary).toBeUndefined()
+    const h2 = new Headers({ 'x-codex-primary-used-percent': '110' })
+    expect(normalizeQuotaHeaders(h2).primary).toBeUndefined()
+    const h3 = new Headers({ 'x-codex-primary-used-percent': 'NaN' })
+    expect(normalizeQuotaHeaders(h3).primary).toBeUndefined()
+
+    const ws1 = normalizeWsFrame({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: { used_percent: -5, window_minutes: 300 },
+      },
+    })
+    expect(ws1.primary).toBeUndefined()
+    const ws2 = normalizeWsFrame({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: { used_percent: 105, window_minutes: 300 },
+      },
+    })
+    expect(ws2.primary).toBeUndefined()
+
+    const wham1 = normalizeWham({
+      rate_limit: {
+        primary_window: { used_percent: -1, limit_window_seconds: 18000 },
+      },
+    })
+    expect(wham1.primary).toBeUndefined()
+    const wham2 = normalizeWham({
+      rate_limit: {
+        primary_window: { used_percent: 101, limit_window_seconds: 18000 },
+      },
+    })
+    expect(wham2.primary).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
