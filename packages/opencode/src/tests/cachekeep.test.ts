@@ -1888,10 +1888,8 @@ describe('CacheKeepManager token resolution', () => {
 
   test('session.deleted event removes target by threadID and prevents further warm fires', async () => {
     const originalFetch = globalThis.fetch
-    let lastFetchHeaders: Headers | undefined
 
-    globalThis.fetch = (async (url: any, init: any) => {
-      lastFetchHeaders = new Headers(init?.headers)
+    globalThis.fetch = (async (_url: any, _init: any) => {
       return new Response('{}')
     }) as any
 

@@ -20,7 +20,7 @@ function shouldBypassProxy(url: URL): boolean {
         return true
       }
     } else {
-      if (host === entry || host.endsWith('.' + entry)) {
+      if (host === entry || host.endsWith(`.${entry}`)) {
         return true
       }
     }
