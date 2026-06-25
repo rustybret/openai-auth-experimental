@@ -490,6 +490,79 @@ describe('integration: killswitch enforcement', () => {
     }
   })
 
+  it('keeps blocking a killed main across a token refresh (no fail-open leak)', async () => {
+    // The leak: the quota cache is token-bound, so a routine OAuth token refresh
+    // would turn a known-exhausted account into "unknown" → fail open → spend.
+    // The policy peek is identity-bound, so the block must survive the refresh.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // below threshold
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+
+      // getAuth returns a DIFFERENT access token on each call, emulating a token
+      // refresh between the two requests (same account, new credential).
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      let authCall = 0
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: `sk-rotating-${authCall++}`,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      // Request 1: unknown quota → passes, hits upstream, pushes low quota bound
+      // to the first token.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+      expect(mock.calls()).toBe(1)
+
+      // Request 2: getAuth now returns a NEW token. A token-bound read would miss
+      // and fail open; the identity-bound policy peek still sees the kill.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(429)
+      await second.body?.cancel()
+      // Still no extra spend despite the token change.
+      expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('reroutes to a healthy fallback when the killswitch kills main', async () => {
     // Main killed (high threshold), one fallback whose quota is unknown — unknown
     // fails OPEN by default, so it survives the killswitch filter and serves.

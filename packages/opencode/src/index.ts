@@ -900,6 +900,9 @@ export async function CodexAuthPlugin(
           snapshot: Record<string, unknown>,
           accessToken: string,
           accountId?: string,
+          // ChatGPT account identity for the MAIN account, so the killswitch's
+          // policy read survives a token refresh but still drops on a switch.
+          mainAccountIdentity?: string,
         ) {
           if (Object.keys(snapshot).length === 0) return
           const now = Date.now()
@@ -913,7 +916,7 @@ export async function CodexAuthPlugin(
           if (accountId && accountId !== 'main') {
             quotaManager.setFallback(accountId, entry, accessToken)
           } else {
-            quotaManager.setMain(accessToken, entry)
+            quotaManager.setMain(accessToken, entry, mainAccountIdentity)
           }
           logQ.debug('quota pushed', {
             pid: process.pid,
@@ -1248,14 +1251,17 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
 
         // Last-seen pushed quota for the resolved primary (fallback or main).
-        // Push-only: no network fetch here.
+        // Push-only: no network fetch here. Uses the NON-invalidating policy
+        // peeks (bound to stable account identity) so a routine token refresh
+        // does not turn a known-exhausted account into "unknown" (which would
+        // fail open and spend). A genuine account switch still drops the entry.
         function killswitchPrimaryQuota(
           active: OAuthAccount | undefined,
-          access: string,
+          mainAccountIdentity: string | undefined,
         ) {
           return active
-            ? quotaManager.getFallback(active.id, access)?.quota
-            : quotaManager.getMain(access)?.quota
+            ? quotaManager.peekFallbackForPolicy(active.id)?.quota
+            : quotaManager.peekMainForPolicy(mainAccountIdentity)?.quota
         }
 
         // Synthetic provider-shaped 429 with a Retry-After derived from the
@@ -1382,9 +1388,11 @@ export async function CodexAuthPlugin(
           let killswitchFiltered = candidates
           if (isKillswitchEnabled(fallbackStorage)) {
             killswitchFiltered = candidates.filter((c) => {
+              // Non-invalidating policy peeks: a token refresh must not flip a
+              // killed account to "unknown" and let a reroute spend on it.
               const quota = c.isMain
-                ? quotaManager.getMain(c.access)?.quota
-                : quotaManager.getFallback(c.quotaAccountId ?? '', c.access)
+                ? quotaManager.peekMainForPolicy(c.accountId)?.quota
+                : quotaManager.peekFallbackForPolicy(c.quotaAccountId ?? '')
                     ?.quota
               return killswitchPassesPolicy(
                 quota,
@@ -1611,7 +1619,10 @@ export async function CodexAuthPlugin(
             const killswitchBlocksPrimary =
               isKillswitchEnabled(reqStorage) &&
               !killswitchPassesPolicy(
-                killswitchPrimaryQuota(activeFallback, primaryAccess),
+                killswitchPrimaryQuota(
+                  activeFallback,
+                  authWithAccount.accountId,
+                ),
                 reqStorage,
                 activeFallback?.id,
               )
@@ -1666,7 +1677,12 @@ export async function CodexAuthPlugin(
                   fallbackQuotaAccountId,
                 )
               } else {
-                await pushQuota(snapshot, primaryAccess, activeFallback?.id)
+                await pushQuota(
+                  snapshot,
+                  primaryAccess,
+                  activeFallback?.id,
+                  activeFallback ? undefined : authWithAccount.accountId,
+                )
               }
             } catch {
               // Quota push is best-effort — never break the response

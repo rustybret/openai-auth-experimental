@@ -137,6 +137,11 @@ export class QuotaManager {
   // --- State ---
   private main: QuotaEntry | null = null
   private mainTokenFp: string | null = null
+  // Stable ChatGPT account identity of the account that produced `main` (when
+  // known). Lets the killswitch read survive a token REFRESH (same account, new
+  // access token) while still detecting an account SWITCH — unlike mainTokenFp,
+  // which changes on every refresh and would drop the cache.
+  private mainQuotaAccountId: string | null = null
   private fallbacks = new Map<string, QuotaEntry>()
   // Fingerprint of the access token that produced each fallback cache entry, so
   // a re-login (credential change) for the same account id invalidates the
@@ -236,12 +241,45 @@ export class QuotaManager {
   // persisted account.quota on boot)
   // =========================================================================
 
-  setMain(accessToken: string, entry: QuotaEntry): void {
+  setMain(accessToken: string, entry: QuotaEntry, accountId?: string): void {
     // Conditional-push guard: never overwrite a valid cached snapshot with
     // an empty one (no window data).
     if (!hasAnyQuotaWindow(entry.quota)) return
     this.mainTokenFp = tokenFingerprint(accessToken)
+    if (accountId) this.mainQuotaAccountId = accountId
     this.main = entry
+  }
+
+  /**
+   * Non-invalidating read of the cached main quota for POLICY decisions
+   * (killswitch). Unlike getMain(token), a token mismatch does NOT drop the
+   * cache — an access-token refresh is a same-account event and must not turn a
+   * known-exhausted account into "unknown" (which would fail open and spend).
+   *
+   * Pass the live ChatGPT accountId to still drop on a genuine account SWITCH:
+   * if the cached entry's account identity is known and differs, return null so
+   * the killswitch treats it as unknown rather than judging account A by account
+   * B's quota. When identity is unknown on either side, the cached snapshot is
+   * returned (best-effort) — the same fail-open-on-unknown stance as elsewhere.
+   */
+  peekMainForPolicy(accountId?: string): QuotaEntry | null {
+    if (
+      accountId &&
+      this.mainQuotaAccountId &&
+      this.mainQuotaAccountId !== accountId
+    ) {
+      return null
+    }
+    return this.main
+  }
+
+  /**
+   * Non-invalidating read of a cached fallback quota for POLICY decisions
+   * (killswitch). Keyed by the stable internal account id, so a token refresh
+   * for the same account does not drop it (getFallback(id, token) would).
+   */
+  peekFallbackForPolicy(accountId: string): QuotaEntry | null {
+    return this.fallbacks.get(accountId) ?? null
   }
 
   setFallback(
@@ -424,6 +462,7 @@ export class QuotaManager {
 
     this.main = entry
     this.mainTokenFp = persisted.tokenFingerprint ?? null
+    if (storage?.mainAccountId) this.mainQuotaAccountId = storage.mainAccountId
   }
 
   private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
