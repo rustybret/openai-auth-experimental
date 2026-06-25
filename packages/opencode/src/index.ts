@@ -1739,15 +1739,24 @@ export async function CodexAuthPlugin(
         cleanAbort()
       }
       const command = input.command as CommandModalName
-      // Thread session-aware notification capability into the command context
-      // so the detached add-flow completion can deliver feedback to the user.
-      if (cmdCtx) {
-        cmdCtx.sessionId = input.sessionID
-        cmdCtx.notify = (payload) => {
+      // Build a PER-INVOCATION context that threads this request's session id and
+      // notifier. Mutating the shared cmdCtx would race across concurrent sessions:
+      // the detached add-flow snapshots ctx.sessionId only after an await, so a
+      // second session's modal command in that window could misroute the first
+      // session's OAuth feedback. A per-call copy is never mutated by another turn.
+      const callCtx: CommandContext = {
+        // biome-ignore lint/style/noNonNullAssertion: guarded above (cleanAbort throws when cmdCtx is null)
+        ...cmdCtx!,
+        sessionId: input.sessionID,
+        notify: (payload) => {
           pushNotification(payload, input.sessionID)
-        }
+        },
       }
-      const payload = await buildDialogPayload(command, input.arguments, cmdCtx)
+      const payload = await buildDialogPayload(
+        command,
+        input.arguments,
+        callCtx,
+      )
       if (isTuiConnected(input.sessionID)) {
         pushNotification(payload, input.sessionID)
       } else {
