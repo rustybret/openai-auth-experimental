@@ -319,8 +319,10 @@ async function executeAccountCommand(
         ) {
           const msg =
             'That account is already your main account — not added as a fallback.'
+          // Log the internal account id, never the ChatGPT stable id (a sensitive
+          // identity from the OAuth claims).
           log.warn('account add rejected (main identity)', {
-            accountId: account.accountId,
+            id: account.id,
             sessionId,
           })
           notify?.({

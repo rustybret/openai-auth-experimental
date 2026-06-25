@@ -130,23 +130,26 @@ describe('logger redaction', () => {
     expect(txt).toContain('"status"')
   })
 
-  it('redacts account identity keys (accountId, chatgptAccountId, chatgpt-account-id)', async () => {
+  it('redacts only the ChatGPT stable id, not the internal accountId key', async () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
     const { createLogger, flushForTest } = await import('../logger.ts')
     const log = createLogger('transport')
     log.info('account-keys', {
-      accountId: 'acc-123',
+      // Bare accountId carries the INTERNAL id/key ('main' or a fallback id) in
+      // every diagnostic log — safe and needed for debugging, so NOT redacted.
+      accountId: 'main',
       chatgptAccountId: 'chatgpt-acc-456',
       'chatgpt-account-id': 'chatgpt-acc-789',
       chatgpt_account_id: 'chatgpt-acc-000',
     })
     await flushForTest()
     const txt = readFileSync(logFile, 'utf8')
-    expect(txt).not.toContain('acc-123')
+    // Internal id stays visible.
+    expect(txt).toContain('"accountId":"main"')
+    // Every form of the ChatGPT stable id is redacted.
     expect(txt).not.toContain('chatgpt-acc-456')
     expect(txt).not.toContain('chatgpt-acc-789')
     expect(txt).not.toContain('chatgpt-acc-000')
-    expect(txt).toContain('"accountId":"***REDACTED***"')
     expect(txt).toContain('"chatgptAccountId":"***REDACTED***"')
     expect(txt).toContain('"chatgpt-account-id":"***REDACTED***"')
     expect(txt).toContain('"chatgpt_account_id":"***REDACTED***"')
