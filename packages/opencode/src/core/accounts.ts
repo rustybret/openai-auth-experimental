@@ -801,6 +801,61 @@ export async function saveAccounts(
   }
 }
 
+/**
+ * Read-modify-write the account store atomically under the save lock.
+ *
+ * Unlike saveAccounts (which UNION-merges the incoming accounts with the latest
+ * on-disk set so concurrent ADDS from another process are never lost), this
+ * reads the freshest state under the lock and writes the mutator's result
+ * AUTHORITATIVELY — no union. That is required for structural edits (remove,
+ * reorder): a union cannot express a deletion (the removed id reappears from
+ * `latest`) or a reordering (the union is seeded latest-first). Because the
+ * mutator runs against freshly-read state under the lock, an add committed by a
+ * concurrent process is still visible to it and preserved.
+ *
+ * The mutator may edit `current` in place and return it, or return a new
+ * storage object. Returning undefined means "no change" and still rewrites the
+ * freshly-read state (a harmless idempotent write).
+ */
+export async function mutateAccounts(
+  mutate: (current: AccountStorage) => AccountStorage | undefined,
+  path = getAccountStoragePath(),
+): Promise<AccountStorage> {
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path)
+  try {
+    const stateLock = await acquireSaveAccountsLock(statePath)
+    try {
+      const configJson = await readJsonIfPresent(path)
+      const stateJson = await readJsonIfPresent(statePath)
+      const current =
+        (configJson.exists
+          ? normalizeStorage(
+              mergeConfigAndState(configJson.value, stateJson.value),
+            )
+          : null) ?? emptyAccountStorage()
+      const next = mutate(current) ?? current
+      const existing = isRecord(configJson.value) ? configJson.value : {}
+      const nextConfig = { ...existing, ...configFromStorage(next) }
+      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(statePath, stateFromStorage(next))
+      return next
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
+}
+
+function emptyAccountStorage(): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+  }
+}
+
 function applyMainQuotaStatePatch(
   state: AccountRuntimeState,
   storage: AccountStorage,

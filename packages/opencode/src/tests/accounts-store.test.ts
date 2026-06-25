@@ -236,3 +236,131 @@ describe('accounts store', () => {
     ])
   })
 })
+
+describe('mutateAccounts (authoritative structural edits)', () => {
+  function oauth(id: string): OAuthAccount {
+    return {
+      id,
+      type: 'oauth',
+      access: `acc-${id}`,
+      refresh: `ref-${id}`,
+      expires: Date.now() + 3600_000,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+  }
+
+  it('removal persists and is NOT resurrected by a load/save round-trip', async () => {
+    const { loadAccounts, saveAccounts, mutateAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauth('a'), oauth('b'), oauth('c')],
+      },
+      cfgPath,
+    )
+
+    await mutateAccounts((current) => {
+      const idx = current.accounts.findIndex((a) => a.id === 'b')
+      current.accounts.splice(idx, 1)
+      return current
+    }, cfgPath)
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.accounts.map((a) => a.id)).toEqual(['a', 'c'])
+
+    // The config file on disk must also no longer contain the removed id —
+    // proving the deletion was authoritative, not just an in-memory filter.
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['a', 'c'])
+  })
+
+  it('reordering persists (union-merge would have ignored it)', async () => {
+    const { loadAccounts, saveAccounts, mutateAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauth('x'), oauth('y'), oauth('z')],
+      },
+      cfgPath,
+    )
+
+    // Swap x and z.
+    await mutateAccounts((current) => {
+      const tmp = current.accounts[0]!
+      current.accounts[0] = current.accounts[2]!
+      current.accounts[2] = tmp
+      return current
+    }, cfgPath)
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.accounts.map((a) => a.id)).toEqual(['z', 'y', 'x'])
+  })
+
+  it('preserves a concurrent add committed by another writer before the lock', async () => {
+    const { loadAccounts, saveAccounts, mutateAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauth('keep')],
+      },
+      cfgPath,
+    )
+
+    // Hold the save lock so the mutate call blocks until we release it.
+    const lock = await acquireRefreshFileLock({
+      name: 'save',
+      ttlMs: 10_000,
+      path: cfgPath,
+    })
+    expect(lock).not.toBeNull()
+
+    // Start a removal of 'keep' — it will block on the lock.
+    const mutate = mutateAccounts((current) => {
+      const idx = current.accounts.findIndex((a) => a.id === 'keep')
+      if (idx !== -1) current.accounts.splice(idx, 1)
+      return current
+    }, cfgPath)
+
+    // While blocked, another writer commits a brand-new account directly to disk
+    // (writeFile, not saveAccounts — saveAccounts would block on the same lock).
+    await new Promise((r) => setTimeout(r, 50))
+    await writeFile(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'keep', type: 'oauth', enabled: true },
+          { id: 'concurrent', type: 'oauth', enabled: true },
+        ],
+      })}\n`,
+    )
+    await writeFile(
+      statePath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: {
+          keep: oauth('keep'),
+          concurrent: oauth('concurrent'),
+        },
+      })}\n`,
+    )
+
+    await lock?.release()
+    await mutate
+
+    // mutateAccounts read the freshest state under the lock, so it removed
+    // 'keep' WITHOUT losing the concurrently-added 'concurrent'.
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.accounts.map((a) => a.id).sort()).toEqual(['concurrent'])
+  })
+})

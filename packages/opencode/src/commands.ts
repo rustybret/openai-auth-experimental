@@ -5,6 +5,7 @@ import {
   saveAccounts as defaultSaveAccounts,
   isOAuthAccount,
   type KillswitchConfig,
+  mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
 } from './core/accounts'
@@ -232,61 +233,76 @@ async function executeAccountCommand(
 
   if (tokens[0] === 'remove' && tokens[1]) {
     const targetId = tokens[1]
-    const idx = accounts.findIndex((a) => a.id === targetId)
-    if (idx === -1) {
+    // Structural edit: route through mutateAccounts so the deletion is written
+    // authoritatively. saveAccounts union-merges latest ∪ incoming by id, which
+    // would resurrect the removed account from the on-disk `latest` set.
+    let removed = false
+    const next = await mutateAccounts((current) => {
+      const idx = current.accounts.findIndex((a) => a.id === targetId)
+      if (idx === -1) return current
+      removed = true
+      const wasActive = current.routing?.activeId === targetId
+      current.accounts.splice(idx, 1)
+      // If removing the active account, repoint to the next OAuth fallback or main.
+      if (wasActive) {
+        const nextActive = current.accounts.find(isOAuthAccount)
+        current.routing = {
+          ...(current.routing ?? {}),
+          activeId: nextActive?.id ?? 'main',
+        }
+      }
+      return current
+    }, ctx.accountStoragePath)
+
+    if (!removed) {
       return {
         command: 'openai-account',
         text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts },
+        knobs: { accounts: next.accounts },
       }
     }
 
-    const wasActive = storage.routing?.activeId === targetId
-    accounts.splice(idx, 1)
-
-    // If removing the active account, repoint to the next OAuth fallback or main.
-    if (wasActive) {
-      const next = accounts.find(isOAuthAccount)
-      storage.routing = {
-        ...(storage.routing ?? {}),
-        activeId: next?.id ?? 'main',
-      }
-    }
-
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('account removed', { id: targetId })
     void ctx.refreshSidebar?.().catch(() => {})
 
     return {
       command: 'openai-account',
       text: `## Account Removed\n\nRemoved account \`${targetId}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: next.accounts },
     }
   }
 
   if (tokens[0] === 'order' && tokens.length >= 3) {
-    // Reorder: swap positions of two accounts
-    const a = accounts.findIndex((ac) => ac.id === tokens[1])
-    const b = accounts.findIndex((ac) => ac.id === tokens[2])
-    if (a === -1 || b === -1) {
+    // Reorder: swap positions of two accounts. Structural edit — route through
+    // mutateAccounts. saveAccounts seeds its union map latest-first, so a
+    // reordered `incoming` array would be ignored and the swap silently lost.
+    let ok = false
+    const next = await mutateAccounts((current) => {
+      const a = current.accounts.findIndex((ac) => ac.id === tokens[1])
+      const b = current.accounts.findIndex((ac) => ac.id === tokens[2])
+      if (a === -1 || b === -1) return current
+      ok = true
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      const tmp = current.accounts[a]!
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      current.accounts[a] = current.accounts[b]!
+      current.accounts[b] = tmp
+      return current
+    }, ctx.accountStoragePath)
+
+    if (!ok) {
       return {
         command: 'openai-account',
         text: '## Invalid Order\n\nBoth account IDs must exist.',
-        knobs: { accounts },
+        knobs: { accounts: next.accounts },
       }
     }
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    const tmp = accounts[a]!
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    accounts[a] = accounts[b]!
-    accounts[b] = tmp
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('accounts reordered', { a: tokens[1], b: tokens[2] })
     void ctx.refreshSidebar?.().catch(() => {})
     return {
       command: 'openai-account',
       text: `## Accounts Reordered\n\nSwapped positions of \`${tokens[1]}\` and \`${tokens[2]}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: next.accounts },
     }
   }
 
@@ -307,16 +323,24 @@ async function executeAccountCommand(
     // never reach the user.
     completion
       .then(async (account) => {
-        const store = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        let rejectedAsMain = false
+        // Route the add through mutateAccounts: read-modify-write under the lock
+        // so a concurrent add/remove cannot clobber this insertion, and so the
+        // main-identity check reads the freshest mainAccountId.
+        await mutateAccounts((current) => {
+          if (
+            account.accountId &&
+            current.mainAccountId &&
+            account.accountId === current.mainAccountId
+          ) {
+            rejectedAsMain = true
+            return current
+          }
+          upsertAccount(current.accounts, account as OAuthAccount)
+          return current
+        }, ctx.accountStoragePath)
 
-        if (
-          account.accountId &&
-          store.mainAccountId &&
-          account.accountId === store.mainAccountId
-        ) {
+        if (rejectedAsMain) {
           const msg =
             'That account is already your main account — not added as a fallback.'
           // Log the internal account id, never the ChatGPT stable id (a sensitive
@@ -333,8 +357,6 @@ async function executeAccountCommand(
           return
         }
 
-        upsertAccount(store.accounts, account as OAuthAccount)
-        await defaultSaveAccounts(store, ctx.accountStoragePath)
         log.info('account added', {
           id: account.id,
           label: account.label,
