@@ -315,7 +315,13 @@ export async function startOAuthServer(): Promise<{
   port: number
   redirectUri: string
 }> {
-  const redirectUri = `http://127.0.0.1:${OAUTH_PORT}/auth/callback`
+  // MUST be `localhost`, not `127.0.0.1`. This exact string is sent as the
+  // OAuth `redirect_uri` (both in the authorize URL and the token exchange) and
+  // OpenAI matches it EXACTLY against the redirect URI registered for the Codex
+  // client (`http://localhost:1455/auth/callback`). Using 127.0.0.1 yields
+  // `authorize_hydra_invalid_request`. The HTTP server still binds to 127.0.0.1
+  // below — the browser resolves localhost to it — so do not "standardize" this.
+  const redirectUri = `http://localhost:${OAUTH_PORT}/auth/callback`
   if (oauthServer) {
     return { port: OAUTH_PORT, redirectUri }
   }

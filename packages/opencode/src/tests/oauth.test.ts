@@ -292,15 +292,17 @@ describe('extractAccountId', () => {
 describe('buildAuthorizeUrl', () => {
   test('builds a URL with required params', () => {
     const url = buildAuthorizeUrl(
-      'http://127.0.0.1:1455/auth/callback',
+      'http://localhost:1455/auth/callback',
       { verifier: 'v', challenge: 'c' },
       'state123',
     )
     expect(url).toContain('https://auth.openai.com/oauth/authorize')
     expect(url).toContain('code_challenge=c')
     expect(url).toContain('state=state123')
+    // redirect_uri MUST use localhost to match OpenAI's registered Codex client
+    // redirect URI exactly (127.0.0.1 → authorize_hydra_invalid_request).
     expect(url).toContain(
-      'redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback',
+      'redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback',
     )
   })
 })
@@ -375,6 +377,8 @@ describe('OAuth server concurrency (C1/C2)', () => {
   test('C1: two concurrent waitForOAuthCallback flows both resolve correctly via state-keyed map', async () => {
     const { redirectUri } = await startOAuthServer()
     expect(redirectUri).toContain(String(OAUTH_PORT))
+    // Must be localhost (OpenAI matches the registered redirect URI exactly).
+    expect(redirectUri).toBe(`http://localhost:${OAUTH_PORT}/auth/callback`)
 
     const pkce1 = { verifier: 'v1', challenge: 'c1' }
     const pkce2 = { verifier: 'v2', challenge: 'c2' }
@@ -430,7 +434,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
 
     await expect(startOAuthServer()).resolves.toEqual({
       port: OAUTH_PORT,
-      redirectUri: `http://127.0.0.1:${OAUTH_PORT}/auth/callback`,
+      redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
     })
   })
 
@@ -698,11 +702,14 @@ describe('upsertAccount U5 — label-tier guard', () => {
 // Regression tests for security/robustness hardening
 // ---------------------------------------------------------------------------
 
-describe('Loopback redirect-URI family mismatch (Fix 1)', () => {
-  test('redirectUri uses 127.0.0.1 instead of localhost', async () => {
+describe('Redirect-URI must match OpenAI-registered value', () => {
+  test('redirectUri uses localhost, not 127.0.0.1', async () => {
+    // OpenAI matches the redirect URI EXACTLY against the value registered for
+    // the Codex client (http://localhost:1455/auth/callback). 127.0.0.1 yields
+    // authorize_hydra_invalid_request. The server still binds to 127.0.0.1.
     const { redirectUri } = await startOAuthServer()
-    expect(redirectUri).toContain('http://127.0.0.1:')
-    expect(redirectUri).not.toContain('localhost')
+    expect(redirectUri).toContain('http://localhost:')
+    expect(redirectUri).not.toContain('127.0.0.1')
   })
 })
 
