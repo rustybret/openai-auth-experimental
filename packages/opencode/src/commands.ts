@@ -3,7 +3,6 @@ import {
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
   saveAccounts as defaultSaveAccounts,
-  isOAuthAccount,
   type KillswitchConfig,
   mutateAccounts,
   type OAuthAccount,
@@ -176,58 +175,22 @@ async function executeAccountCommand(
         'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add a fallback account.',
       )
     } else {
-      const activeId = storage.routing?.activeId ?? 'main'
+      const mode: RoutingMode = storage.routing?.mode ?? 'main-first'
+      lines.push(`Routing: \`${mode}\` (set with \`/openai-routing\`).`)
+      lines.push('')
       for (const a of accounts) {
-        const marker = a.id === activeId ? ' *active*' : ''
         const type = (a as { type?: string }).type ?? 'oauth'
-        lines.push(`- \`${a.id}\`${marker} (${type})`)
+        lines.push(`- \`${a.id}\` (${type})`)
       }
     }
     lines.push('')
     lines.push(
-      'Commands: `/openai-account add [label]` | `/openai-account switch <id>` | `/openai-account remove <id>`',
+      'Commands: `/openai-account add [label]` | `/openai-account remove <id>`',
     )
     return {
       command: 'openai-account',
       text: lines.join('\n'),
       knobs: { accounts },
-    }
-  }
-
-  if (tokens[0] === 'switch' && tokens[1]) {
-    const targetId = tokens[1]
-
-    if (targetId === 'main') {
-      storage.routing = { ...(storage.routing ?? {}), activeId: 'main' }
-      await defaultSaveAccounts(storage, ctx.accountStoragePath)
-      log.info('account switched', { activeId: 'main' })
-      void ctx.refreshSidebar?.().catch(() => {})
-      return {
-        command: 'openai-account',
-        text: '## Account Switched\n\nActive account is now main.',
-        knobs: { accounts, activeId: 'main' },
-      }
-    }
-
-    const account = accounts.find((a) => a.id === targetId)
-    if (!account) {
-      return {
-        command: 'openai-account',
-        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts },
-      }
-    }
-
-    // Persist the active account id
-    storage.routing = { ...(storage.routing ?? {}), activeId: targetId }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
-    log.info('account switched', { activeId: targetId })
-    void ctx.refreshSidebar?.().catch(() => {})
-
-    return {
-      command: 'openai-account',
-      text: `## Account Switched\n\nActive account is now \`${targetId}\`.`,
-      knobs: { accounts, activeId: targetId },
     }
   }
 
@@ -241,16 +204,7 @@ async function executeAccountCommand(
       const idx = current.accounts.findIndex((a) => a.id === targetId)
       if (idx === -1) return current
       removed = true
-      const wasActive = current.routing?.activeId === targetId
       current.accounts.splice(idx, 1)
-      // If removing the active account, repoint to the next OAuth fallback or main.
-      if (wasActive) {
-        const nextActive = current.accounts.find(isOAuthAccount)
-        current.routing = {
-          ...(current.routing ?? {}),
-          activeId: nextActive?.id ?? 'main',
-        }
-      }
       return current
     }, ctx.accountStoragePath)
 

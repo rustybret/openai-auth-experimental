@@ -1048,7 +1048,8 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'fallback-1', ...routing },
+        // fallback-first: the single fallback is tried before main, so it serves.
+        routing: { mode: 'fallback-first', ...routing },
       }),
     )
   }
@@ -1477,7 +1478,7 @@ describe('integration: active fallback routing', () => {
     ).toBe('work-alt')
   })
 
-  it('attributes active fallback quota to the fallback and keeps the fresh sidebar activeId', async () => {
+  it('fallback-first attributes served-fallback quota to the fallback and marks it active in the sidebar', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
@@ -1496,7 +1497,8 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        // fallback-first: the fallback is tried before main and serves.
+        routing: { mode: 'fallback-first' },
       }),
     )
 
@@ -1520,28 +1522,6 @@ describe('integration: active fallback routing', () => {
         Date.now() + 3600_000,
       )
       hooks = loaded.hooks
-
-      writeFileSync(
-        configFile,
-        JSON.stringify({
-          version: 1,
-          main: { type: 'opencode', provider: 'openai' },
-          accounts: [
-            {
-              id: 'work-alt',
-              type: 'oauth',
-              label: 'Work Alt',
-              enabled: true,
-              access: 'work-alt-token',
-              refresh: 'work-alt-refresh',
-              expires: Date.now() + 3600_000 * 24,
-              accountId: 'chatgpt-work-alt',
-            },
-          ],
-          refresh: { refreshBeforeExpiryMinutes: 5 },
-          routing: { activeId: 'work-alt' },
-        }),
-      )
 
       const response = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
@@ -1618,10 +1598,12 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('does not throw when active fallback refresh fails and falls back to stale fallback access', async () => {
+  it('fallback-first uses a still-valid fallback token when its refresh fails', async () => {
+    // Token is inside the refresh window (needs refresh) but NOT expired, so a
+    // failed refresh must not drop it — the still-valid token is used.
     seedStorage({
       access: 'fallback-stale-token',
-      expires: Date.now() - 60_000,
+      expires: Date.now() + 2 * 60_000,
     })
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
@@ -1653,6 +1635,47 @@ describe('integration: active fallback routing', () => {
     }
   })
 
+  it('fallback-first does not re-try fallbacks reactively after main also fails (no double-spend)', async () => {
+    // fallback-first with one fallback that 429s: the proactive gate tries it,
+    // falls through to main, and main also 429s. The reactive path must NOT
+    // re-try the already-tried fallback — so the fallback is hit exactly once.
+    seedStorage({ access: 'fallback-access-token' })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        throw new Error('refresh unavailable')
+      }
+      seenAuth.push(headerValue(init, 'authorization'))
+      // Everything is rate-limited.
+      return new Response('{}', { status: 429 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(429)
+      await response.body?.cancel()
+      // Fallback tried once (proactive), then main once — no reactive re-try.
+      expect(seenAuth).toEqual([
+        'Bearer fallback-access-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('captures cachekeep bodies before the WebSocket transport early return', async () => {
     writeFileSync(
       configFile,
@@ -1661,7 +1684,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
 
@@ -1715,7 +1738,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
 
@@ -1807,7 +1830,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
     const authSetCalls: unknown[] = []
@@ -1853,7 +1876,7 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('uses main before other fallbacks when routing mode is unset', async () => {
+  it('main-first (default): tries main first, then reactively falls back on 429', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
@@ -1880,16 +1903,18 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'fallback-1' },
+        // Default (main-first): main is the primary; no per-account pin.
+        routing: { mode: 'main-first' },
       }),
     )
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
+    // Main (main-stale-token) is rate-limited → reactive fallback to fallback-1.
     globalThis.fetch = (async (_url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       return new Response('{}', {
-        status: auth.includes('fallback-primary-token') ? 429 : 200,
+        status: auth.includes('main-stale-token') ? 429 : 200,
       })
     }) as unknown as typeof globalThis.fetch
 
@@ -1907,9 +1932,10 @@ describe('integration: active fallback routing', () => {
       )
 
       expect(response.status).toBe(200)
+      // Main tried first, then the first usable fallback served.
       expect(seenAuth).toEqual([
-        'Bearer fallback-primary-token',
         'Bearer main-stale-token',
+        'Bearer fallback-primary-token',
       ])
     } finally {
       globalThis.fetch = originalFetch

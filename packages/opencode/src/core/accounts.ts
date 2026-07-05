@@ -176,8 +176,10 @@ export type AccountStorage = {
     provider: 'openai'
   }
   routing?: {
+    // Routing is purely mode-driven (main-first | fallback-first). There is no
+    // persisted "active account" pin — the account that serves each request is
+    // decided per-request by the mode + quota/killswitch policy.
     mode?: RoutingMode
-    activeId?: string
   }
   fallbackOn?: number[]
   refresh?: {

@@ -33,6 +33,7 @@ import {
   loadAccounts,
   migrateIfNeeded,
   type OAuthAccount,
+  type RoutingMode,
   saveAccounts,
   shouldFallbackStatus,
 } from './core/accounts'
@@ -956,6 +957,10 @@ export async function CodexAuthPlugin(
         // during tests where afterEach restores the env floor).
         // -------------------------------------------------------------------
         const boundSidebarFile = getSidebarStateFile()
+        // Display-only: the account that actually served the most recent request
+        // (main or a fallback id). Routing has no persisted pin, so this is how
+        // the sidebar shows the true active account. Defaults to main.
+        let lastServedActiveId = 'main'
         async function writeSidebarState(
           qm: QuotaManager,
           store: Awaited<ReturnType<typeof loadAccounts>>,
@@ -979,7 +984,7 @@ export async function CodexAuthPlugin(
                   enabled: true,
                 }
               }),
-            activeId: store.routing?.activeId ?? 'main',
+            activeId: lastServedActiveId,
             route: store.routing?.mode ?? 'main-first',
             lastUpdated: Date.now(),
           }
@@ -1250,18 +1255,13 @@ export async function CodexAuthPlugin(
         // Killswitch helpers (opt-in hard circuit-breaker on cached quota).
         // -------------------------------------------------------------------
 
-        // Last-seen pushed quota for the resolved primary (fallback or main).
-        // Push-only: no network fetch here. Uses the NON-invalidating policy
-        // peeks (bound to stable account identity) so a routine token refresh
-        // does not turn a known-exhausted account into "unknown" (which would
-        // fail open and spend). A genuine account switch still drops the entry.
-        function killswitchPrimaryQuota(
-          active: OAuthAccount | undefined,
-          mainAccountIdentity: string | undefined,
-        ) {
-          return active
-            ? quotaManager.peekFallbackForPolicy(active.id)?.quota
-            : quotaManager.peekMainForPolicy(mainAccountIdentity)?.quota
+        // Last-seen pushed quota for the MAIN account (the primary is always
+        // main). Push-only: no network fetch here. Uses the NON-invalidating
+        // policy peek (bound to stable account identity) so a routine token
+        // refresh does not turn a known-exhausted account into "unknown" (which
+        // would fail open and spend). A genuine account switch still drops it.
+        function killswitchMainQuota(mainAccountIdentity: string | undefined) {
+          return quotaManager.peekMainForPolicy(mainAccountIdentity)?.quota
         }
 
         // Synthetic provider-shaped 429 with a Retry-After derived from the
@@ -1304,34 +1304,26 @@ export async function CodexAuthPlugin(
         }
 
         // -------------------------------------------------------------------
-        // tryFallbackAccounts — reactive: iterate getUsableFallbackAccounts
-        // and retry with each candidate's access token.
+        // Fallback candidate building (shared by the proactive fallback-first
+        // gate and the reactive main-error path). The primary is ALWAYS main, so
+        // main is never a fallback candidate here.
         // -------------------------------------------------------------------
-        async function tryFallbackAccounts(
-          requestInput: RequestInfo | URL,
-          init: RequestInit | undefined,
-          primaryResponse: Response,
-          primaryFallbackId?: string,
-        ) {
-          if (!isReplayableRequest(init)) return { response: primaryResponse }
+        type FallbackCandidate = {
+          access: string
+          accountId?: string
+          keepwarmAccountKey: string
+          quotaAccountId: string
+          fallback: FallbackAccount
+        }
 
-          const fallbackStorage = await loadRequestAccounts()
+        async function usableFallbackCandidates(
+          fallbackStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): Promise<FallbackCandidate[]> {
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(fallbackStorage)
-
-          type Candidate = {
-            access: string
-            accountId?: string
-            keepwarmAccountKey: string
-            quotaAccountId?: string
-            fallback?: FallbackAccount
-            isMain?: true
-          }
-          const candidates: Candidate[] = []
-
-          // Fallback candidates: exclude the primary when it was a fallback
+          const candidates: FallbackCandidate[] = []
           for (const fb of usableFallbacks) {
-            if (fb.id !== primaryFallbackId && fb.access) {
+            if (fb.access) {
               candidates.push({
                 access: fb.access,
                 accountId: fb.accountId,
@@ -1341,68 +1333,77 @@ export async function CodexAuthPlugin(
               })
             }
           }
-
-          // When primary is a fallback, include main as a candidate
-          let mainCandidate: Candidate | undefined
-          if (primaryFallbackId) {
-            const mainAuth = await getAuth()
-            if (
-              mainAuth.type === 'oauth' &&
-              (mainAuth.access || mainAuth.refresh)
-            ) {
-              let mainAccess = mainAuth.access ?? ''
-              if (!mainAuth.access || (mainAuth.expires ?? 0) < Date.now()) {
-                try {
-                  mainAccess = (await refreshMainWithLease()).access
-                } catch {
-                  // Use stale token on refresh failure
-                }
-              }
-              if (mainAccess) {
-                const mainAuthWithAccount = mainAuth as typeof mainAuth & {
-                  accountId?: string
-                }
-                mainCandidate = {
-                  access: mainAccess,
-                  accountId: mainAuthWithAccount.accountId,
-                  keepwarmAccountKey: 'main',
-                  isMain: true,
-                }
-              }
-            }
-          }
-
-          // Honor routing.mode ordering: main-first puts main at the front,
-          // fallback-first puts main last.
-          if (mainCandidate) {
-            if (fallbackStorage?.routing?.mode === 'fallback-first') {
-              candidates.push(mainCandidate)
-            } else {
-              candidates.unshift(mainCandidate)
-            }
-          }
-
           // Killswitch: drop any candidate whose last-seen quota is below its
-          // threshold so a reroute never spends on a killed account. Opt-in —
-          // a no-op when the killswitch is disabled.
-          let killswitchFiltered = candidates
-          if (isKillswitchEnabled(fallbackStorage)) {
-            killswitchFiltered = candidates.filter((c) => {
-              // Non-invalidating policy peeks: a token refresh must not flip a
-              // killed account to "unknown" and let a reroute spend on it.
-              const quota = c.isMain
-                ? quotaManager.peekMainForPolicy(c.accountId)?.quota
-                : quotaManager.peekFallbackForPolicy(c.quotaAccountId ?? '')
-                    ?.quota
-              return killswitchPassesPolicy(
-                quota,
-                fallbackStorage,
-                c.isMain ? undefined : c.quotaAccountId,
-              )
-            })
-          }
+          // threshold so routing never spends on a killed account. Opt-in — a
+          // no-op when disabled. Non-invalidating peek so a token refresh does
+          // not flip a killed account to "unknown".
+          if (!isKillswitchEnabled(fallbackStorage)) return candidates
+          return candidates.filter((c) =>
+            killswitchPassesPolicy(
+              quotaManager.peekFallbackForPolicy(c.quotaAccountId)?.quota,
+              fallbackStorage,
+              c.quotaAccountId,
+            ),
+          )
+        }
 
-          if (!killswitchFiltered.length) return { response: primaryResponse }
+        // -------------------------------------------------------------------
+        // tryFallbackFirst — proactive (fallback-first mode): try usable
+        // fallbacks BEFORE main. Returns the first fallback that serves, or
+        // undefined if none serve so the caller falls through to main.
+        // -------------------------------------------------------------------
+        async function tryFallbackFirst(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+          fallbackStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): Promise<
+          | {
+              response: Response
+              accessToken: string
+              quotaAccountId: string
+              activeId: string
+            }
+          | undefined
+        > {
+          const candidates = await usableFallbackCandidates(fallbackStorage)
+          for (const candidate of candidates) {
+            const response = await sendWithAccessToken(
+              requestInput,
+              init,
+              candidate.access,
+              candidate.accountId,
+              candidate.keepwarmAccountKey,
+            )
+            if (!shouldFallbackStatus(response.status, fallbackStorage)) {
+              await fallbackManager.markUsed(candidate.fallback)
+              return {
+                response,
+                accessToken: candidate.access,
+                quotaAccountId: candidate.quotaAccountId,
+                activeId: candidate.keepwarmAccountKey,
+              }
+            }
+            // This fallback failed — discard its body and try the next.
+            response.body?.cancel().catch(() => {})
+          }
+          return undefined
+        }
+
+        // -------------------------------------------------------------------
+        // tryFallbackAccounts — reactive: main returned a fallback status, so
+        // retry with each usable fallback's access token.
+        // -------------------------------------------------------------------
+        async function tryFallbackAccounts(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+          primaryResponse: Response,
+          _unused?: string,
+        ) {
+          if (!isReplayableRequest(init)) return { response: primaryResponse }
+
+          const fallbackStorage = await loadRequestAccounts()
+          const candidates = await usableFallbackCandidates(fallbackStorage)
+          if (!candidates.length) return { response: primaryResponse }
 
           // Keep the returned response body live; only cancel a response after a
           // later retry has produced a replacement.
@@ -1411,7 +1412,7 @@ export async function CodexAuthPlugin(
             | { accessToken: string; accountId?: string }
             | undefined
 
-          for (const candidate of killswitchFiltered) {
+          for (const candidate of candidates) {
             const response = await sendWithAccessToken(
               requestInput,
               init,
@@ -1430,15 +1431,13 @@ export async function CodexAuthPlugin(
             }
 
             if (!shouldFallbackStatus(response.status, fallbackStorage)) {
-              if (candidate.fallback) {
-                await fallbackManager.markUsed(candidate.fallback)
-              }
+              await fallbackManager.markUsed(candidate.fallback)
               return { response, ...lastQuotaTarget }
             }
           }
 
-          // All fallbacks exhausted (or none had .access). Return the last
-          // response — its body is always intact (never cancelled here).
+          // All fallbacks exhausted. Return the last response — its body is
+          // always intact (never cancelled here).
           return { response: lastResponse, ...lastQuotaTarget }
         }
 
@@ -1491,63 +1490,20 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            // Select the active primary account for this request.
+            // Routing is purely mode-driven. The primary is ALWAYS the main
+            // account; fallback-first is handled by a proactive gate below that
+            // tries usable fallbacks before main. There is no per-account pin.
             const reqStorage = await loadRequestAccounts()
-            const activeId = reqStorage?.routing?.activeId ?? 'main'
 
-            let activeFallback =
-              activeId !== 'main'
-                ? reqStorage?.accounts.find(
-                    (a): a is OAuthAccount =>
-                      a.enabled !== false &&
-                      a.id === activeId &&
-                      isOAuthAccount(a),
-                  )
-                : undefined
-
-            let currentAuth: {
+            // Main primary uses opencode's auth slot.
+            const currentAuth: {
               type: string
               access?: string
               refresh?: string
               expires?: number
-            }
-            let primaryAccess: string
-
-            if (activeFallback && reqStorage) {
-              // Refresh fallback primaries through fallback storage only; the
-              // single auth slot remains the main account.
-              let resolvedFallback = activeFallback
-              try {
-                resolvedFallback = await fallbackManager.refreshAccount(
-                  activeFallback,
-                  reqStorage,
-                )
-              } catch {
-                // Keep a stale fallback token when one exists; otherwise demote.
-              }
-
-              if (resolvedFallback.access) {
-                activeFallback = resolvedFallback
-                currentAuth = {
-                  type: 'oauth',
-                  access: resolvedFallback.access,
-                  refresh: resolvedFallback.refresh,
-                  expires: resolvedFallback.expires,
-                }
-                primaryAccess = resolvedFallback.access
-              } else {
-                activeFallback = undefined
-                currentAuth = await getAuth()
-                if (currentAuth.type !== 'oauth')
-                  return fetch(requestInput, init)
-                primaryAccess = currentAuth.access ?? ''
-              }
-            } else {
-              // Main primary uses opencode's auth slot.
-              currentAuth = await getAuth()
-              if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
-              primaryAccess = currentAuth.access ?? ''
-            }
+            } = await getAuth()
+            if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+            let primaryAccess: string = currentAuth.access ?? ''
 
             // Strip any existing auth headers — we set them
             if (init?.headers) {
@@ -1578,76 +1534,110 @@ export async function CodexAuthPlugin(
             }
 
             // Refresh expired main tokens and mirror them into opencode's slot.
-            if (!activeFallback) {
-              if (
-                !currentAuth.access ||
-                (currentAuth.expires ?? 0) < Date.now()
-              ) {
-                logR.debug('token refresh triggered', {
-                  pid: process.pid,
-                  hasAccess: Boolean(currentAuth.access),
-                  expiresInMs: currentAuth.expires
-                    ? currentAuth.expires - Date.now()
-                    : undefined,
-                })
-                try {
-                  const refreshed = await refreshMainWithLease()
-                  currentAuth.access = refreshed.access
-                  currentAuth.refresh = refreshed.refresh
-                  currentAuth.expires = refreshed.expires
-                } catch {
-                  // Use stale token on refresh failure
-                }
+            if (
+              !currentAuth.access ||
+              (currentAuth.expires ?? 0) < Date.now()
+            ) {
+              logR.debug('token refresh triggered', {
+                pid: process.pid,
+                hasAccess: Boolean(currentAuth.access),
+                expiresInMs: currentAuth.expires
+                  ? currentAuth.expires - Date.now()
+                  : undefined,
+              })
+              try {
+                const refreshed = await refreshMainWithLease()
+                currentAuth.access = refreshed.access
+                currentAuth.refresh = refreshed.refresh
+                currentAuth.expires = refreshed.expires
+              } catch {
+                // Use stale token on refresh failure
               }
-              primaryAccess = currentAuth.access ?? ''
             }
+            primaryAccess = currentAuth.access ?? ''
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
             }
+            const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
 
-            // Killswitch (opt-in): act on last-seen cached quota, push-only — no
-            // network fetch on the hot path. If the resolved primary is below its
-            // threshold, do NOT spend on it: synthesize a 429 so the existing
-            // reactive-fallback path reroutes to a surviving account, and if none
-            // survive (or the body is non-replayable so a fallback is impossible)
-            // the 429 stands as the hard block (with a Retry-After). Blocking is
-            // independent of replayability — the killswitch's contract is "never
-            // spend below threshold", so a non-replayable request hard-fails
-            // rather than spending on the killed account.
-            let response: Response
-            const killswitchBlocksPrimary =
-              isKillswitchEnabled(reqStorage) &&
-              !killswitchPassesPolicy(
-                killswitchPrimaryQuota(
-                  activeFallback,
-                  authWithAccount.accountId,
-                ),
-                reqStorage,
-                activeFallback?.id,
-              )
-            if (killswitchBlocksPrimary) {
-              logA.debug('killswitch blocked primary', {
-                pid: process.pid,
-                activeId: activeFallback?.id ?? 'main',
-              })
-              response = killswitchBlockedResponse(reqStorage)
-            } else {
-              // Send through the resolved primary account.
-              response = await sendWithAccessToken(
-                requestInput,
-                init,
-                primaryAccess,
-                activeFallback?.accountId ?? authWithAccount.accountId,
-                activeFallback?.id ?? 'main',
-              )
+            // fallback-first (proactive): try usable fallbacks BEFORE main. If one
+            // serves, use it and skip main entirely; otherwise fall through to the
+            // main send below. Only replayable requests can be routed to a
+            // fallback (the body must survive a re-send).
+            let response: Response | undefined
+            let servedFallback:
+              | { accessToken: string; accountId?: string; activeId: string }
+              | undefined
+            // True when the proactive gate already tried every usable fallback,
+            // so the reactive path below must not re-try (and re-spend on) them.
+            let fallbacksAlreadyTried = false
+            if (mode === 'fallback-first' && isReplayableRequest(init)) {
+              fallbacksAlreadyTried = true
+              const pre = await tryFallbackFirst(requestInput, init, reqStorage)
+              if (pre) {
+                response = pre.response
+                servedFallback = {
+                  accessToken: pre.accessToken,
+                  accountId: pre.quotaAccountId,
+                  activeId: pre.activeId,
+                }
+              }
             }
 
-            let fallbackServed = false
+            // Killswitch (opt-in): act on last-seen cached quota, push-only — no
+            // network fetch on the hot path. If main is below its threshold, do
+            // NOT spend on it: synthesize a 429 so the reactive-fallback path can
+            // reroute to a surviving account, and if none survive (or the body is
+            // non-replayable so a fallback is impossible) the 429 stands as the
+            // hard block (with a Retry-After). Blocking is independent of
+            // replayability — the killswitch's contract is "never spend below
+            // threshold", so a non-replayable request hard-fails.
+            if (!response) {
+              const killswitchBlocksMain =
+                isKillswitchEnabled(reqStorage) &&
+                !killswitchPassesPolicy(
+                  killswitchMainQuota(authWithAccount.accountId),
+                  reqStorage,
+                  undefined,
+                )
+              if (killswitchBlocksMain) {
+                logA.debug('killswitch blocked primary', {
+                  pid: process.pid,
+                  activeId: 'main',
+                })
+                response = killswitchBlockedResponse(reqStorage)
+              } else {
+                // Send through the main account.
+                response = await sendWithAccessToken(
+                  requestInput,
+                  init,
+                  primaryAccess,
+                  authWithAccount.accountId,
+                  'main',
+                )
+              }
+            }
+
+            // A fallback served proactively (fallback-first) — attribute quota
+            // to it and mark it the display-active account. Its response is a
+            // success, so no reactive retry is needed.
+            let fallbackServed = Boolean(servedFallback)
             let finalResponse = response
-            let fallbackQuotaAccess = primaryAccess
-            let fallbackQuotaAccountId: string | undefined
-            if (shouldFallbackStatus(response.status, reqStorage)) {
+            let fallbackQuotaAccess =
+              servedFallback?.accessToken ?? primaryAccess
+            let fallbackQuotaAccountId = servedFallback?.accountId
+            let servedActiveId = servedFallback?.activeId ?? 'main'
+
+            // main-first (or fallback-first that fell through to main): on a
+            // 401/403/429 from main, reactively try usable fallbacks — unless the
+            // proactive gate already tried them all (fallback-first), in which
+            // case re-trying would just re-spend on the same exhausted accounts.
+            if (
+              !servedFallback &&
+              !fallbacksAlreadyTried &&
+              shouldFallbackStatus(response.status, reqStorage)
+            ) {
               logA.debug('reactive fallback triggered', {
                 pid: process.pid,
                 status: response.status,
@@ -1656,7 +1646,7 @@ export async function CodexAuthPlugin(
                 requestInput,
                 init,
                 response,
-                activeFallback ? activeId : undefined,
+                undefined,
               )
               const fallbackResponse = fallbackResult.response
               if (fallbackResponse !== response) {
@@ -1665,8 +1655,14 @@ export async function CodexAuthPlugin(
                 fallbackQuotaAccess =
                   fallbackResult.accessToken ?? primaryAccess
                 fallbackQuotaAccountId = fallbackResult.accountId
+                if (fallbackResult.accountId)
+                  servedActiveId = fallbackResult.accountId
               }
             }
+
+            // Record which account served so the sidebar shows the true active
+            // account (display only — not a persisted pin).
+            lastServedActiveId = servedActiveId
 
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
@@ -1680,8 +1676,8 @@ export async function CodexAuthPlugin(
                 await pushQuota(
                   snapshot,
                   primaryAccess,
-                  activeFallback?.id,
-                  activeFallback ? undefined : authWithAccount.accountId,
+                  undefined,
+                  authWithAccount.accountId,
                 )
               }
             } catch {
