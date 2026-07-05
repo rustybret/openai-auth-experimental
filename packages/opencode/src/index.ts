@@ -50,8 +50,10 @@ import {
   buildAuthorizeUrl,
   completeDeviceAuth,
   extractAccountId,
+  extractAccountIdFromClaims,
   flowCleanup,
   generatePKCE,
+  parseJwtClaims,
   startOAuthServer,
   USER_AGENT,
   waitForOAuthCallback,
@@ -1367,13 +1369,35 @@ export async function CodexAuthPlugin(
         > {
           const candidates = await usableFallbackCandidates(fallbackStorage)
           for (const candidate of candidates) {
-            const response = await sendWithAccessToken(
-              requestInput,
-              init,
-              candidate.access,
-              candidate.accountId,
-              candidate.keepwarmAccountKey,
-            )
+            let response: Response
+            try {
+              response = await sendWithAccessToken(
+                requestInput,
+                init,
+                candidate.access,
+                candidate.accountId,
+                candidate.keepwarmAccountKey,
+              )
+            } catch (error) {
+              // A genuine caller-abort must propagate (the user cancelled the
+              // whole request — do not silently reroute to main). Any other
+              // transport error on a fallback is treated like a failed
+              // candidate: fall through so main still gets a chance to serve.
+              if (
+                error instanceof DOMException &&
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('fallback-first candidate threw; trying next/main', {
+                pid: process.pid,
+                accountId: candidate.quotaAccountId,
+              })
+              continue
+            }
             if (!shouldFallbackStatus(response.status, fallbackStorage)) {
               await fallbackManager.markUsed(candidate.fallback)
               return {
@@ -1559,6 +1583,18 @@ export async function CodexAuthPlugin(
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
             }
+            // Stable ChatGPT identity of the CURRENT main account. Prefer the
+            // auth slot's accountId, but fall back to decoding it from the live
+            // access-token JWT so the killswitch/quota reads can still detect a
+            // main-account SWITCH (a loader that outlives a re-auth would
+            // otherwise judge account B by account A's cached quota).
+            const mainAccountIdentity =
+              authWithAccount.accountId ??
+              (primaryAccess
+                ? extractAccountIdFromClaims(
+                    parseJwtClaims(primaryAccess) ?? {},
+                  )
+                : undefined)
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
 
             // fallback-first (proactive): try usable fallbacks BEFORE main. If one
@@ -1597,7 +1633,7 @@ export async function CodexAuthPlugin(
               const killswitchBlocksMain =
                 isKillswitchEnabled(reqStorage) &&
                 !killswitchPassesPolicy(
-                  killswitchMainQuota(authWithAccount.accountId),
+                  killswitchMainQuota(mainAccountIdentity),
                   reqStorage,
                   undefined,
                 )
@@ -1613,7 +1649,7 @@ export async function CodexAuthPlugin(
                   requestInput,
                   init,
                   primaryAccess,
-                  authWithAccount.accountId,
+                  mainAccountIdentity,
                   'main',
                 )
               }
@@ -1677,7 +1713,7 @@ export async function CodexAuthPlugin(
                   snapshot,
                   primaryAccess,
                   undefined,
-                  authWithAccount.accountId,
+                  mainAccountIdentity,
                 )
               }
             } catch {

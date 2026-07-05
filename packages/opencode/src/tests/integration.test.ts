@@ -563,6 +563,83 @@ describe('integration: killswitch enforcement', () => {
     }
   })
 
+  it('does not block a NEW main account with the OLD main account cached quota after a switch', async () => {
+    // Killswitch ON. Account A gets killed via its response headers, then the
+    // loader stays alive but getAuth() starts returning account B (a re-auth).
+    // The killswitch read is bound to the ChatGPT account identity, so B must
+    // NOT be blocked by A's killed quota (and must not spend under A's).
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // below threshold → A gets killed
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      // getAuth returns account A first, then account B (identity via accountId).
+      let account: 'A' | 'B' = 'A'
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: account === 'A' ? 'access-A' : 'access-B',
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+          accountId: account === 'A' ? 'chatgpt-A' : 'chatgpt-B',
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      // Req 1 (account A): unknown quota → passes; A's 95%-used headers kill it.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Req 2 (still A): now blocked (A is killed).
+      const secondA = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(secondA.status).toBe(429)
+      await secondA.body?.cancel()
+
+      // Switch to account B and request again: B has unknown quota → passes.
+      account = 'B'
+      const firstB = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(firstB.status).toBe(200)
+      await firstB.body?.cancel()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('reroutes to a healthy fallback when the killswitch kills main', async () => {
     // Main killed (high threshold), one fallback whose quota is unknown — unknown
     // fails OPEN by default, so it survives the killswitch filter and serves.
@@ -1666,6 +1743,50 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(429)
       await response.body?.cancel()
       // Fallback tried once (proactive), then main once — no reactive re-try.
+      expect(seenAuth).toEqual([
+        'Bearer fallback-access-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('fallback-first falls through to main when a fallback send throws a non-abort error', async () => {
+    // A transport error (not an abort) on the fallback must not fail the whole
+    // request — main still gets a chance to serve.
+    seedStorage({ access: 'fallback-access-token' })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        throw new Error('refresh unavailable')
+      }
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      // The fallback throws a network error; main succeeds.
+      if (auth.includes('fallback-access-token')) {
+        throw new Error('ECONNRESET')
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+      // Fallback attempted (threw), then main served.
       expect(seenAuth).toEqual([
         'Bearer fallback-access-token',
         'Bearer main-stale-token',
