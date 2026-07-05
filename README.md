@@ -125,12 +125,12 @@ All commands open an interactive control surface in the TUI (a selectable dialog
 
 ## CLI
 
-The package installs an `openai-auth` binary for managing fallback accounts from a shell (useful on headless machines or in scripts):
+The package exposes an `openai-auth` command for managing fallback accounts from a shell (useful on headless machines or in scripts). Run it with `npx` — no global install needed:
 
 ```text
-openai-auth login [--label <name>] [--headless]   # add a fallback account via OAuth
-openai-auth list                                   # list fallback accounts
-openai-auth remove <id>                            # remove a fallback account
+npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]   # add a fallback account via OAuth
+npx @cortexkit/opencode-openai-auth list                                   # list fallback accounts
+npx @cortexkit/opencode-openai-auth remove <id>                            # remove a fallback account
 ```
 
 `login` uses the browser flow by default; `--headless` uses the device-code flow. These manage **fallback** accounts only — the main account comes from `/login openai`.

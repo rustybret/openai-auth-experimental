@@ -13,9 +13,9 @@ export { openUrl as openBrowserForLogin } from './util/open-url'
 
 function usage() {
   console.log(`Usage:
-  openai-auth login [--label <name>] [--headless]
-  openai-auth list
-  openai-auth remove <id>
+  npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
+  npx @cortexkit/opencode-openai-auth list
+  npx @cortexkit/opencode-openai-auth remove <id>
 
 Fallback accounts are stored in:
   ${getAccountStoragePath()}`)

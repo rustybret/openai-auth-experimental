@@ -47,12 +47,12 @@ Each opens an interactive dialog in the TUI and also accepts explicit arguments:
 | `/openai-logging` | `<level>` | Set log level live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
 
-CLI (fallback accounts only; the main account comes from `/login openai`):
+CLI (fallback accounts only; the main account comes from `/login openai`). Run via `npx` — no global install needed:
 
 ```text
-openai-auth login [--label <name>] [--headless]
-openai-auth list
-openai-auth remove <id>
+npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
+npx @cortexkit/opencode-openai-auth list
+npx @cortexkit/opencode-openai-auth remove <id>
 ```
 
 ## Configuration
