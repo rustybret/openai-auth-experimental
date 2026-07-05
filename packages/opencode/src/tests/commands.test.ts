@@ -128,21 +128,23 @@ describe('commands', () => {
     expect(storage?.routing?.mode).toBe('fallback-first')
   })
 
-  test('scalar command (routing) does not resurrect a removed account or its secrets', async () => {
-    // Seed a fallback account with real secrets, then remove it, then run a
-    // scalar command. The scalar path now goes through mutateAccounts (reads
-    // fresh under the lock, no union), so the removed account and its state-file
-    // secrets must stay gone.
+  test('scalar command (routing) with a STALE snapshot does not resurrect a removed account or its secrets', async () => {
+    // Disk authoritatively has only account `a` (e.g. `gone` was just removed by
+    // another session). The scalar command handler, however, loaded a STALE
+    // snapshot that still contains `gone` with real secrets. The scalar write
+    // must go through mutateAccounts (fresh disk read, no union), so `gone`'s
+    // secrets must NOT be re-written into the state file. This test fails if the
+    // routing executor is reverted to loadAccounts+saveAccounts.
     await saveAccounts(
       {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [
           {
-            id: 'gone',
+            id: 'a',
             type: 'oauth',
-            access: 'acc-gone-secret',
-            refresh: 'ref-gone-secret',
+            access: 'acc-a',
+            refresh: 'ref-a',
             expires: Date.now() + 3600_000,
             addedAt: Date.now(),
             lastUsed: Date.now(),
@@ -151,21 +153,46 @@ describe('commands', () => {
       },
       configPath,
     )
+
+    // A stale in-memory snapshot the command handler "loaded" before the remove.
+    const staleSnapshot = {
+      version: 1 as const,
+      main: { type: 'opencode' as const, provider: 'openai' as const },
+      accounts: [
+        {
+          id: 'a',
+          type: 'oauth' as const,
+          access: 'acc-a',
+          refresh: 'ref-a',
+          expires: Date.now() + 3600_000,
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+        },
+        {
+          id: 'gone',
+          type: 'oauth' as const,
+          access: 'acc-gone-secret',
+          refresh: 'ref-gone-secret',
+          expires: Date.now() + 3600_000,
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+        },
+      ],
+    }
     const ctx: CommandContext = {
       accountStoragePath: configPath,
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
-      loadAccounts,
+      // Inject the stale snapshot as what the handler reads for display.
+      loadAccounts: (async () => staleSnapshot) as typeof loadAccounts,
       client: makeClient(),
     }
 
-    await buildDialogPayload('openai-account', 'remove gone', ctx)
-    // A scalar command runs afterward.
     await buildDialogPayload('openai-routing', 'fallback-first', ctx)
 
+    // Authoritative disk read: `gone` must not have been resurrected.
     const storage = await loadAccounts(configPath)
-    expect(storage?.accounts.map((a) => a.id)).toEqual([])
+    expect(storage?.accounts.map((acc) => acc.id)).toEqual(['a'])
     expect(storage?.routing?.mode).toBe('fallback-first')
-    // Secrets must not linger in the state file.
     const stateRaw = readFileSync(statePath, 'utf8')
     expect(stateRaw).not.toContain('acc-gone-secret')
     expect(stateRaw).not.toContain('ref-gone-secret')
