@@ -38,3 +38,4 @@ openai-auth.json.*
 coverage/
 tmp/
 temp/
+/.omo/run-continuation
