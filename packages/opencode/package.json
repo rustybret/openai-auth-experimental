@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
-  "version": "0.1.4",
+  "version": "0.2.1",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -40,6 +40,8 @@
     "src/tui/command-dialogs.tsx",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
+    "src/logger.ts",
+    "src/util",
     "src/rpc",
     "README.md",
     "LICENSE"

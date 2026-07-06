@@ -7,7 +7,17 @@ import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
 
 export const TITLE_HEADER = 'x-opencode-title'
-const INTERNAL_HEADERS = new Set([TITLE_HEADER, DUMP_SESSION_HEADER])
+// Internal-only header carrying the quota STORAGE key ('main' or a fallback id)
+// for the account this request is sent on. Quota frames must be attributed by
+// this internal key, not the wire `chatgpt-account-id` (which can differ from the
+// plugin's fallback id, or be present for the main account — both misroute quota).
+// Stripped before the socket upgrade / HTTP fallback like every internal header.
+export const QUOTA_ACCOUNT_HEADER = 'x-openai-auth-quota-account'
+const INTERNAL_HEADERS = new Set([
+  TITLE_HEADER,
+  DUMP_SESSION_HEADER,
+  QUOTA_ACCOUNT_HEADER,
+])
 
 export interface CreateWebSocketFetchOptions {
   httpFetch?: typeof globalThis.fetch
@@ -47,12 +57,21 @@ interface PoolEntry {
   // continuation input is only known at send time.
   turnID?: string
   turnStartedAt?: number
+  // Last full replay input seen for this logical turn. Unlike continuation,
+  // this survives socket reconnects so a replay of prior user messages does
+  // not look like a fresh turn.
+  turnInput?: unknown[]
+  turnSignature?: string
 }
 
 interface ContinuationState {
   responseID: string
   input: unknown[]
   signature: string
+  // call_ids the chained response actually finalized. Only these may be trimmed
+  // from a later continuation suffix; an unfinalized function_call (e.g. an
+  // aborted partial whose output is still replayed) must be kept inline.
+  finalizedCallIds: Set<string>
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -119,7 +138,8 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           ? input
           : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
-    const httpInit = withoutInternalHeaders(init)
+    const wsInit = withoutInternalHeaders(init)
+    const httpInit = sanitizeHttpFallbackInit(wsInit)
 
     if (
       init?.method !== 'POST' ||
@@ -158,7 +178,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     // codex.rate_limits frame leakage. Same account + same session → same key
     // → socket reuse preserved.
     const sourceHeadersForKey = OpenAIWebSocket.normalizeHeaders(
-      httpInit?.headers,
+      wsInit?.headers,
     )
     const acctDisc = accountDiscriminator(sourceHeadersForKey)
     const key = `${sessionID}:${acctDisc}:conversation`
@@ -182,7 +202,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     entry.lastUsedAt = Date.now()
     try {
       const sourceBody = normalizeResponseBody(body)
-      const sourceHeaders = OpenAIWebSocket.normalizeHeaders(httpInit?.headers)
+      const sourceHeaders = OpenAIWebSocket.normalizeHeaders(wsInit?.headers)
 
       // Capture the per-request account identity at send time so that any
       // codex.rate_limits frame arriving asynchronously is attributed to THIS
@@ -193,9 +213,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         sourceHeaders.authorization.startsWith('Bearer ')
           ? sourceHeaders.authorization.slice('Bearer '.length)
           : ''
+      // Attribute quota by the internal storage key threaded from the loader
+      // (the account this request was actually sent on), NOT the wire
+      // chatgpt-account-id header. The internal key was read from the raw init
+      // before internal-header stripping.
       const requestAccountId =
-        typeof sourceHeaders['chatgpt-account-id'] === 'string'
-          ? sourceHeaders['chatgpt-account-id']
+        typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
+          ? internalHeaders[QUOTA_ACCOUNT_HEADER]
           : undefined
       const requestOnQuota = onQuota
         ? (s: Record<string, unknown>) =>
@@ -220,7 +244,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           signal: init?.signal ?? undefined,
           sessionID: dumpSessionID,
           url: options?.url ?? url,
-          headers: httpInit?.headers,
+          headers: wsInit?.headers,
         })
       }
       let resolveFirstEvent: (
@@ -233,17 +257,23 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           rejectFirstEvent = reject
         },
       )
+      const continuedBody = withContinuation(entry, sourceBody)
       const requestBody = orderCodexBody(
-        applyTurnId(entry, withContinuation(entry, sourceBody)),
+        applyTurnId(entry, continuedBody, sourceBody),
       )
+      // The request chained to the prior continuation iff it carries a
+      // previous_response_id (withContinuation only sets it when it actually
+      // trimmed against the prior response; an empty-suffix full replay does not).
+      const mainChainedToPrior =
+        typeof requestBody.previous_response_id === 'string'
       await dumpCodexRequest({
         sessionID: dumpSessionID,
         transport: 'websocket',
         phase: 'main',
         bodyText: JSON.stringify(requestBody),
         url: options?.url ?? url,
-        method: httpInit?.method,
-        headers: httpInit?.headers,
+        method: wsInit?.method,
+        headers: wsInit?.headers,
       })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
@@ -253,7 +283,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         signal: init?.signal ?? undefined,
         onQuota: requestOnQuota,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
-        onComplete: (event) => {
+        onComplete: (event, finalizedCallIds) => {
           const usage = responseUsage(event)
           void dumpDiagnostic({
             component: 'ws-pool',
@@ -262,7 +292,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             responseID: responseID(event),
             usage,
           })
-          updateContinuation(entry, sourceBody, event)
+          updateContinuation(
+            entry,
+            sourceBody,
+            event,
+            finalizedCallIds,
+            mainChainedToPrior,
+          )
         },
         onTerminal: (event) => {
           entry.busy = false
@@ -487,7 +523,7 @@ async function prewarm(
     sessionID: options.sessionID,
     idleTimeout,
     signal: options.signal,
-    onComplete: (event) => {
+    onComplete: (event, finalizedCallIds) => {
       void dumpDiagnostic({
         component: 'ws-pool',
         event: 'prewarm_completed',
@@ -495,7 +531,9 @@ async function prewarm(
         responseID: responseID(event),
         usage: responseUsage(event),
       })
-      updateContinuation(entry, request, event)
+      // A prewarm always starts a fresh chain (previous_response_id:null), so it
+      // never inherits the prior turn's finalized set.
+      updateContinuation(entry, request, event, finalizedCallIds, false)
     },
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
@@ -638,6 +676,11 @@ function updateContinuation(
   entry: PoolEntry,
   fullBody: Record<string, unknown>,
   event: Record<string, unknown>,
+  finalizedCallIds: Set<string>,
+  // Whether the request that produced this response actually chained via
+  // previous_response_id to the PRIOR continuation. Only then does this response's
+  // reconstructable context include the prior chain's finalized calls.
+  chainedToPrior: boolean,
 ) {
   const response = event.response
   const responseID =
@@ -648,32 +691,55 @@ function updateContinuation(
     entry.continuation = undefined
     return
   }
+  // Accumulate finalized call ids across the previous_response_id chain, not just
+  // the latest response: a suffix can carry the output of a call finalized several
+  // responses back (delayed/parallel tool output) — already in the chained context,
+  // so still safe to trim. CRUCIAL: only inherit the prior set when THIS request
+  // actually chained to it. A request sent WITHOUT previous_response_id (a prewarm,
+  // or a full replay emitted when the continuation suffix filtered to empty) starts
+  // a fresh reconstructable context; inheriting a stale set there could later trim a
+  // function_call this response's context does not contain → re-orphan → 400.
+  const chainFinalized = chainedToPrior
+    ? new Set(entry.continuation?.finalizedCallIds)
+    : new Set<string>()
+  for (const id of finalizedCallIds) chainFinalized.add(id)
   entry.continuation = {
     responseID,
     input: fullBody.input,
     signature: bodySignature(fullBody),
+    finalizedCallIds: chainFinalized,
   }
 }
 
 // Stabilize turn_id/turn_started_at across a turn's tool-loop, matching Codex. The *sent* input
-// is authoritative: a fresh turn carries a non-*_output message; a tool continuation carries only
-// *_output items and reuses the active turn_id.
-export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
+// is authoritative on the normal continuation path: a fresh user turn carries a user/developer
+// message; a tool continuation carries only tool *_output items (and possibly an inline,
+// unfinalized function_call kept by the continuation guard) and reuses the active turn_id. When a
+// reconnect forces a full replay, compare against the previous full input so historical user
+// messages do not look like a fresh turn. We key on a user/developer message — matching the HTTP
+// path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline function_call
+// does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
+export function applyTurnId(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  fullBody: Record<string, unknown> = body,
+) {
   const input = Array.isArray(body.input) ? body.input : []
-  const isNewTurn =
-    input.length > 0 &&
-    input.some(
-      (item) =>
-        !(
-          isRecord(item) &&
-          typeof item.type === 'string' &&
-          item.type.endsWith('_output')
-        ),
-    )
+  const fullInput = Array.isArray(fullBody.input) ? fullBody.input : input
+  const fullSignature = bodySignature(fullBody)
+  const prefixLength =
+    entry.turnInput && entry.turnSignature === fullSignature
+      ? matchingInputPrefixLength(entry.turnInput, fullInput)
+      : undefined
+  const turnInput =
+    prefixLength === undefined ? input : fullInput.slice(prefixLength)
+  const isNewTurn = turnInput.length > 0 && turnInput.some(isUserTurnMessage)
   if (isNewTurn || !entry.turnID) {
     entry.turnID = uuidV7()
     entry.turnStartedAt = Date.now()
   }
+  entry.turnInput = fullInput.slice()
+  entry.turnSignature = fullSignature
   const cm = body.client_metadata
   if (!isRecord(cm) || typeof cm['x-codex-turn-metadata'] !== 'string')
     return body
@@ -700,6 +766,15 @@ export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
   }
 }
 
+function matchingInputPrefixLength(prefix: unknown[], input: unknown[]) {
+  if (prefix.length > input.length) return undefined
+  for (let index = 0; index < prefix.length; index++) {
+    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
+      return undefined
+  }
+  return prefix.length
+}
+
 function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
   const input = Array.isArray(body.input) ? body.input : undefined
   if (!input || !entry.continuation) return body
@@ -718,7 +793,10 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
     }
   }
   const suffix = input.slice(entry.continuation.input.length)
-  const nextInput = continuationInput(suffix)
+  const nextInput = continuationInput(
+    suffix,
+    entry.continuation.finalizedCallIds,
+  )
   if (nextInput.length === 0) return body
   return {
     ...body,
@@ -742,7 +820,7 @@ function isUserTurnMessage(item: unknown) {
   return item.role === 'user' || item.role === 'developer'
 }
 
-function continuationInput(input: unknown[]) {
+function continuationInput(input: unknown[], finalizedCallIds: Set<string>) {
   return input.filter((item) => {
     if (!isRecord(item)) return true
     if (typeof item.type === 'string' && item.type.endsWith('_output'))
@@ -752,6 +830,21 @@ function continuationInput(input: unknown[]) {
       item.type === 'custom_tool_call_output'
     )
       return true
+    // A function_call is normally dropped from the continuation because the
+    // chained response (previous_response_id) already holds it. That only holds
+    // when the response actually FINALIZED it. An unfinalized call (e.g. an
+    // aborted partial that OpenCode still replays as a function_call/output pair)
+    // is NOT in the chained response, so trimming it orphans its output → 400.
+    // Keep such a function_call inline so the backend can match it.
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const callId =
+        typeof item.call_id === 'string'
+          ? item.call_id
+          : typeof item.id === 'string'
+            ? item.id
+            : undefined
+      return callId ? !finalizedCallIds.has(callId) : true
+    }
     if (item.type === 'message') return item.role !== 'assistant'
     if (typeof item.role === 'string') return item.role !== 'assistant'
     return false
@@ -794,6 +887,40 @@ function hasInputPrefix(prefix: unknown[], input: unknown[]) {
       return false
   }
   return true
+}
+
+function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
+  if (init?.method?.toUpperCase() !== 'POST') return init
+  const headers = new Headers(init.headers)
+  headers.set('accept', 'text/event-stream')
+  headers.set('content-type', 'application/json')
+  return {
+    ...init,
+    headers,
+    body: sanitizeHttpFallbackBody(init.body),
+  }
+}
+
+function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
+  if (typeof body !== 'string') return body
+  try {
+    const parsed = JSON.parse(body)
+    if (!isRecord(parsed) || !isRecord(parsed.client_metadata)) return body
+    if (
+      !(
+        'x-codex-turn-metadata' in parsed.client_metadata ||
+        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
+      )
+    ) {
+      return body
+    }
+    const clientMetadata = { ...parsed.client_metadata }
+    delete clientMetadata['x-codex-turn-metadata']
+    delete clientMetadata['x-codex-ws-stream-request-start-ms']
+    return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
+  } catch {
+    return body
+  }
 }
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(

@@ -1,4 +1,5 @@
 import {
+  afterAll,
   afterEach,
   beforeEach,
   describe,
@@ -13,6 +14,16 @@ import { join } from 'node:path'
 import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload } from '../commands'
+// Snapshot the REAL oauth module exports at load time (before any mock.module
+// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
+// it, so without restoring here the beginAccountLogin stub below would poison
+// every later test file that imports ../core/oauth. We spread into a PLAIN object
+// so the snapshot holds the original function references even after the live
+// namespace is later replaced; afterAll re-installs it.
+import * as oauthLiveNamespace from '../core/oauth'
+
+const oauthRealExports = { ...oauthLiveNamespace }
+
 import type { AccountQuotaWindow, OAuthQuotaSnapshot } from '../core/accounts'
 import { loadAccounts, type OAuthAccount, saveAccounts } from '../core/accounts'
 import { QuotaManager } from '../core/quota-manager'
@@ -115,6 +126,76 @@ describe('commands', () => {
     // Verify persisted
     const storage = await loadAccounts(configPath)
     expect(storage?.routing?.mode).toBe('fallback-first')
+  })
+
+  test('scalar command (routing) with a STALE snapshot does not resurrect a removed account or its secrets', async () => {
+    // Disk authoritatively has only account `a` (e.g. `gone` was just removed by
+    // another session). The scalar command handler, however, loaded a STALE
+    // snapshot that still contains `gone` with real secrets. The scalar write
+    // must go through mutateAccounts (fresh disk read, no union), so `gone`'s
+    // secrets must NOT be re-written into the state file. This test fails if the
+    // routing executor is reverted to loadAccounts+saveAccounts.
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'a',
+            type: 'oauth',
+            access: 'acc-a',
+            refresh: 'ref-a',
+            expires: Date.now() + 3600_000,
+            addedAt: Date.now(),
+            lastUsed: Date.now(),
+          },
+        ],
+      },
+      configPath,
+    )
+
+    // A stale in-memory snapshot the command handler "loaded" before the remove.
+    const staleSnapshot = {
+      version: 1 as const,
+      main: { type: 'opencode' as const, provider: 'openai' as const },
+      accounts: [
+        {
+          id: 'a',
+          type: 'oauth' as const,
+          access: 'acc-a',
+          refresh: 'ref-a',
+          expires: Date.now() + 3600_000,
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+        },
+        {
+          id: 'gone',
+          type: 'oauth' as const,
+          access: 'acc-gone-secret',
+          refresh: 'ref-gone-secret',
+          expires: Date.now() + 3600_000,
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+        },
+      ],
+    }
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      // Inject the stale snapshot as what the handler reads for display.
+      loadAccounts: (async () => staleSnapshot) as typeof loadAccounts,
+      client: makeClient(),
+    }
+
+    await buildDialogPayload('openai-routing', 'fallback-first', ctx)
+
+    // Authoritative disk read: `gone` must not have been resurrected.
+    const storage = await loadAccounts(configPath)
+    expect(storage?.accounts.map((acc) => acc.id)).toEqual(['a'])
+    expect(storage?.routing?.mode).toBe('fallback-first')
+    const stateRaw = readFileSync(statePath, 'utf8')
+    expect(stateRaw).not.toContain('acc-gone-secret')
+    expect(stateRaw).not.toContain('ref-gone-secret')
   })
 
   test('/openai-cachekeep status reflects persisted enabled and state-aware knobs', async () => {
@@ -284,284 +365,8 @@ describe('commands', () => {
   })
 
   // -----------------------------------------------------------------------
-  // (b) switch to a fallback → activeId set, slot/main token UNCHANGED
-  //     (client.auth.set is NOT called — the slot is never overwritten)
+  // refreshSidebar is called after remove/order mutations
   // -----------------------------------------------------------------------
-  test('switch to fallback → activeId set, client.auth.set NOT called (non-destructive)', async () => {
-    const account = makeAccount('acct-1')
-    const acct2 = makeAccount('acct-2', {
-      access: 'access-2',
-      refresh: 'refresh-2',
-    })
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account, acct2] },
-    })
-    const client = makeClient()
-    const setSpy = spyOn(client.auth, 'set')
-
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-    }
-
-    // Seed the file first — set acct-1 as active
-    const initial = {
-      version: 1 as const,
-      accounts: [account, acct2],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    // Switch to acct-2
-    const payload = await buildDialogPayload(
-      'openai-account',
-      'switch acct-2',
-      ctx,
-    )
-    expect(payload.command).toBe('openai-account')
-    expect(payload.text).toContain('acct-2')
-
-    // INVARIANT: the auth slot was never touched
-    expect(setSpy).not.toHaveBeenCalled()
-
-    // activeId was persisted
-    const storage = await loadAccounts(configPath)
-    expect(storage?.routing?.activeId).toBe('acct-2')
-  })
-
-  // -----------------------------------------------------------------------
-  // (b1) non-destructive round-trip: switch fallback → switch main →
-  //       activeId='main', slot untouched, main token intact
-  // -----------------------------------------------------------------------
-  test('switch fallback → switch main: round-trip is non-destructive', async () => {
-    const account = makeAccount('acct-1')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account] },
-    })
-    const client = makeClient()
-    const setSpy = spyOn(client.auth, 'set')
-
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-    }
-
-    // Seed with acct-1 as active fallback
-    const initial = {
-      version: 1 as const,
-      accounts: [account],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    // Switch to main
-    const payload = await buildDialogPayload(
-      'openai-account',
-      'switch main',
-      ctx,
-    )
-    expect(payload.command).toBe('openai-account')
-    expect(payload.text).toContain('main')
-    expect(payload.knobs.activeId).toBe('main')
-
-    // INVARIANT: switching to main never touches the auth slot
-    expect(setSpy).not.toHaveBeenCalled()
-
-    // Persisted activeId is 'main'
-    const storage = await loadAccounts(configPath)
-    expect(storage?.routing?.activeId).toBe('main')
-  })
-
-  // -----------------------------------------------------------------------
-  // (b2) switch main → sets activeId='main' (no mirror)
-  // -----------------------------------------------------------------------
-  test('switch main → sets activeId=main + persists', async () => {
-    const account = makeAccount('acct-1')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account] },
-    })
-    const client = makeClient()
-
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-    }
-
-    // Seed with acct-1 as active
-    const initial = {
-      version: 1 as const,
-      accounts: [account],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    const payload = await buildDialogPayload(
-      'openai-account',
-      'switch main',
-      ctx,
-    )
-    expect(payload.command).toBe('openai-account')
-    expect(payload.text).toContain('main')
-    expect(payload.knobs.activeId).toBe('main')
-  })
-
-  test('switch main → persisted activeId is main', async () => {
-    const account = makeAccount('acct-1')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account] },
-    })
-    const client = makeClient()
-
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-    }
-
-    const initial = {
-      version: 1 as const,
-      accounts: [account],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    await buildDialogPayload('openai-account', 'switch main', ctx)
-
-    const storage = await loadAccounts(configPath)
-    expect(storage?.routing?.activeId).toBe('main')
-  })
-
-  test('remove active account selects the next OAuth fallback instead of an API account', async () => {
-    const active = makeAccount('acct-active')
-    const apiAccount = {
-      id: 'api-1',
-      type: 'api' as const,
-      apiKey: 'api-key',
-      baseURL: 'https://example.test',
-    }
-    const oauthNext = makeAccount('acct-next')
-    const qm = new QuotaManager({
-      storage: {
-        version: 1 as const,
-        accounts: [active, apiAccount, oauthNext],
-      },
-    })
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client: makeClient(),
-    }
-    await saveAccounts(
-      {
-        version: 1 as const,
-        accounts: [active, apiAccount, oauthNext],
-        routing: { mode: 'main-first' as const, activeId: 'acct-active' },
-      },
-      configPath,
-    )
-
-    await buildDialogPayload('openai-account', 'remove acct-active', ctx)
-
-    const storage = await loadAccounts(configPath)
-    expect(storage?.routing?.activeId).toBe('acct-next')
-  })
-
-  test('remove the last active OAuth fallback resets activeId to main', async () => {
-    const active = makeAccount('acct-active')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [active] },
-    })
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client: makeClient(),
-    }
-    await saveAccounts(
-      {
-        version: 1 as const,
-        accounts: [active],
-        routing: { mode: 'main-first' as const, activeId: 'acct-active' },
-      },
-      configPath,
-    )
-
-    await buildDialogPayload('openai-account', 'remove acct-active', ctx)
-
-    const storage = await loadAccounts(configPath)
-    expect(storage?.routing?.activeId).toBe('main')
-  })
-
-  // -----------------------------------------------------------------------
-  // (b4) refreshSidebar is called after switch/remove/order mutations
-  // -----------------------------------------------------------------------
-  test('refreshSidebar called after switch', async () => {
-    const account = makeAccount('acct-1')
-    const acct2 = makeAccount('acct-2')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account, acct2] },
-    })
-    const client = makeClient()
-
-    const refreshCalls: number[] = []
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-      refreshSidebar: async () => {
-        refreshCalls.push(1)
-      },
-    }
-
-    const initial = {
-      version: 1 as const,
-      accounts: [account, acct2],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    await buildDialogPayload('openai-account', 'switch acct-2', ctx)
-    expect(refreshCalls.length).toBe(1)
-  })
-
-  test('refreshSidebar called after switch main', async () => {
-    const account = makeAccount('acct-1')
-    const qm = new QuotaManager({
-      storage: { version: 1 as const, accounts: [account] },
-    })
-    const client = makeClient()
-
-    const refreshCalls: number[] = []
-    const ctx: CommandContext = {
-      accountStoragePath: configPath,
-      quotaManager: qm,
-      loadAccounts,
-      client,
-      refreshSidebar: async () => {
-        refreshCalls.push(1)
-      },
-    }
-
-    const initial = {
-      version: 1 as const,
-      accounts: [account],
-      routing: { mode: 'main-first' as const, activeId: 'acct-1' },
-    }
-    await saveAccounts(initial, configPath)
-
-    await buildDialogPayload('openai-account', 'switch main', ctx)
-    expect(refreshCalls.length).toBe(1)
-  })
-
   test('refreshSidebar called after remove', async () => {
     const account = makeAccount('acct-1')
     const qm = new QuotaManager({
@@ -917,6 +722,12 @@ describe('commands (add)', () => {
     } catch {
       /* */
     }
+  })
+
+  // mock.module('../core/oauth', ...) below leaks process-wide; re-install the
+  // real module so later test files (e.g. oauth.test.ts) see the genuine exports.
+  afterAll(() => {
+    mock.module('../core/oauth', () => oauthRealExports)
   })
 
   test('/openai-account add returns dialog with auth URL', async () => {

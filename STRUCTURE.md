@@ -65,7 +65,7 @@
 - Purpose: Generic, provider-agnostic core. Owns the multi-account store, file locks, retry/backoff math, quota cache/refresh orchestration, OAuth flow primitives, cache keep-warm, and atomic-write helpers. The Codex-specific bits (`codexRefreshFn`, `whamUsageFn`, JWT/account-id extraction) are injected via the `provider.ts` seam or live in `oauth.ts` so the layer can stay provider-agnostic.
 - Contains: `accounts.ts`, `atomic-write.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`.
 - Key files:
-  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`saveAccounts`, `FallbackAccountManager`, account types
+  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`saveAccounts`, `mutateAccounts` (authoritative read-modify-write for structural mutations), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache + backoff
   - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
@@ -80,7 +80,7 @@
 
 **`packages/opencode/src/tests/`:**
 - Purpose: Co-located bun tests (every `*.test.ts` exercises a sibling source file).
-- Contains: 25+ test files plus a `setup-env.ts`.
+- Contains: 30+ test files plus a `setup-env.ts`.
 - Key files: `packages/opencode/src/tests/integration.test.ts`, `packages/opencode/src/tests/oauth.test.ts`, `packages/opencode/src/tests/cachekeep.test.ts`, `packages/opencode/src/tests/rpc-server.test.ts`.
 
 **`packages/opencode/src/tui/`:**
@@ -171,7 +171,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **New `/openai-*` slash command:** add the command name constant in `packages/opencode/src/commands.ts` (`OPENAI_*_COMMAND_NAME`), add it to `MODAL_COMMANDS`, implement `executeXxxCommand`, and wire it into `buildDialogPayload`. The TUI dialog content lives in `packages/opencode/src/tui/command-dialogs.tsx`.
 
-**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, write through `saveAccounts` (atomic via `writeJsonAtomic`). Account operations preserve existing transport settings.
+**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, write through `saveAccounts` (atomic via `writeJsonAtomic`). Account operations preserve existing transport settings. For structural modifications (removal, reordering), route edits through `mutateAccounts` instead of `saveAccounts` to avoid union-merge resurrection.
 
 **New transport (gRPC, etc.):** create a new file under `packages/opencode/src/` mirroring `ws.ts` + `ws-pool.ts`; integrate in `packages/opencode/src/index.ts` `sendWithAccessToken` next to the HTTP/WS branch. Update `packages/opencode/src/raw-ws.ts` only if you need a new runtime-specific client.
 

@@ -176,8 +176,10 @@ export type AccountStorage = {
     provider: 'openai'
   }
   routing?: {
+    // Routing is purely mode-driven (main-first | fallback-first). There is no
+    // persisted "active account" pin — the account that serves each request is
+    // decided per-request by the mode + quota/killswitch policy.
     mode?: RoutingMode
-    activeId?: string
   }
   fallbackOn?: number[]
   refresh?: {
@@ -454,6 +456,31 @@ function objectWithDefinedEntries(value: Record<string, unknown>) {
   )
 }
 
+/**
+ * The set of account ids present in the CONFIG file (the authoritative account
+ * roster). Returns null when the config is absent or unreadable/malformed, so
+ * callers can fall back to non-pruning behavior rather than risk wiping live
+ * state. The config never holds secrets (see accountConfig), so reading it here
+ * is safe. Reads are lock-free but the file is written atomically, so a
+ * concurrent write is seen as either the complete old or complete new file.
+ */
+async function readConfigRosterIds(path: string): Promise<Set<string> | null> {
+  let value: unknown
+  try {
+    value = (await readJsonIfPresent(path)).value
+  } catch {
+    return null
+  }
+  if (!isRecord(value) || !Array.isArray(value.accounts)) return null
+  const ids = new Set<string>()
+  for (const account of value.accounts) {
+    if (isRecord(account) && typeof account.id === 'string') {
+      ids.add(account.id)
+    }
+  }
+  return ids
+}
+
 function mergeConfigAndState(
   configValue: unknown,
   stateValue: unknown,
@@ -556,6 +583,70 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   )
 }
 
+function copyRuntimeField<K extends keyof AccountRuntimeEntry>(
+  target: AccountRuntimeEntry,
+  source: AccountRuntimeEntry,
+  key: K,
+) {
+  if (key in source) {
+    target[key] = source[key]
+  } else {
+    delete target[key]
+  }
+}
+
+function tokenFieldsMatch(
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  return (
+    existing.access === incoming.access &&
+    existing.refresh === incoming.refresh &&
+    existing.expires === incoming.expires &&
+    existing.lastRefreshedAt === incoming.lastRefreshedAt
+  )
+}
+
+function selectSameTokenState(
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  if (!tokenFieldsMatch(existing, incoming)) return incoming
+  if (!('lastRefreshError' in incoming)) return existing
+  if (!('lastRefreshError' in existing)) return incoming
+  return (incoming.lastRefreshError?.checkedAt ?? 0) >
+    (existing.lastRefreshError?.checkedAt ?? 0)
+    ? incoming
+    : existing
+}
+
+function applyNewerTokenState(
+  merged: AccountRuntimeEntry,
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  const existingRefreshAt = existing.lastRefreshedAt ?? 0
+  const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+  const existingExpires = existing.expires ?? 0
+  const incomingExpires = incoming.expires ?? 0
+  const tokenSource =
+    incomingRefreshAt > existingRefreshAt
+      ? incoming
+      : existingRefreshAt > incomingRefreshAt
+        ? existing
+        : incomingExpires > existingExpires
+          ? incoming
+          : existingExpires > incomingExpires
+            ? existing
+            : selectSameTokenState(existing, incoming)
+
+  copyRuntimeField(merged, tokenSource, 'access')
+  copyRuntimeField(merged, tokenSource, 'refresh')
+  copyRuntimeField(merged, tokenSource, 'expires')
+  copyRuntimeField(merged, tokenSource, 'lastRefreshedAt')
+  copyRuntimeField(merged, tokenSource, 'lastRefreshError')
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
@@ -564,39 +655,31 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
-  if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
-    const tokenChanged = Boolean(
-      existingEntry.access &&
-        incoming.access &&
-        existingEntry.access !== incoming.access,
-    )
-    const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
-    const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
-    if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
-      const merged: AccountRuntimeEntry = { ...existingEntry }
-      if (
-        typeof incoming.lastUsed === 'number' &&
-        (!(typeof existingEntry.lastUsed === 'number') ||
-          incoming.lastUsed > existingEntry.lastUsed)
-      ) {
-        merged.lastUsed = incoming.lastUsed
+  const existingQuotaIsNewer = existingQuotaCheckedAt > incomingQuotaCheckedAt
+  const merged: AccountRuntimeEntry = existingQuotaIsNewer
+    ? {
+        ...existingEntry,
+        ...incoming,
+        quota: existingEntry.quota,
+        lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
       }
-      return merged
-    }
-    return {
-      ...existingEntry,
-      ...incoming,
-      quota: existingEntry.quota,
-      lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
-    }
-  }
-  const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
-  if (!('lastQuotaRefreshError' in incoming)) {
+    : { ...existingEntry, ...incoming }
+
+  if (!existingQuotaIsNewer && !('lastQuotaRefreshError' in incoming)) {
     delete merged.lastQuotaRefreshError
   }
   if (!('lastRefreshError' in incoming)) {
     delete merged.lastRefreshError
   }
+  if (
+    typeof existingEntry.lastUsed === 'number' &&
+    (!(typeof incoming.lastUsed === 'number') ||
+      existingEntry.lastUsed > incoming.lastUsed)
+  ) {
+    merged.lastUsed = existingEntry.lastUsed
+  }
+
+  applyNewerTokenState(merged, existingEntry, incoming)
   return merged
 }
 
@@ -745,6 +828,61 @@ export async function saveAccounts(
   }
 }
 
+/**
+ * Read-modify-write the account store atomically under the save lock.
+ *
+ * Unlike saveAccounts (which UNION-merges the incoming accounts with the latest
+ * on-disk set so concurrent ADDS from another process are never lost), this
+ * reads the freshest state under the lock and writes the mutator's result
+ * AUTHORITATIVELY — no union. That is required for structural edits (remove,
+ * reorder): a union cannot express a deletion (the removed id reappears from
+ * `latest`) or a reordering (the union is seeded latest-first). Because the
+ * mutator runs against freshly-read state under the lock, an add committed by a
+ * concurrent process is still visible to it and preserved.
+ *
+ * The mutator may edit `current` in place and return it, or return a new
+ * storage object. Returning undefined means "no change" and still rewrites the
+ * freshly-read state (a harmless idempotent write).
+ */
+export async function mutateAccounts(
+  mutate: (current: AccountStorage) => AccountStorage | undefined,
+  path = getAccountStoragePath(),
+): Promise<AccountStorage> {
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path)
+  try {
+    const stateLock = await acquireSaveAccountsLock(statePath)
+    try {
+      const configJson = await readJsonIfPresent(path)
+      const stateJson = await readJsonIfPresent(statePath)
+      const current =
+        (configJson.exists
+          ? normalizeStorage(
+              mergeConfigAndState(configJson.value, stateJson.value),
+            )
+          : null) ?? emptyAccountStorage()
+      const next = mutate(current) ?? current
+      const existing = isRecord(configJson.value) ? configJson.value : {}
+      const nextConfig = { ...existing, ...configFromStorage(next) }
+      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(statePath, stateFromStorage(next))
+      return next
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
+}
+
+function emptyAccountStorage(): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+  }
+}
+
 function applyMainQuotaStatePatch(
   state: AccountRuntimeState,
   storage: AccountStorage,
@@ -811,9 +949,21 @@ export async function saveAccountState(
 
     if (scope.accounts) {
       const ids = scope.accounts === true ? null : new Set(scope.accounts)
+      // Authoritative account roster from the CONFIG file (the account list of
+      // record). A caller's in-memory `storage` may be stale — e.g. a background
+      // refresh holding a snapshot from before a concurrent removal — so gating
+      // state writes on the roster prevents re-introducing a removed account's
+      // secrets (access/refresh/apiKey) into the state file. Read unlocked: the
+      // config is written atomically (temp+rename), so this sees a complete
+      // file, and the state lock we hold serializes the state write itself.
+      const roster = await readConfigRosterIds(path)
       next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
       for (const account of storage.accounts) {
         if (ids && !ids.has(account.id)) continue
+        // Skip accounts no longer in the roster (removed out from under a stale
+        // snapshot). When the roster is unreadable (null) fall back to today's
+        // merge-only behavior rather than risk wiping live secrets.
+        if (roster && !roster.has(account.id)) continue
         next.accounts[account.id] = mergeAccountRuntimeState(
           next.accounts[account.id],
           accountRuntimeState(account),
@@ -824,6 +974,14 @@ export async function saveAccountState(
           if (!storage.accounts.some((account) => account.id === id)) {
             delete next.accounts[id]
           }
+        }
+      }
+      // Prune orphan state entries whose id is absent from the roster — clears
+      // secrets already at rest for a removed account (and closes the
+      // mutateAccounts config-then-state crash window on the next state write).
+      if (roster) {
+        for (const id of Object.keys(next.accounts)) {
+          if (!roster.has(id)) delete next.accounts[id]
         }
       }
     }
@@ -1072,6 +1230,22 @@ function tokenNeedsRefresh(
   )
 }
 
+function hasUnexpiredAccessToken(account: OAuthAccount, now: number) {
+  return Boolean(
+    account.access &&
+      typeof account.expires === 'number' &&
+      account.expires > now,
+  )
+}
+
+function isMainAccountFallback(storage: AccountStorage, account: OAuthAccount) {
+  return Boolean(
+    storage.mainAccountId &&
+      account.accountId &&
+      account.accountId === storage.mainAccountId,
+  )
+}
+
 function updateStoredAccount(storage: AccountStorage, account: OAuthAccount) {
   const idx = storage.accounts.findIndex(
     (candidate) => candidate.id === account.id,
@@ -1312,32 +1486,68 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isMainAccountFallback(storage, account)) continue
+      let refreshFailed = false
+      let candidate = account
       try {
-        let next = account
-        if (tokenNeedsRefresh(next, storage, this.now())) {
-          const refreshError = next.lastRefreshError
+        if (tokenNeedsRefresh(candidate, storage, this.now())) {
+          const refreshError = candidate.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.refresh, this.now())
+            refreshBackoffActive(refreshError, candidate.refresh, this.now())
           ) {
+            refreshFailed = true
             throw new Error(
               formatRefreshBackoffMessage(refreshError, this.now()),
             )
           }
-          next = await this.refreshAccount(next, storage)
-          changed = true
+          try {
+            candidate = await this.refreshAccount(candidate, storage)
+            changed = true
+          } catch (error) {
+            refreshFailed = true
+            const stored = storage.accounts.find(
+              (candidate): candidate is OAuthAccount =>
+                candidate.id === account.id && isOAuthAccount(candidate),
+            )
+            if (
+              stored &&
+              !refreshBackoffActive(
+                stored.lastRefreshError,
+                stored.refresh,
+                this.now(),
+              )
+            ) {
+              recordRefreshError(stored, error, this.now())
+              updateStoredAccount(storage, stored)
+              changed = true
+            }
+            throw error
+          }
         }
-        this.seedFallbackQuota(next, storage)
+        this.seedFallbackQuota(candidate, storage)
         // Quota is pushed per-turn from transport headers/WS frames; selection
         // filters stale candidates without ever pulling quota from the network.
         if (
-          this.accountPassesQuotaPolicy(this.quotaPolicyAccount(next), storage)
+          this.accountPassesQuotaPolicy(
+            this.quotaPolicyAccount(candidate),
+            storage,
+          )
         )
-          usable.push(next)
+          usable.push(candidate)
       } catch (error) {
+        const hasUsableCandidateToken = hasUnexpiredAccessToken(
+          candidate,
+          this.now(),
+        )
+        if (refreshFailed) {
+          if (!hasUsableCandidateToken) continue
+        } else if (!hasUsableCandidateToken) {
+          continue
+        }
         if (
           canUseCachedQuotaAfterRefreshError(
-            account,
+            candidate,
             storage,
             error,
             this.now(),
@@ -1345,12 +1555,12 @@ export class FallbackAccountManager {
         ) {
           logR.debug('fallback quota using cached quota after refresh error', {
             pid: process.pid,
-            accountId: account.id,
+            accountId: candidate.id,
             error: formatErrorMessage(error),
           })
-          usable.push(account)
+          usable.push(candidate)
         } else if (!failClosedOnUnknownQuota(storage)) {
-          usable.push(account)
+          usable.push(candidate)
         }
       }
     }

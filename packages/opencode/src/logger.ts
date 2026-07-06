@@ -35,6 +35,12 @@ const SECRET_KEY_EXACT =
 function isSecretKey(key: string): boolean {
   if (SECRET_KEY_EXACT.test(key)) return true
   const k = key.toLowerCase().replace(/[-_]/g, '')
+  // Only the unambiguous ChatGPT stable id (chatgpt-account-id / chatgptAccountId)
+  // is sensitive. A bare `accountId` field is overloaded — most diagnostic logs put
+  // the INTERNAL account id/key ('main' or a fallback id) there, which is safe and
+  // needed for debugging — so it is intentionally NOT redacted by name. The genuine
+  // ChatGPT id is kept out of logs at the source instead.
+  if (k === 'chatgptaccountid') return true
   if (k.includes('apikey')) return true
   if (k.endsWith('secret') || k.endsWith('password')) return true
   if (k.endsWith('token') && !k.endsWith('tokens')) return true

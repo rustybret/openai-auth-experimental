@@ -341,52 +341,10 @@ function openAccountDialog(api: TuiPluginApi, apply: ApplyFn) {
               showAddFlow()
               return
             }
-            if (option.value === 'main') {
-              showL2Main()
-              return
-            }
+            // Main has no per-account actions (routing is mode-driven; main is
+            // not removable or reorderable) — the row is informational only.
+            if (option.value === 'main') return
             showL2Fallback(option.value)
-          }}
-        />
-      ))
-    })
-  }
-
-  function showL2Main() {
-    void getSidebarState().then((state) => {
-      const DialogSelectInner = api.ui.DialogSelect<string>
-      const isActive = state.activeId === 'main' || !state.activeId
-      const options: Array<{
-        title: string
-        value: string
-        description: string
-      }> = []
-      if (!isActive) {
-        options.push({
-          title: 'Switch to main account',
-          value: 'switch',
-          description: 'Make main the active account',
-        })
-      }
-      options.push({
-        title: 'Back',
-        value: 'back',
-        description: 'Return to account list',
-      })
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogSelectInner
-          title='Main account'
-          options={options}
-          onSelect={(option) => {
-            if (option.value === 'switch') {
-              void apply('openai-account', 'switch main').then((r) => {
-                api.ui.toast({ message: r.text })
-                showL1()
-              })
-              return
-            }
-            showL1()
           }}
         />
       ))
@@ -402,20 +360,11 @@ function openAccountDialog(api: TuiPluginApi, apply: ApplyFn) {
         showL1()
         return
       }
-      const isActive = state.activeId === id
       const options: Array<{
         title: string
         value: string
         description: string
       }> = []
-
-      if (!isActive) {
-        options.push({
-          title: 'Switch to this account',
-          value: 'switch',
-          description: 'Make this the active account',
-        })
-      }
 
       options.push({
         title: 'Remove',
@@ -457,13 +406,6 @@ function openAccountDialog(api: TuiPluginApi, apply: ApplyFn) {
           title={fb.label ?? fb.id}
           options={options}
           onSelect={(option) => {
-            if (option.value === 'switch') {
-              void apply('openai-account', `switch ${id}`).then((r) => {
-                api.ui.toast({ message: r.text })
-                showL1()
-              })
-              return
-            }
             if (option.value === 'remove') {
               api.ui.dialog.setSize('xlarge')
               api.ui.dialog.replace(() => (

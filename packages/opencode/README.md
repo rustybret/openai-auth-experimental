@@ -40,19 +40,19 @@ Each opens an interactive dialog in the TUI and also accepts explicit arguments:
 | Command | Arguments | Purpose |
 | --- | --- | --- |
 | `/openai-quota` | — | Show 5h + weekly quota for all accounts. |
-| `/openai-account` | `add [label]` · `switch <id>` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts (non-destructive switch). |
-| `/openai-routing` | `main-first` · `fallback-first` | Account preference order. |
+| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts. |
+| `/openai-routing` | `main-first` · `fallback-first` | Routing mode: which account is tried first. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm. |
 | `/openai-logging` | `<level>` | Set log level live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
 
-CLI (fallback accounts only; the main account comes from `/login openai`):
+CLI (fallback accounts only; the main account comes from `/login openai`). Run via `npx` — no global install needed:
 
 ```text
-openai-auth login [--label <name>] [--headless]
-openai-auth list
-openai-auth remove <id>
+npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
+npx @cortexkit/opencode-openai-auth list
+npx @cortexkit/opencode-openai-auth remove <id>
 ```
 
 ## Configuration

@@ -32,7 +32,8 @@ function windowFromHeader(
   const used = h.get(prefix)
   if (used === null) return undefined
   const usedPercent = Number(used)
-  if (!Number.isFinite(usedPercent)) return undefined
+  if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100)
+    return undefined
   return {
     usedPercent,
     remainingPercent: 100 - usedPercent,
@@ -81,7 +82,12 @@ function windowFromWs(
   // A non-finite used_percent (NaN, Infinity) would produce a bogus
   // remainingPercent that silently bypasses quota-gate checks — return
   // undefined so the caller treats it as no window rather than a fake one.
-  if (!Number.isFinite(w.used_percent)) return undefined
+  if (
+    !Number.isFinite(w.used_percent) ||
+    w.used_percent < 0 ||
+    w.used_percent > 100
+  )
+    return undefined
   return {
     usedPercent: w.used_percent,
     remainingPercent: 100 - w.used_percent,
@@ -127,7 +133,12 @@ function windowFromWham(
   // A non-finite used_percent (NaN, Infinity) would produce a bogus
   // remainingPercent that silently bypasses quota-gate checks — return
   // undefined so the caller treats it as no window rather than a fake one.
-  if (!Number.isFinite(w.used_percent)) return undefined
+  if (
+    !Number.isFinite(w.used_percent) ||
+    w.used_percent < 0 ||
+    w.used_percent > 100
+  )
+    return undefined
   return {
     usedPercent: w.used_percent,
     remainingPercent: 100 - w.used_percent,

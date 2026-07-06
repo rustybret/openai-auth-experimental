@@ -51,10 +51,11 @@ export interface IdTokenClaims {
 }
 
 export function parseJwtClaims(token: string): IdTokenClaims | undefined {
+  if (token.length > 16384) return undefined
   const parts = token.split('.')
   if (parts.length !== 3) return undefined
   const payload = parts[1]
-  if (!payload) return undefined
+  if (!payload || payload.length > 8192) return undefined
   try {
     return JSON.parse(Buffer.from(payload, 'base64url').toString())
   } catch {
@@ -314,6 +315,12 @@ export async function startOAuthServer(): Promise<{
   port: number
   redirectUri: string
 }> {
+  // MUST be `localhost`, not `127.0.0.1`. This exact string is sent as the
+  // OAuth `redirect_uri` (both in the authorize URL and the token exchange) and
+  // OpenAI matches it EXACTLY against the redirect URI registered for the Codex
+  // client (`http://localhost:1455/auth/callback`). Using 127.0.0.1 yields
+  // `authorize_hydra_invalid_request`. The HTTP server still binds to 127.0.0.1
+  // below — the browser resolves localhost to it — so do not "standardize" this.
   const redirectUri = `http://localhost:${OAUTH_PORT}/auth/callback`
   if (oauthServer) {
     return { port: OAUTH_PORT, redirectUri }
@@ -322,7 +329,7 @@ export async function startOAuthServer(): Promise<{
 
   serverStarting = (async () => {
     const server = createServer((req, res) => {
-      const url = new URL(req.url || '/', `http://localhost:${OAUTH_PORT}`)
+      const url = new URL(req.url || '/', `http://127.0.0.1:${OAUTH_PORT}`)
 
       if (url.pathname === '/auth/callback') {
         const code = url.searchParams.get('code')
@@ -451,8 +458,15 @@ export function waitForOAuthCallback(
   pkce: PkceCodes,
   state: string,
   timeoutMs = 5 * 60 * 1000,
+  signal?: AbortSignal,
 ): Promise<TokenResponse> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      flowCleanup(state)
+      reject(new Error('Login cancelled'))
+      return
+    }
+
     const timeout = setTimeout(() => {
       const entry = pendingFlows.get(state)
       if (entry) {
@@ -463,15 +477,34 @@ export function waitForOAuthCallback(
       }
     }, timeoutMs)
 
+    const onAbort = () => {
+      clearTimeout(timeout)
+      const entry = pendingFlows.get(state)
+      if (entry) {
+        flowCleanup(state)
+        reject(new Error('Login cancelled'))
+      }
+    }
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort)
+    }
+
     pendingFlows.set(state, {
       pkce,
       state,
       resolve: (tokens) => {
         clearTimeout(timeout)
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
+        }
         resolve(tokens)
       },
       reject: (error) => {
         clearTimeout(timeout)
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
+        }
         reject(error)
       },
     })
@@ -486,6 +519,7 @@ export interface DeviceAuthInit {
   device_auth_id: string
   user_code: string
   interval: string
+  expires_in?: number | string
 }
 
 export async function beginDeviceAuth(): Promise<{
@@ -522,10 +556,22 @@ export async function completeDeviceAuth(
   signal?: AbortSignal,
 ): Promise<TokenResponse> {
   const interval = Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1000
+  const expires_in =
+    typeof deviceData.expires_in === 'number'
+      ? deviceData.expires_in
+      : parseInt(deviceData.expires_in || '', 10)
+  const maxDurationMs =
+    !Number.isNaN(expires_in) && expires_in > 0
+      ? expires_in * 1000
+      : 15 * 60 * 1000 // default 15 minutes
+  const startTime = Date.now()
 
   while (true) {
     if (signal?.aborted) {
       throw new Error('Device authorization cancelled')
+    }
+    if (Date.now() - startTime > maxDurationMs) {
+      throw new Error('Device authorization expired')
     }
 
     const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
@@ -571,7 +617,22 @@ export async function completeDeviceAuth(
       throw new Error(`Device authorization failed: ${response.status}`)
     }
 
-    await sleep(interval + OAUTH_POLLING_SAFETY_MARGIN_MS)
+    const remainingMs = maxDurationMs - (Date.now() - startTime)
+    if (remainingMs <= 0) {
+      throw new Error('Device authorization expired')
+    }
+    const sleepMs = Math.min(
+      interval + OAUTH_POLLING_SAFETY_MARGIN_MS,
+      remainingMs,
+    )
+    try {
+      await sleep(sleepMs, undefined, { signal })
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error('Device authorization cancelled')
+      }
+      throw err
+    }
   }
 }
 
@@ -594,6 +655,13 @@ export interface IngestAccount {
   enabled: boolean
   addedAt: number
   lastUsed: number
+  /**
+   * When the token was obtained. Stamped at login so a freshly added account
+   * carries a refresh marker — without it, the runtime-state merge cannot tell a
+   * rotated token from a stale one (both default to 0) and a concurrent stale
+   * save could roll the token back.
+   */
+  lastRefreshedAt?: number
   /** Stable ChatGPT account identifier from the OAuth token claims. */
   accountId?: string
 }
@@ -705,6 +773,7 @@ export async function beginAccountLogin(
         enabled: true,
         addedAt: now,
         lastUsed: now,
+        lastRefreshedAt: now,
         accountId: extractAccountId(tokens),
       }
     })()
@@ -725,7 +794,7 @@ export async function beginAccountLogin(
       if (signal?.aborted) {
         throw new Error('Login cancelled')
       }
-      const tokens = await waitForOAuthCallback(pkce, state)
+      const tokens = await waitForOAuthCallback(pkce, state, undefined, signal)
       const now = Date.now()
       return {
         id: label || extractAccountId(tokens) || crypto.randomUUID(),
@@ -737,6 +806,7 @@ export async function beginAccountLogin(
         enabled: true,
         addedAt: now,
         lastUsed: now,
+        lastRefreshedAt: now,
         accountId: extractAccountId(tokens),
       }
     } finally {

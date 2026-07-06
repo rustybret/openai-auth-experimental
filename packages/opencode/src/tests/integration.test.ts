@@ -299,6 +299,406 @@ describe('integration: HTTP quota push', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Test 2b: Killswitch enforcement through the loader fetch override (end-to-end)
+// ---------------------------------------------------------------------------
+
+describe('integration: killswitch enforcement', () => {
+  let configDir: string
+  let configFile: string
+  let stateFile: string
+  let sidebarFile: string
+  let logFile: string
+  const accessToken = 'sk-ks-access'
+  const refreshToken = 'sk-ks-refresh'
+
+  beforeEach(() => {
+    configDir = tempDir('oai-int-ks-')
+    configFile = join(configDir, 'openai-auth.json')
+    stateFile = join(configDir, 'openai-auth-state.json')
+    sidebarFile = join(configDir, 'sidebar-state.json')
+    logFile = join(configDir, 'test.log')
+    process.env.OPENCODE_OPENAI_AUTH_FILE = configFile
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = stateFile
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    process.env.NODE_ENV = 'test'
+    process.env.OPENCODE_CONFIG_DIR = configDir
+  })
+
+  afterEach(async () => {
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    delete process.env.OPENCODE_CONFIG_DIR
+    delete process.env.NODE_ENV
+  })
+
+  // Mock fetch: a 200 whose x-codex-* headers report `usedPercent` for the
+  // primary window. Counts calls so we can prove a blocked request never spends.
+  function mockCodexFetch(usedPercent: number) {
+    let calls = 0
+    const fn = (async () => {
+      calls++
+      return new Response('{"choices":[{"delta":{"content":"hi"}}]}', {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-codex-primary-used-percent': String(usedPercent),
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': '1781729038',
+          'x-codex-secondary-used-percent': String(usedPercent),
+          'x-codex-secondary-window-minutes': '10080',
+          'x-codex-secondary-reset-at': '1781766665',
+        },
+      })
+    }) as unknown as typeof globalThis.fetch
+    return { fn, calls: () => calls }
+  }
+
+  async function loaderFetch(hooks: Hooks) {
+    const authHook = hooks.auth
+    if (!authHook?.loader) throw new Error('No auth loader')
+    const loaderResult = await authHook.loader(
+      async () => ({
+        type: 'oauth' as const,
+        provider: 'openai',
+        access: accessToken,
+        refresh: refreshToken,
+        expires: Date.now() + 3600_000,
+      }),
+      {
+        id: 'openai',
+        label: 'OpenAI',
+        models: [],
+      } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+    )
+    const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+      url: string,
+      init?: RequestInit,
+    ) => Promise<Response>
+    if (!fetchOverride) throw new Error('No fetch in loader result')
+    return fetchOverride
+  }
+
+  const REQ_INIT: RequestInit = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  }
+
+  it('blocks the main account with a synthetic 429 + Retry-After once quota drops below the threshold, without spending', async () => {
+    // Killswitch ON, main threshold high so a near-exhausted account is killed.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: {
+          enabled: true,
+          main: { primary: 50, secondary: 50 },
+        },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // 95% used → 5% remaining → below 50%
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      // First request: quota is unknown, so it passes the gate, hits upstream,
+      // and the 95%-used headers push low quota into the manager.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+      expect(mock.calls()).toBe(1)
+
+      // Second request: cached quota is now below threshold → hard block.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(429)
+      expect(second.headers.get('retry-after')).toBeTruthy()
+      const body = (await second.json()) as {
+        error?: { type?: string; message?: string }
+      }
+      expect(body.error?.type).toBe('rate_limit_exceeded')
+      expect(body.error?.message).toContain('Killswitch')
+
+      // The blocked request did NOT reach upstream — no extra spend.
+      expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does NOT block when the killswitch is disabled (opt-in)', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        // killswitch absent → disabled
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(99) // basically exhausted
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Even with quota at 1% remaining, a disabled killswitch never blocks.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+      expect(mock.calls()).toBe(2)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('keeps blocking a killed main across a token refresh (no fail-open leak)', async () => {
+    // The leak: the quota cache is token-bound, so a routine OAuth token refresh
+    // would turn a known-exhausted account into "unknown" → fail open → spend.
+    // The policy peek is identity-bound, so the block must survive the refresh.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // below threshold
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+
+      // getAuth returns a DIFFERENT access token on each call, emulating a token
+      // refresh between the two requests (same account, new credential).
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      let authCall = 0
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: `sk-rotating-${authCall++}`,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      // Request 1: unknown quota → passes, hits upstream, pushes low quota bound
+      // to the first token.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+      expect(mock.calls()).toBe(1)
+
+      // Request 2: getAuth now returns a NEW token. A token-bound read would miss
+      // and fail open; the identity-bound policy peek still sees the kill.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(429)
+      await second.body?.cancel()
+      // Still no extra spend despite the token change.
+      expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does not block a NEW main account with the OLD main account cached quota after a switch', async () => {
+    // Killswitch ON. Account A gets killed via its response headers, then the
+    // loader stays alive but getAuth() starts returning account B (a re-auth).
+    // The killswitch read is bound to the ChatGPT account identity, so B must
+    // NOT be blocked by A's killed quota (and must not spend under A's).
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // below threshold → A gets killed
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      // getAuth returns account A first, then account B (identity via accountId).
+      let account: 'A' | 'B' = 'A'
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: account === 'A' ? 'access-A' : 'access-B',
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+          accountId: account === 'A' ? 'chatgpt-A' : 'chatgpt-B',
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      // Req 1 (account A): unknown quota → passes; A's 95%-used headers kill it.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Req 2 (still A): now blocked (A is killed).
+      const secondA = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(secondA.status).toBe(429)
+      await secondA.body?.cancel()
+
+      // Switch to account B and request again: B has unknown quota → passes.
+      account = 'B'
+      const firstB = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(firstB.status).toBe(200)
+      await firstB.body?.cancel()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('reroutes to a healthy fallback when the killswitch kills main', async () => {
+    // Main killed (high threshold), one fallback whose quota is unknown — unknown
+    // fails OPEN by default, so it survives the killswitch filter and serves.
+    const fallback: OAuthAccount = {
+      id: 'fb-healthy',
+      type: 'oauth',
+      access: 'sk-fb-access',
+      refresh: 'sk-fb-refresh',
+      expires: Date.now() + 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95)
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      // First request pushes low main quota.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Second request: main is killswitch-blocked, but the healthy fallback
+      // serves a 200 (not a 429).
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+      // Two upstream calls served by the fallback path (main never spent on req 2).
+      expect(mock.calls()).toBeGreaterThanOrEqual(2)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Test 3: WS quota push (frame consumed, not relayed)
 // ---------------------------------------------------------------------------
 
@@ -725,7 +1125,8 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'fallback-1', ...routing },
+        // fallback-first: the single fallback is tried before main, so it serves.
+        routing: { mode: 'fallback-first', ...routing },
       }),
     )
   }
@@ -1154,7 +1555,7 @@ describe('integration: active fallback routing', () => {
     ).toBe('work-alt')
   })
 
-  it('attributes active fallback quota to the fallback and keeps the fresh sidebar activeId', async () => {
+  it('fallback-first attributes served-fallback quota to the fallback and marks it active in the sidebar', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
@@ -1173,7 +1574,8 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        // fallback-first: the fallback is tried before main and serves.
+        routing: { mode: 'fallback-first' },
       }),
     )
 
@@ -1197,28 +1599,6 @@ describe('integration: active fallback routing', () => {
         Date.now() + 3600_000,
       )
       hooks = loaded.hooks
-
-      writeFileSync(
-        configFile,
-        JSON.stringify({
-          version: 1,
-          main: { type: 'opencode', provider: 'openai' },
-          accounts: [
-            {
-              id: 'work-alt',
-              type: 'oauth',
-              label: 'Work Alt',
-              enabled: true,
-              access: 'work-alt-token',
-              refresh: 'work-alt-refresh',
-              expires: Date.now() + 3600_000 * 24,
-              accountId: 'chatgpt-work-alt',
-            },
-          ],
-          refresh: { refreshBeforeExpiryMinutes: 5 },
-          routing: { activeId: 'work-alt' },
-        }),
-      )
 
       const response = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
@@ -1295,10 +1675,12 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('does not throw when active fallback refresh fails and falls back to stale fallback access', async () => {
+  it('fallback-first uses a still-valid fallback token when its refresh fails', async () => {
+    // Token is inside the refresh window (needs refresh) but NOT expired, so a
+    // failed refresh must not drop it — the still-valid token is used.
     seedStorage({
       access: 'fallback-stale-token',
-      expires: Date.now() - 60_000,
+      expires: Date.now() + 2 * 60_000,
     })
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
@@ -1330,6 +1712,91 @@ describe('integration: active fallback routing', () => {
     }
   })
 
+  it('fallback-first does not re-try fallbacks reactively after main also fails (no double-spend)', async () => {
+    // fallback-first with one fallback that 429s: the proactive gate tries it,
+    // falls through to main, and main also 429s. The reactive path must NOT
+    // re-try the already-tried fallback — so the fallback is hit exactly once.
+    seedStorage({ access: 'fallback-access-token' })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        throw new Error('refresh unavailable')
+      }
+      seenAuth.push(headerValue(init, 'authorization'))
+      // Everything is rate-limited.
+      return new Response('{}', { status: 429 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(429)
+      await response.body?.cancel()
+      // Fallback tried once (proactive), then main once — no reactive re-try.
+      expect(seenAuth).toEqual([
+        'Bearer fallback-access-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('fallback-first falls through to main when a fallback send throws a non-abort error', async () => {
+    // A transport error (not an abort) on the fallback must not fail the whole
+    // request — main still gets a chance to serve.
+    seedStorage({ access: 'fallback-access-token' })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        throw new Error('refresh unavailable')
+      }
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      // The fallback throws a network error; main succeeds.
+      if (auth.includes('fallback-access-token')) {
+        throw new Error('ECONNRESET')
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+      // Fallback attempted (threw), then main served.
+      expect(seenAuth).toEqual([
+        'Bearer fallback-access-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('captures cachekeep bodies before the WebSocket transport early return', async () => {
     writeFileSync(
       configFile,
@@ -1338,7 +1805,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
 
@@ -1392,7 +1859,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
 
@@ -1484,7 +1951,7 @@ describe('integration: active fallback routing', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'main' },
+        routing: { mode: 'main-first' },
       }),
     )
     const authSetCalls: unknown[] = []
@@ -1530,7 +1997,7 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('uses main before other fallbacks when routing mode is unset', async () => {
+  it('main-first (default): tries main first, then reactively falls back on 429', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
@@ -1557,16 +2024,18 @@ describe('integration: active fallback routing', () => {
           },
         ],
         refresh: { refreshBeforeExpiryMinutes: 5 },
-        routing: { activeId: 'fallback-1' },
+        // Default (main-first): main is the primary; no per-account pin.
+        routing: { mode: 'main-first' },
       }),
     )
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
+    // Main (main-stale-token) is rate-limited → reactive fallback to fallback-1.
     globalThis.fetch = (async (_url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       return new Response('{}', {
-        status: auth.includes('fallback-primary-token') ? 429 : 200,
+        status: auth.includes('main-stale-token') ? 429 : 200,
       })
     }) as unknown as typeof globalThis.fetch
 
@@ -1584,9 +2053,10 @@ describe('integration: active fallback routing', () => {
       )
 
       expect(response.status).toBe(200)
+      // Main tried first, then the first usable fallback served.
       expect(seenAuth).toEqual([
-        'Bearer fallback-primary-token',
         'Bearer main-stale-token',
+        'Bearer fallback-primary-token',
       ])
     } finally {
       globalThis.fetch = originalFetch

@@ -70,6 +70,86 @@ describe('QuotaManager push', () => {
     expect(entry!.quota.primary?.remainingPercent).toBe(90)
   })
 
+  it('peekMainForPolicy survives a token refresh but drops on an account switch', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const oldToken = `access-old-${randomUUID()}`
+    const newToken = `access-new-${randomUUID()}`
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    // Quota pushed for account "acct-A" with the old token.
+    qm.setMain(
+      oldToken,
+      {
+        quota: snapshot,
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      'acct-A',
+    )
+
+    // A normal token refresh (same account, new access token) must NOT drop the
+    // policy view — the killswitch still sees the account's quota.
+    const afterRefresh = qm.peekMainForPolicy('acct-A')
+    expect(afterRefresh).not.toBeNull()
+    expect(afterRefresh!.quota.primary?.usedPercent).toBe(10)
+
+    // No-identity peek also returns the cached entry (best-effort).
+    expect(qm.peekMainForPolicy()).not.toBeNull()
+
+    // Contrast: the invalidating display read with the NEW token drops the
+    // cache (token-bound) — this is exactly the path the leak fix bypasses.
+    expect(qm.getMain(newToken)).toBeNull()
+
+    // A genuine account SWITCH (different ChatGPT id) drops the policy view, so
+    // the killswitch never judges account B by account A's quota.
+    qm.setMain(
+      oldToken,
+      {
+        quota: snapshot,
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      'acct-A',
+    )
+    expect(qm.peekMainForPolicy('acct-B')).toBeNull()
+  })
+
+  it('peekFallbackForPolicy survives a token refresh (keyed by stable account id)', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const oldToken = `fb-old-${randomUUID()}`
+    const newToken = `fb-new-${randomUUID()}`
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    qm.setFallback(
+      'fb-1',
+      {
+        quota: snapshot,
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      oldToken,
+    )
+
+    // Token refresh for the same fallback id: policy peek still sees it.
+    expect(qm.peekFallbackForPolicy('fb-1')).not.toBeNull()
+    // But the invalidating display read with the new token drops it.
+    expect(qm.getFallback('fb-1', newToken)).toBeNull()
+  })
+
   it('conditional push: empty snapshot does NOT overwrite a valid cached one', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const token = `access-${randomUUID()}`

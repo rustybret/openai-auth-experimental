@@ -2,9 +2,8 @@ import { getSettings } from './config'
 import {
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
-  saveAccounts as defaultSaveAccounts,
-  isOAuthAccount,
   type KillswitchConfig,
+  mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
 } from './core/accounts'
@@ -175,16 +174,17 @@ async function executeAccountCommand(
         'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add a fallback account.',
       )
     } else {
-      const activeId = storage.routing?.activeId ?? 'main'
+      const mode: RoutingMode = storage.routing?.mode ?? 'main-first'
+      lines.push(`Routing: \`${mode}\` (set with \`/openai-routing\`).`)
+      lines.push('')
       for (const a of accounts) {
-        const marker = a.id === activeId ? ' *active*' : ''
         const type = (a as { type?: string }).type ?? 'oauth'
-        lines.push(`- \`${a.id}\`${marker} (${type})`)
+        lines.push(`- \`${a.id}\` (${type})`)
       }
     }
     lines.push('')
     lines.push(
-      'Commands: `/openai-account add [label]` | `/openai-account switch <id>` | `/openai-account remove <id>`',
+      'Commands: `/openai-account add [label]` | `/openai-account remove <id>`',
     )
     return {
       command: 'openai-account',
@@ -193,100 +193,69 @@ async function executeAccountCommand(
     }
   }
 
-  if (tokens[0] === 'switch' && tokens[1]) {
-    const targetId = tokens[1]
-
-    if (targetId === 'main') {
-      storage.routing = { ...(storage.routing ?? {}), activeId: 'main' }
-      await defaultSaveAccounts(storage, ctx.accountStoragePath)
-      log.info('account switched', { activeId: 'main' })
-      void ctx.refreshSidebar?.().catch(() => {})
-      return {
-        command: 'openai-account',
-        text: '## Account Switched\n\nActive account is now main.',
-        knobs: { accounts, activeId: 'main' },
-      }
-    }
-
-    const account = accounts.find((a) => a.id === targetId)
-    if (!account) {
-      return {
-        command: 'openai-account',
-        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts },
-      }
-    }
-
-    // Persist the active account id
-    storage.routing = { ...(storage.routing ?? {}), activeId: targetId }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
-    log.info('account switched', { activeId: targetId })
-    void ctx.refreshSidebar?.().catch(() => {})
-
-    return {
-      command: 'openai-account',
-      text: `## Account Switched\n\nActive account is now \`${targetId}\`.`,
-      knobs: { accounts, activeId: targetId },
-    }
-  }
-
   if (tokens[0] === 'remove' && tokens[1]) {
     const targetId = tokens[1]
-    const idx = accounts.findIndex((a) => a.id === targetId)
-    if (idx === -1) {
+    // Structural edit: route through mutateAccounts so the deletion is written
+    // authoritatively. saveAccounts union-merges latest ∪ incoming by id, which
+    // would resurrect the removed account from the on-disk `latest` set.
+    let removed = false
+    const next = await mutateAccounts((current) => {
+      const idx = current.accounts.findIndex((a) => a.id === targetId)
+      if (idx === -1) return current
+      removed = true
+      current.accounts.splice(idx, 1)
+      return current
+    }, ctx.accountStoragePath)
+
+    if (!removed) {
       return {
         command: 'openai-account',
         text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts },
+        knobs: { accounts: next.accounts },
       }
     }
 
-    const wasActive = storage.routing?.activeId === targetId
-    accounts.splice(idx, 1)
-
-    // If removing the active account, repoint to the next OAuth fallback or main.
-    if (wasActive) {
-      const next = accounts.find(isOAuthAccount)
-      storage.routing = {
-        ...(storage.routing ?? {}),
-        activeId: next?.id ?? 'main',
-      }
-    }
-
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('account removed', { id: targetId })
     void ctx.refreshSidebar?.().catch(() => {})
 
     return {
       command: 'openai-account',
       text: `## Account Removed\n\nRemoved account \`${targetId}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: next.accounts },
     }
   }
 
   if (tokens[0] === 'order' && tokens.length >= 3) {
-    // Reorder: swap positions of two accounts
-    const a = accounts.findIndex((ac) => ac.id === tokens[1])
-    const b = accounts.findIndex((ac) => ac.id === tokens[2])
-    if (a === -1 || b === -1) {
+    // Reorder: swap positions of two accounts. Structural edit — route through
+    // mutateAccounts. saveAccounts seeds its union map latest-first, so a
+    // reordered `incoming` array would be ignored and the swap silently lost.
+    let ok = false
+    const next = await mutateAccounts((current) => {
+      const a = current.accounts.findIndex((ac) => ac.id === tokens[1])
+      const b = current.accounts.findIndex((ac) => ac.id === tokens[2])
+      if (a === -1 || b === -1) return current
+      ok = true
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      const tmp = current.accounts[a]!
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      current.accounts[a] = current.accounts[b]!
+      current.accounts[b] = tmp
+      return current
+    }, ctx.accountStoragePath)
+
+    if (!ok) {
       return {
         command: 'openai-account',
         text: '## Invalid Order\n\nBoth account IDs must exist.',
-        knobs: { accounts },
+        knobs: { accounts: next.accounts },
       }
     }
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    const tmp = accounts[a]!
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    accounts[a] = accounts[b]!
-    accounts[b] = tmp
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('accounts reordered', { a: tokens[1], b: tokens[2] })
     void ctx.refreshSidebar?.().catch(() => {})
     return {
       command: 'openai-account',
       text: `## Accounts Reordered\n\nSwapped positions of \`${tokens[1]}\` and \`${tokens[2]}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: next.accounts },
     }
   }
 
@@ -307,20 +276,30 @@ async function executeAccountCommand(
     // never reach the user.
     completion
       .then(async (account) => {
-        const store = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        let rejectedAsMain = false
+        // Route the add through mutateAccounts: read-modify-write under the lock
+        // so a concurrent add/remove cannot clobber this insertion, and so the
+        // main-identity check reads the freshest mainAccountId.
+        await mutateAccounts((current) => {
+          if (
+            account.accountId &&
+            current.mainAccountId &&
+            account.accountId === current.mainAccountId
+          ) {
+            rejectedAsMain = true
+            return current
+          }
+          upsertAccount(current.accounts, account as OAuthAccount)
+          return current
+        }, ctx.accountStoragePath)
 
-        if (
-          account.accountId &&
-          store.mainAccountId &&
-          account.accountId === store.mainAccountId
-        ) {
+        if (rejectedAsMain) {
           const msg =
             'That account is already your main account — not added as a fallback.'
+          // Log the internal account id, never the ChatGPT stable id (a sensitive
+          // identity from the OAuth claims).
           log.warn('account add rejected (main identity)', {
-            accountId: account.accountId,
+            id: account.id,
             sessionId,
           })
           notify?.({
@@ -331,8 +310,6 @@ async function executeAccountCommand(
           return
         }
 
-        upsertAccount(store.accounts, account as OAuthAccount)
-        await defaultSaveAccounts(store, ctx.accountStoragePath)
         log.info('account added', {
           id: account.id,
           label: account.label,
@@ -375,7 +352,7 @@ async function executeAccountCommand(
 
   return {
     command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account switch <id>` — switch active\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap positions',
+    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting is set with `/openai-routing` (main-first / fallback-first).',
     knobs: { accounts },
   }
 }
@@ -396,8 +373,14 @@ async function executeRoutingCommand(
     (tokens[0] === 'main-first' || tokens[0] === 'fallback-first')
   ) {
     const mode = tokens[0] as RoutingMode
-    storage.routing = { ...(storage.routing ?? {}), mode }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Scalar-field write MUST go through mutateAccounts (read-fresh under lock,
+    // authoritative rewrite). A stale saveAccounts here would union its stale
+    // account list back over disk and resurrect a concurrently-removed account
+    // — re-writing that account's secrets into the state file (credential leak).
+    await mutateAccounts((current) => {
+      current.routing = { ...(current.routing ?? {}), mode }
+      return current
+    }, ctx.accountStoragePath)
     log.info('routing mode changed', { mode })
     return {
       command: 'openai-routing',
@@ -473,8 +456,10 @@ async function executeKillswitchCommand(
         secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
       },
     }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch enabled')
     return {
       command: 'openai-killswitch',
@@ -485,8 +470,10 @@ async function executeKillswitchCommand(
 
   if (tokens[0] === 'off') {
     const updated: KillswitchConfig = { ...config, enabled: false }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch disabled')
     return {
       command: 'openai-killswitch',
@@ -523,8 +510,10 @@ async function executeKillswitchCommand(
         updated.accounts![acct] = thresholds
       }
     }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch thresholds updated', { count: tokens.length - 1 })
     return {
       command: 'openai-killswitch',
@@ -557,13 +546,11 @@ async function executeDumpCommand(
   }
 
   if (tokens[0] === 'on') {
-    // Persist the dump toggle in account storage
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.dump = { ...(storage.dump ?? {}), enabled: true }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Persist the dump toggle via mutateAccounts (authoritative, no stale union).
+    await mutateAccounts((current) => {
+      current.dump = { ...(current.dump ?? {}), enabled: true }
+      return current
+    }, ctx.accountStoragePath)
     log.info('request dump enabled')
     return {
       command: 'openai-dump',
@@ -573,12 +560,10 @@ async function executeDumpCommand(
   }
 
   if (tokens[0] === 'off') {
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.dump = { ...(storage.dump ?? {}), enabled: false }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.dump = { ...(current.dump ?? {}), enabled: false }
+      return current
+    }, ctx.accountStoragePath)
     log.info('request dump disabled')
     return {
       command: 'openai-dump',
@@ -619,13 +604,11 @@ async function executeLoggingCommand(
     // Call setLogLevel so the log-level change takes effect immediately without a restart.
     setLogLevel(level as 'error' | 'warn' | 'info' | 'debug' | 'trace')
 
-    // Persist in account storage
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.logging = { ...(storage.logging ?? {}), level }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Persist via mutateAccounts (authoritative, no stale union).
+    await mutateAccounts((current) => {
+      current.logging = { ...(current.logging ?? {}), level }
+      return current
+    }, ctx.accountStoragePath)
     log.info('log level changed', { level })
 
     return {
@@ -725,13 +708,10 @@ async function executeCachekeepCommand(
         knobs: {},
       }
     }
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
-    nextStorage.cachekeep = { ...(nextStorage.cachekeep ?? {}), enabled: true }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: true }
+      return current
+    }, ctx.accountStoragePath)
     log.info('cachekeep enabled')
     ctx.setCacheKeepEnabled?.(true)
     mgr.start()
@@ -757,13 +737,10 @@ async function executeCachekeepCommand(
   }
 
   if (tokens[0] === 'off') {
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
-    nextStorage.cachekeep = { ...(nextStorage.cachekeep ?? {}), enabled: false }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: false }
+      return current
+    }, ctx.accountStoragePath)
     log.info('cachekeep disabled')
     ctx.setCacheKeepEnabled?.(false)
     mgr?.stop()
@@ -783,17 +760,14 @@ async function executeCachekeepCommand(
         knobs: {},
       }
     }
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
     const value = subCmd === 'on'
-    nextStorage.cachekeep = {
-      ...(nextStorage.cachekeep ?? {}),
-      subagents: value,
-    }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = {
+        ...(current.cachekeep ?? {}),
+        subagents: value,
+      }
+      return current
+    }, ctx.accountStoragePath)
     log.info(
       value
         ? 'cachekeep subagent warming enabled'
