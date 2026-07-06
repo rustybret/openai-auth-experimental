@@ -36,5 +36,5 @@ temp/
 !.gitignore
 **.*.md
 !**.*.md
-
-
+.github/
+!.github/*
