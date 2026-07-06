@@ -6,14 +6,9 @@ packages/*/dist/
 *.tgz
 
 # Local agent/dev state
-.opencode/
 .claude/
 .alfonso/
 .cortexkit/
-HANDOVER.md
-
-# Paused local benchmark harness (owned out-of-tree)
-benchmarks/
 
 # Editor and OS metadata
 .DS_Store
@@ -24,7 +19,6 @@ benchmarks/
 .env
 .env.*
 !.env.example
-mise.local.toml
 openai-auth.json
 openai-auth.json.*
 
@@ -39,3 +33,8 @@ coverage/
 tmp/
 temp/
 /.omo/run-continuation
+!.gitignore
+**.*.md
+!**.*.md
+
+
