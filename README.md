@@ -3,6 +3,7 @@
 > **Fork notice:** This is a personal experimental fork of [cortexkit/openai-auth](https://github.com/cortexkit/openai-auth), maintained by [@rustybret](https://github.com/rustybret). All credit for the original plugin, architecture, and implementation goes to [CortexKit](https://github.com/cortexkit). This fork tracks the upstream `main` branch on the `local/fork` branch and integrates PRs ahead of their upstream release.
 >
 > **What's different from upstream:**
+>
 > - PR #7 (`feat/parity`) — multi-account fallback, quota tracking, cache keep-warm, `/openai-account`, `/openai-quota`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-routing` commands, `openai-auth` CLI
 > - PR #6 — `@opencode-ai/plugin` bumped to 1.17.7
 > - PR #2 — `ai` package bumped to v6 (major)
@@ -50,21 +51,29 @@ bun run build   # output: packages/opencode/dist/index.js
 }
 ```
 
-**3. Clear the plugin cache and restart OpenCode:**
+**3. After any code change:**
+
+- Run (from `packages/opencode/`) 
+
+```bash
+`bun run build` 
+```
+
+- Restart OpenCode.
 
 ```bash
 rm -rf ~/.cache/opencode
 ```
 
-After any code change, re-run `bun run build` (from `packages/opencode/`) and restart OpenCode.
 
 ### Authenticate
 
 Log in with OpenCode's normal auth command and pick the `openai` provider:
 
 ```text
-/login openai
+opencode auth login 
 ```
+- select openai
 
 Three methods are offered:
 
@@ -72,22 +81,21 @@ Three methods are offered:
 - **ChatGPT Pro/Plus (headless)** — device-code flow for remote or headless machines: you're shown a code to enter at the OpenAI device page from any browser.
 - **Manually enter API Key** — falls back to a standard pay-as-you-go OpenAI API key (no OAuth, normal billing).
 
-The account you log in with via `/login openai` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
+The account you log in with via `opencode auth login` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
 
 **Quick reference:**
 
 | Action | Command |
 | --- | --- |
-| Log in (first / main account) | `/login openai` |
+| Log in (first / main account) | `opencode auth login` |
 | Add a second (or third) account | `/openai-account add` |
 | Add with a label | `/openai-account add work` |
 | Add from a shell / headless machine | `openai-auth login [--label work] [--headless]` |
 | List accounts + quota | `/openai-quota` |
 
-
 ## Multiple accounts
 
-The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
+The plugin supports more than one ChatGPT account: a single **main** account (the one from `opencode auth login`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
 
 - **Add a fallback** in the TUI with `/openai-account add [label]` (runs the same browser/headless OAuth flow as login), or from a shell with the `openai-auth` CLI (see [CLI](#cli)).
 - **Remove** a fallback with `/openai-account remove <id>`.
@@ -165,7 +173,7 @@ npx @cortexkit/opencode-openai-auth list                                   # lis
 npx @cortexkit/opencode-openai-auth remove <id>                            # remove a fallback account
 ```
 
-`login` uses the browser flow by default; `--headless` uses the device-code flow. These manage **fallback** accounts only — the main account comes from `/login openai`.
+`login` uses the browser flow by default; `--headless` uses the device-code flow. These manage **fallback** accounts only — the main account comes from `opencode auth login`.
 
 ## Configuration
 
@@ -307,30 +315,7 @@ bun run dev:clean
 
 ## Release
 
-This repo uses CortexKit's tag-driven release workflow.
-
-Preview a release:
-
-```bash
-./scripts/release.sh 0.2.0 --dry
-```
-
-Create and push the release tag:
-
-```bash
-./scripts/release.sh 0.2.0
-```
-
-Wait for GitHub Actions:
-
-```bash
-./scripts/wait-release.sh v0.2.0
-```
-
-The release workflow runs checks, publishes `@cortexkit/opencode-openai-auth` to npm with provenance (npm Trusted Publishing / OIDC), and creates the GitHub release.
-
-> [!NOTE]
-> npm Trusted Publishing can only be configured after the package already exists on npm, so the **first** version must be published manually (`npm publish --access public` from `packages/opencode/`). Configure OIDC trusted publishing for the package afterward; subsequent tagged releases then publish through the workflow. The publish job already skips any version that is already on npm.
+none
 
 ## License
 
