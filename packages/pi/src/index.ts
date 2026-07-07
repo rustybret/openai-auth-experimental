@@ -8,10 +8,8 @@ import type {
   OAuthLoginCallbacks,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-import {
-  createAssistantMessageEventStream,
-  streamSimpleOpenAICodexResponses,
-} from '@earendil-works/pi-ai'
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
+import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/api/openai-codex-responses'
 import {
   loginOpenAICodex,
   refreshOpenAICodexToken,
