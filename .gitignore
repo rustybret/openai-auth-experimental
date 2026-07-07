@@ -33,7 +33,6 @@ coverage/
 tmp/
 temp/
 /.omo/run-continuation
-!.gitignore
 **.*.md
 !**.*.md
 .github/
