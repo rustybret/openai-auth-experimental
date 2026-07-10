@@ -27,7 +27,11 @@
             "cloudhome-5aa53d2c": {
                 "access": "allow",
                 "intent_budget": "plan"
-            }
+            },
+      "agent-harness-0367cd71": {
+        "access": "allow",
+        "intent_budget": "plan"
+      }
         }
     }
 }
