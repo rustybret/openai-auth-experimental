@@ -95,8 +95,7 @@ git tag -a "$TAG" -m "Release $TAG"
 echo ""
 
 echo "→ Pushing to origin..."
-git push origin "$BRANCH"
-git push origin "$TAG"
+git push origin "$BRANCH" "$TAG"
 echo ""
 
 echo "  ✓ Released $TAG"
