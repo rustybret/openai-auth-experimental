@@ -16,6 +16,7 @@ import {
   type FallbackAccount,
   FallbackAccountManager,
   type OAuthAccount,
+  saveAccounts,
 } from '../core/accounts.ts'
 import { hashRefreshToken } from '../core/backoff.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
@@ -130,6 +131,7 @@ describe('fallback selection', () => {
         },
       })
       const storage = makeStorage([account])
+      await saveAccounts(storage)
       const refreshFn = jest
         .fn()
         .mockRejectedValue(new Error('fetch failed while refreshing token'))
@@ -197,6 +199,7 @@ describe('fallback selection', () => {
         },
       })
       const storage = makeStorage([account])
+      await saveAccounts(storage)
       const refreshFn = jest.fn().mockResolvedValue({
         access: 'fresh-access',
         refresh: 'fresh-refresh',
