@@ -29,15 +29,15 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
 
@@ -72,16 +72,16 @@ jobs:
           - package: "@cortexkit/pi-openai-auth"
             workspace: "@cortexkit/pi-openai-auth"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
 
@@ -90,23 +90,37 @@ jobs:
 
       - name: Resolve release version
         id: version
+        env:
+          RAW_VERSION: ${{ github.event.inputs.version || github.ref_name }}
         run: |
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${VERSION#v}"
+          VERSION="${RAW_VERSION#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Validate version is semver
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::'$VERSION' is not valid semver"; exit 1
+          fi
+
       - name: Sync version
-        run: node scripts/version-sync.mjs "${{ steps.version.outputs.version }}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/version-sync.mjs "$VERSION"
 
       - name: Build
         run: bun run build
 
       - name: Check whether package version is already published
         id: published
+        env:
+          PACKAGE: ${{ matrix.package }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if npm view "${{ matrix.package }}@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+          if npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "${{ matrix.package }}@${{ steps.version.outputs.version }} is already published; skipping."
+            echo "$PACKAGE@$VERSION is already published; skipping."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
@@ -114,7 +128,9 @@ jobs:
       # Uses npm Trusted Publishing (OIDC) configured on npmjs.com.
       - name: Publish package to npm
         if: steps.published.outputs.exists != 'true'
-        run: npm publish --workspace "${{ matrix.workspace }}" --access public --provenance
+        env:
+          WORKSPACE: ${{ matrix.workspace }}
+        run: npm publish --workspace "$WORKSPACE" --access public --provenance
 
   github-release:
     name: Create GitHub Release
@@ -122,9 +138,9 @@ jobs:
     needs: [test, publish-npm]
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           generate_release_notes: true
