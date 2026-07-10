@@ -38,3 +38,5 @@ temp/
 !**.*.md
 .github/
 !.github/*
+.opencode/package-lock.json
+.opencode/package.json
