@@ -282,6 +282,15 @@ export type AccountRefreshError = {
   message: string
 }
 
+export class AccountRemovedDuringRefreshError extends Error {
+  readonly code = 'ACCOUNT_REMOVED_DURING_REFRESH'
+
+  constructor(accountId: string) {
+    super(`Fallback account ${accountId} was removed before refresh`)
+    this.name = 'AccountRemovedDuringRefreshError'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -304,6 +313,17 @@ export const DEFAULT_KILLSWITCH_THRESHOLDS = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isAccountRemovedDuringRefreshError(
+  error: unknown,
+): error is AccountRemovedDuringRefreshError {
+  return (
+    error instanceof AccountRemovedDuringRefreshError ||
+    (isRecord(error) &&
+      error.name === 'AccountRemovedDuringRefreshError' &&
+      error.code === 'ACCOUNT_REMOVED_DURING_REFRESH')
+  )
 }
 
 function normalizeAccountBase(value: Record<string, unknown>): AccountBase {
@@ -1142,7 +1162,7 @@ function isAccountStore(value: Record<string, unknown>): boolean {
  * Migrate an existing single-slot token into the multi-account store.
  *
  * Reads the existing token via the caller-provided `getAuth` (the ONLY
- * read path — there is no `client.auth.get`).  If a token exists and the
+ * read path — there is no `client.auth.get`). If a token exists and the
  * config file is NOT yet an account store (content discriminator), seeds
  * it as the primary OAuth account.
  *
@@ -1151,7 +1171,8 @@ function isAccountStore(value: Record<string, unknown>): boolean {
  *
  * Tolerates expired/revoked tokens (migrates them; refresh handles validity).
  *
- * Guards against first-run races with `acquireRefreshFileLock`.
+ * Guards against first-run races with the same save-lock order used by
+ * structural account mutations.
  */
 export async function migrateIfNeeded(
   existingToken:
@@ -1159,44 +1180,44 @@ export async function migrateIfNeeded(
     | undefined,
   path = getAccountStoragePath(),
 ) {
-  const lock = await acquireRefreshFileLock({
-    name: 'migrate',
-    ttlMs: 30_000,
-    path,
-  })
-  if (!lock) return // another process is already migrating
-
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path)
   try {
-    const existing = await readJsonIfPresent(path)
-    if (existing.exists && isRecord(existing.value)) {
-      if (isAccountStore(existing.value)) return // already migrated
+    const stateLock = await acquireSaveAccountsLock(statePath)
+    try {
+      const existing = await readJsonIfPresent(path)
+      if (existing.exists && isRecord(existing.value)) {
+        if (isAccountStore(existing.value)) return // already migrated
+      }
+
+      if (!existingToken) return // no token to migrate
+
+      const storage: AccountStorage = {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }
+
+      // Extract the stable ChatGPT account id from the main token so we
+      // can reject attempts to add main as a fallback later.
+      if (existingToken.access) {
+        const accountId = extractAccountId({
+          id_token: '',
+          access_token: existingToken.access,
+          refresh_token: existingToken.refresh,
+        })
+        if (accountId) storage.mainAccountId = accountId
+      }
+
+      // Merge with existing transport keys so saving the account store preserves webSearch/webSockets/rawWebSocket/dump/dumpDir.
+      const existingFields =
+        existing.exists && isRecord(existing.value) ? existing.value : {}
+      const nextConfig = { ...existingFields, ...configFromStorage(storage) }
+      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(statePath, stateFromStorage(storage))
+    } finally {
+      await stateLock.release()
     }
-
-    if (!existingToken) return // no token to migrate
-
-    const storage: AccountStorage = {
-      version: 1,
-      main: { type: 'opencode', provider: 'openai' },
-      accounts: [],
-    }
-
-    // Extract the stable ChatGPT account id from the main token so we
-    // can reject attempts to add main as a fallback later.
-    if (existingToken.access) {
-      const accountId = extractAccountId({
-        id_token: '',
-        access_token: existingToken.access,
-        refresh_token: existingToken.refresh,
-      })
-      if (accountId) storage.mainAccountId = accountId
-    }
-
-    // Merge with existing transport keys so saving the account store preserves webSearch/webSockets/rawWebSocket/dump/dumpDir.
-    const existingFields =
-      existing.exists && isRecord(existing.value) ? existing.value : {}
-    const nextConfig = { ...existingFields, ...configFromStorage(storage) }
-    await writeJsonAtomic(path, nextConfig)
-    await writeJsonAtomic(getAccountStatePath(path), stateFromStorage(storage))
   } finally {
     await lock.release()
   }
@@ -1505,6 +1526,7 @@ export class FallbackAccountManager {
             candidate = await this.refreshAccount(candidate, storage)
             changed = true
           } catch (error) {
+            if (isAccountRemovedDuringRefreshError(error)) continue
             refreshFailed = true
             const stored = storage.accounts.find(
               (candidate): candidate is OAuthAccount =>
@@ -1866,7 +1888,11 @@ export class FallbackAccountManager {
         return latestAccount
       }
 
-      sourceAccount = latestAccount ?? sourceAccount
+      if (!latestAccount) {
+        throw new AccountRemovedDuringRefreshError(account.id)
+      }
+
+      sourceAccount = latestAccount
       const providerRefreshFn =
         this.options.refreshFn ??
         (async () => {
