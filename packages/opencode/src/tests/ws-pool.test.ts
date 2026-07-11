@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
+import { ResponseStreamError } from '../response-stream-error'
 import { connectResponsesWebSocket } from '../ws'
 import {
   applyTurnId,
@@ -245,12 +246,32 @@ describe('createWebSocketFetch', () => {
             body: JSON.stringify({ stream: true, input: [] }),
           },
         )
-        await response.text()
+        // The rate-limit response.failed must error the body with a RETRYABLE
+        // stream error (so OpenCode re-issues and the fetch override reroutes),
+        // NOT stream the frame and close normally. Reading the body must reject.
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        // The message must contain "rate limit" so OpenCode's native-LLM
+        // runtime (which loses the isRetryable marker and falls back to a
+        // text heuristic in retry.ts) still re-issues the request.
+        expect(
+          (streamError as { message: string }).message.toLowerCase(),
+        ).toContain('rate limit')
 
         expect(rateLimitCalls).toHaveLength(1)
         expect(rateLimitCalls[0]?.window).toBe('secondary')
         // Attributed by the internal quota storage key captured at send time
         // (mirrors onQuota's requestAccountId), not the wire chatgpt-account-id.
+        // The mark must be set BEFORE the body errors, so it's live when
+        // OpenCode re-issues.
         expect(rateLimitCalls[0]?.accountId).toBe('fb-1')
         websocketFetch.close()
       },

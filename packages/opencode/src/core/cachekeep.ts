@@ -159,7 +159,8 @@ export function isWithinCacheKeepWindow(
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000 // 5 min
 // gpt-5.6 prompts live on Codex's prompt cache for ~30 min, vs ~5 min for older
-// models, so per-target TTL doubles to match — keeps the warm cadence honest.
+// models, so per-target TTL is raised to 30 min to match — keeps the warm
+// cadence honest (warm just before the real 30-min eviction, not every 5 min).
 const GPT_5_6_TTL_MS = 30 * 60 * 1000 // 30 min
 // Long idle bound for 5.6 subagents — gives the session room for both warms on
 // the happy path (~58 min) while still eventually reclaims a stuck target whose

@@ -377,6 +377,49 @@ export function streamResponsesWebSocket(
       return
     }
 
+    // Mid-stream quota exhaustion: a response.failed carrying a
+    // rate_limit_reached_type means THIS account ran out of quota
+    // mid-generation. We already returned status:200 at socket upgrade, so the
+    // only way to make OpenCode reroute to another account is to error the
+    // response body with a RETRYABLE stream error — its outer retry loop then
+    // re-issues the request and our fetch override picks a different account.
+    // Enqueuing the response.failed frame and closing normally produces no
+    // error part on the stock AI-SDK runtime: the turn ends silently with no
+    // reroute (OpenCode session/retry.ts only re-issues on a retryable
+    // APICallError or specific error text). So handle it here, BEFORE the
+    // frame is enqueued: mark route state first (the loader's callback marks
+    // synchronously, so the mark is set when OpenCode re-issues), then error
+    // the body; do not enqueue the frame or [DONE].
+    //
+    // Dual-runtime robustness: on the stock runtime ResponseStreamError (a
+    // retryable APICallError) is what triggers the re-issue. Under
+    // OPENCODE_EXPERIMENTAL_NATIVE_LLM=1 a response.failed becomes an LLM
+    // provider-error that processor.ts throws as a BARE Error, losing the
+    // isRetryable marker; OpenCode's retry.ts then only re-issues if the
+    // message text matches a rate-limit pattern. So the message intentionally
+    // contains "rate limit reached" to satisfy that heuristic too.
+    if (isRecord(event) && event.type === 'response.failed') {
+      const failed = isRecord(event.response)
+        ? (event.response as Record<string, unknown>).failed
+        : undefined
+      const label = isRecord(failed)
+        ? (failed as Record<string, unknown>).rate_limit_reached_type
+        : undefined
+      if (typeof label === 'string') {
+        if (!emitted) options.onFirstEvent?.()
+        completed = true
+        cleanup()
+        options.onRateLimitReached?.(label)
+        options.onTerminal?.(event)
+        controller?.error(
+          new ResponseStreamError(
+            `OpenAI account rate limit reached mid-stream (${label})`,
+          ),
+        )
+        return
+      }
+    }
+
     if (event) {
       void logProviderNativeWebSearchEvent(event, options.sessionID)
       recordFinalizedFunctionCall(event, finalizedFunctionCallIds)
@@ -425,21 +468,11 @@ export function streamResponsesWebSocket(
       translatedEvent.type === 'response.incomplete' ||
       translatedEvent.type === 'error'
     ) {
+      // A rate-limit response.failed is intercepted earlier (errored as a
+      // retryable stream failure so OpenCode reroutes). Any OTHER terminal
+      // failure/incomplete/error reaching here is non-reroutable and closes
+      // the stream benignly.
       completed = true
-      // Mid-stream quota exhaustion arrives in-band here (ws.ts already
-      // returned status:200 at socket upgrade, before generation ran), so
-      // this is the only signal the pool has for it. SSE/HTTP has no
-      // equivalent mid-stream hook — the body passes through untouched there.
-      if (translatedEvent.type === 'response.failed') {
-        const rateLimitType = isRecord(translatedEvent.response)
-          ? (translatedEvent.response as Record<string, unknown>)?.failed
-          : undefined
-        if (isRecord(rateLimitType)) {
-          const label = (rateLimitType as Record<string, unknown>)
-            .rate_limit_reached_type
-          if (typeof label === 'string') options.onRateLimitReached?.(label)
-        }
-      }
       options.onTerminal?.(translatedEvent)
       closeCompleted()
     }

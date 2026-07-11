@@ -14,6 +14,7 @@ import {
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
 } from '../index.ts'
+import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
@@ -1246,18 +1247,30 @@ describe('integration: killswitch enforcement', () => {
           }
 
           // Request 1: main's stream hits mid-stream rate_limit_reached_type.
-          // The synthetic WS status is still 200 — the reroute cannot come
-          // from a reactive HTTP-status check on THIS response.
+          // The synthetic WS status is 200 at upgrade, but reading the body
+          // must REJECT with a retryable stream error — that is exactly what
+          // makes OpenCode's outer retry loop re-issue the request (a normal
+          // close would end the turn silently with no reroute). The mark is
+          // set as a side effect before the body errors.
           const first = await fetchOverride(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await first.text()
+          let firstError: unknown
+          try {
+            await first.text()
+          } catch (err) {
+            firstError = err
+          }
+          expect(firstError).toBeInstanceOf(ResponseStreamError)
+          expect((firstError as { isRetryable?: boolean }).isRetryable).toBe(
+            true,
+          )
 
-          // Request 2: main is now marked rate-limited from request 1's
-          // in-band signal, so the fetch override must reroute to the
-          // fallback WITHOUT ever re-sending to main.
+          // Request 2 models OpenCode's retry-driven re-issue: main is now
+          // marked rate-limited from request 1's in-band signal, so the fetch
+          // override must reroute to the fallback WITHOUT re-sending to main.
           const second = await fetchOverride(
             'https://api.openai.com/v1/responses',
             wsRequest,
@@ -1377,14 +1390,15 @@ describe('integration: killswitch enforcement', () => {
           }
 
           // Request 1: fallback-first tries the fallback; its stream hits
-          // mid-stream rate_limit_reached_type but still returns 200, so
-          // tryFallbackFirst marks it used and serves this response.
+          // mid-stream rate_limit_reached_type. The response is served (200 at
+          // upgrade) but reading the body rejects with a retryable stream
+          // error, which sets the mark and drives OpenCode's re-issue.
           const first = await fetchOverride(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await first.text()
+          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
 
           // Request 2: the fallback is now marked rate-limited from request
           // 1's in-band signal, so usableFallbackCandidates excludes it and
@@ -1502,12 +1516,14 @@ describe('integration: killswitch enforcement', () => {
           }
 
           // Request 1: main's stream hits mid-stream rate_limit_reached_type.
+          // Reading the body rejects with the retryable stream error (the
+          // reissue trigger) and sets the mark as a side effect.
           const first = await fetchOverride(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await first.text()
+          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
 
           // Request 2: main is marked rate-limited from request 1's in-band
           // signal. The killswitch itself is enabled but fails open on
@@ -1602,14 +1618,14 @@ describe('integration: killswitch enforcement', () => {
           }
 
           // Request 1: main hits mid-stream rate_limit_reached_type; no
-          // fallback exists to reroute to, so the mark is set for the next
-          // request.
+          // fallback exists to reroute to. Reading the body rejects with the
+          // retryable stream error and sets the mark for the re-issue.
           const first = await fetchOverride(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await first.text()
+          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
 
           // Request 2: main is marked rate-limited and there is no fallback
           // to reroute to, so this hits the hard-block path.
