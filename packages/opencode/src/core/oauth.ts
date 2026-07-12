@@ -11,6 +11,8 @@ export const ISSUER = 'https://auth.openai.com'
 export const OAUTH_PORT = 1455
 export const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 export const USER_AGENT = `cortexkit-opencode-openai-auth/${PackageVersion}`
+export const RESERVED_ACCOUNT_ID = 'main'
+export const RESERVED_ACCOUNT_ID_ERROR = `"${RESERVED_ACCOUNT_ID}" is a reserved account id; choose a different label.`
 
 // ---------------------------------------------------------------------------
 // PKCE
@@ -119,6 +121,21 @@ export function extractAccountId(tokens: TokenResponse): string | undefined {
     return claims ? extractAccountIdFromClaims(claims) : undefined
   }
   return undefined
+}
+
+export function isReservedAccountId(value: string | undefined): boolean {
+  return (
+    typeof value === 'string' && value.toLowerCase() === RESERVED_ACCOUNT_ID
+  )
+}
+
+export function assertFallbackAccountIdAllowed<T extends string | undefined>(
+  value: T,
+): T {
+  if (isReservedAccountId(value)) {
+    throw new Error(RESERVED_ACCOUNT_ID_ERROR)
+  }
+  return value
 }
 
 // ---------------------------------------------------------------------------
@@ -355,23 +372,24 @@ export async function startOAuthServer(): Promise<{
           return
         }
 
-        if (!code || !state) {
-          const errorMsg = !code
-            ? 'Missing authorization code'
-            : 'Missing state parameter'
-          if (state) {
-            const entry = pendingFlows.get(state)
-            if (entry) {
-              entry.reject(new Error(errorMsg))
-              flowCleanup(state)
-            } else if (flowCount() === 0) {
-              stopOAuthServer()
-            }
-          } else if (flowCount() === 0) {
+        if (!state) {
+          if (flowCount() === 0) {
             stopOAuthServer()
           }
           res.writeHead(400, { 'Content-Type': 'text/html' })
-          res.end(HTML_ERROR(errorMsg))
+          res.end(HTML_ERROR('Missing state parameter'))
+          return
+        }
+
+        if (!code) {
+          // A callback that only echoes state back does not prove the OAuth flow
+          // finished, so keep the pending login alive until a code or provider
+          // error arrives.
+          if (flowCount() === 0) {
+            stopOAuthServer()
+          }
+          res.writeHead(400, { 'Content-Type': 'text/html' })
+          res.end(HTML_ERROR('Missing authorization code'))
           return
         }
 
@@ -756,6 +774,7 @@ export async function beginAccountLogin(
   opts: BeginAccountLoginOptions = {},
 ): Promise<BeginAccountLoginResult> {
   const { label, headless = false, signal } = opts
+  assertFallbackAccountIdAllowed(label)
 
   if (headless) {
     const { deviceData, url, instructions } = await beginDeviceAuth()
@@ -763,8 +782,11 @@ export async function beginAccountLogin(
     const completion = (async (): Promise<IngestAccount> => {
       const tokens = await completeDeviceAuth(deviceData, signal)
       const now = Date.now()
+      const accountId = extractAccountId(tokens)
       return {
-        id: label || extractAccountId(tokens) || crypto.randomUUID(),
+        id: assertFallbackAccountIdAllowed(
+          label || accountId || crypto.randomUUID(),
+        ),
         label: label || undefined,
         type: 'oauth',
         access: tokens.access_token,
@@ -774,7 +796,7 @@ export async function beginAccountLogin(
         addedAt: now,
         lastUsed: now,
         lastRefreshedAt: now,
-        accountId: extractAccountId(tokens),
+        accountId,
       }
     })()
 
@@ -796,8 +818,11 @@ export async function beginAccountLogin(
       }
       const tokens = await waitForOAuthCallback(pkce, state, undefined, signal)
       const now = Date.now()
+      const accountId = extractAccountId(tokens)
       return {
-        id: label || extractAccountId(tokens) || crypto.randomUUID(),
+        id: assertFallbackAccountIdAllowed(
+          label || accountId || crypto.randomUUID(),
+        ),
         label: label || undefined,
         type: 'oauth',
         access: tokens.access_token,
@@ -807,7 +832,7 @@ export async function beginAccountLogin(
         addedAt: now,
         lastUsed: now,
         lastRefreshedAt: now,
-        accountId: extractAccountId(tokens),
+        accountId,
       }
     } finally {
       // Clean up this flow's entry. The shared server is stopped only when

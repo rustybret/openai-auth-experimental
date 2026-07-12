@@ -21,6 +21,9 @@ import {
   waitForOAuthCallback,
 } from '../core/oauth'
 
+const RESERVED_ACCOUNT_ID_ERROR =
+  '"main" is a reserved account id; choose a different label.'
+
 // ---------------------------------------------------------------------------
 // upsertAccount
 // ---------------------------------------------------------------------------
@@ -334,6 +337,106 @@ describe('HTML_ERROR', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Fallback account id hardening
+// ---------------------------------------------------------------------------
+
+describe('reserved fallback account ids', () => {
+  let originalFetch: typeof globalThis.fetch
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    resetOAuthStateForTest()
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    resetOAuthStateForTest()
+  })
+
+  test('headless login rejects a reserved label before starting device auth', async () => {
+    await expect(
+      beginAccountLogin({ headless: true, label: 'MaIn' }),
+    ).rejects.toThrow(RESERVED_ACCOUNT_ID_ERROR)
+  })
+
+  test('headless login rejects a token-derived reserved account id', async () => {
+    const payload = btoa(JSON.stringify({ chatgpt_account_id: 'MAIN' }))
+    globalThis.fetch = mock(async (url: unknown) => {
+      const urlStr = String(url)
+      if (urlStr.endsWith('/api/accounts/deviceauth/usercode')) {
+        return new Response(
+          JSON.stringify({
+            device_auth_id: 'device-1',
+            user_code: 'CODE-1',
+            interval: '1',
+            expires_in: 600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (urlStr.endsWith('/api/accounts/deviceauth/token')) {
+        return new Response(
+          JSON.stringify({
+            authorization_code: 'auth-1',
+            code_verifier: 'verifier-1',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (urlStr.includes('/oauth/token')) {
+        return new Response(
+          JSON.stringify({
+            id_token: `h.${payload}.s`,
+            access_token: 'mock-access',
+            refresh_token: 'mock-refresh',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected fetch: ${urlStr}`)
+    }) as unknown as typeof globalThis.fetch
+
+    const { completion } = await beginAccountLogin({ headless: true })
+    await expect(completion).rejects.toThrow(RESERVED_ACCOUNT_ID_ERROR)
+  })
+
+  test('browser login rejects a token-derived reserved account id', async () => {
+    const payload = btoa(JSON.stringify({ chatgpt_account_id: 'MAIN' }))
+    globalThis.fetch = mock(async (url: unknown, init?: unknown) => {
+      const urlStr = typeof url === 'string' ? url : String(url)
+      if (urlStr.includes('/oauth/token')) {
+        return new Response(
+          JSON.stringify({
+            id_token: `h.${payload}.s`,
+            access_token: 'mock-access',
+            refresh_token: 'mock-refresh',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return originalFetch(url as RequestInfo, init as RequestInit | undefined)
+    }) as unknown as typeof globalThis.fetch
+
+    const { url, completion } = await beginAccountLogin()
+    const completionError = completion.catch((error) => error)
+    const state = new URL(url).searchParams.get('state')
+    expect(state).toBeString()
+    if (!state) throw new Error('Expected browser login URL to include state')
+
+    const callback = await fetch(
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=ok&state=${state}`,
+    )
+    expect(callback.status).toBe(200)
+
+    const rejected = await completionError
+    expect(rejected).toEqual(expect.any(Error))
+    expect(rejected.message).toBe(RESERVED_ACCOUNT_ID_ERROR)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Council C1/C2: OAuth concurrency and server lifecycle
 // ---------------------------------------------------------------------------
 
@@ -471,6 +574,28 @@ describe('OAuth server concurrency (C1/C2)', () => {
     expect(cb.status).toBe(400)
     const text = await cb.text()
     expect(text).toContain('Missing state')
+  })
+
+  test('state-only callback does not consume the pending flow', async () => {
+    await startOAuthServer()
+
+    const pending = waitForOAuthCallback(
+      { verifier: 'v', challenge: 'c' },
+      'keep-state',
+    )
+
+    const stateOnly = await fetch(
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?state=keep-state`,
+    )
+    expect(stateOnly.status).toBe(400)
+    expect(await stateOnly.text()).toContain('Missing authorization code')
+
+    const realCallback = await fetch(
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=real&state=keep-state`,
+    )
+    expect(realCallback.status).toBe(200)
+
+    await expect(pending).resolves.toBeDefined()
   })
 
   test('C2: server stops when no flows are pending after flowCleanup', async () => {

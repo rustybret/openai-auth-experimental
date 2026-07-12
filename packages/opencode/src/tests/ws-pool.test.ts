@@ -1,8 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
+import { ResponseStreamError } from '../response-stream-error'
 import { connectResponsesWebSocket } from '../ws'
-import { applyTurnId, createWebSocketFetch } from '../ws-pool'
+import {
+  applyTurnId,
+  CODEX_BODY_KEY_ORDER,
+  createWebSocketFetch,
+  orderCodexBody,
+} from '../ws-pool'
 
 function entry() {
   return {
@@ -120,9 +126,32 @@ describe('applyTurnId', () => {
   })
 })
 
+describe('orderCodexBody', () => {
+  test('orders known response body keys and leaves unknown keys trailing', () => {
+    const input = {
+      stream: true,
+      extra_key: 'kept-last',
+      client_metadata: {},
+      model: 'gpt-5.5',
+      input: [],
+      prompt_cache_key: 'session-1',
+    }
+
+    const ordered = orderCodexBody(input)
+    expect(Object.keys(ordered)).toEqual([
+      ...CODEX_BODY_KEY_ORDER.filter((key) => key in input),
+      'extra_key',
+    ])
+  })
+})
+
 describe('createWebSocketFetch', () => {
-  test('attributes quota by the internal account key, not the wire chatgpt-account-id', async () => {
-    const quotaCalls: Array<{ accessToken: string; accountId?: string }> = []
+  test('attributes quota by the internal account key and threads the served ChatGPT id', async () => {
+    const quotaCalls: Array<{
+      accessToken: string
+      accountId?: string
+      servedChatgptAccountId?: string
+    }> = []
     await withFakeWebSocket(
       ({ message }) => ({
         send() {
@@ -145,8 +174,12 @@ describe('createWebSocketFetch', () => {
       async () => {
         const websocketFetch = createWebSocketFetch({
           url: 'https://example.test/backend-api/codex/responses',
-          onQuota: (_s, accessToken, accountId) => {
-            quotaCalls.push({ accessToken, accountId })
+          onQuota: (_s, accessToken, accountId, servedChatgptAccountId) => {
+            quotaCalls.push({
+              accessToken,
+              accountId,
+              servedChatgptAccountId,
+            })
           },
         })
 
@@ -170,6 +203,133 @@ describe('createWebSocketFetch', () => {
         expect(quotaCalls).toHaveLength(1)
         expect(quotaCalls[0]?.accountId).toBe('main')
         expect(quotaCalls[0]?.accessToken).toBe('tok-main')
+        expect(quotaCalls[0]?.servedChatgptAccountId).toBe('chatgpt-stable-xyz')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('attributes a mid-stream response.failed rate_limit_reached_type to the connection that sent it', async () => {
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                id: 'resp_1',
+                failed: { rate_limit_reached_type: 'secondary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-rl',
+              authorization: 'Bearer tok-fb',
+              'chatgpt-account-id': 'chatgpt-stable-fb',
+              'x-openai-auth-quota-account': 'fb-1',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        // The rate-limit response.failed must error the body with a RETRYABLE
+        // stream error (so OpenCode re-issues and the fetch override reroutes),
+        // NOT stream the frame and close normally. Reading the body must reject.
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        // Human-readable rate-limit message (surfaced to the user on the
+        // native runtime, which does not auto-reroute).
+        expect(
+          (streamError as { message: string }).message.toLowerCase(),
+        ).toContain('rate limit')
+
+        expect(rateLimitCalls).toHaveLength(1)
+        expect(rateLimitCalls[0]?.window).toBe('secondary')
+        // Attributed by the internal quota storage key captured at send time
+        // (mirrors onQuota's requestAccountId), not the wire chatgpt-account-id.
+        // The mark must be set BEFORE the body errors, so it's live when
+        // OpenCode re-issues.
+        expect(rateLimitCalls[0]?.accountId).toBe('fb-1')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('does NOT force a retry when output already streamed before a rate-limit failure (no duplicate replay)', async () => {
+    // A rate_limit_reached_type arriving AFTER meaningful output has streamed
+    // must still MARK the account (steer the next turn away) but must NOT error
+    // the body — OpenCode has already persisted the emitted parts, so a retry
+    // would replay text / re-run tools / double-bill. The body must complete
+    // normally; only the mark is set.
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          // First emit real output, THEN fail with a rate limit mid-stream.
+          message(
+            JSON.stringify({
+              type: 'response.output_text.delta',
+              delta: 'partial answer',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                id: 'resp_rl_after_output',
+                failed: { rate_limit_reached_type: 'primary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-rl-after-output',
+              authorization: 'Bearer tok-main',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        // Body must NOT reject: reading it to completion resolves.
+        const text = await response.text()
+        expect(text).toContain('partial answer')
+        // The mark is still set so the NEXT turn reroutes off this account.
+        expect(rateLimitCalls).toHaveLength(1)
+        expect(rateLimitCalls[0]?.accountId).toBe('main')
         websocketFetch.close()
       },
     )

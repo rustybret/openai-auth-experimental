@@ -10,7 +10,11 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
+import type {
+  AccountManagerOptions,
+  AccountStorage,
+  OAuthAccount,
+} from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
@@ -35,6 +39,58 @@ afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
   } catch {}
 })
+
+function oauthAccount(
+  id: string,
+  overrides: Partial<OAuthAccount> = {},
+): OAuthAccount {
+  return {
+    id,
+    type: 'oauth',
+    access: `acc-${id}`,
+    refresh: `ref-${id}`,
+    expires: Date.now() + 3600_000,
+    addedAt: Date.now(),
+    lastUsed: Date.now(),
+    ...overrides,
+  }
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+type FallbackAccountManagerConstructor =
+  typeof import('../core/accounts.ts').FallbackAccountManager
+type MutateAccountsFn = typeof import('../core/accounts.ts').mutateAccounts
+
+function createManagerRemovingAccountOnFirstLoad(
+  FallbackAccountManagerCtor: FallbackAccountManagerConstructor,
+  mutateAccounts: MutateAccountsFn,
+  accountId: string,
+  configPath: string,
+  options: AccountManagerOptions,
+) {
+  class RemovingManager extends FallbackAccountManagerCtor {
+    private removed = false
+
+    override async load() {
+      const loaded = await super.load()
+      if (!this.removed) {
+        this.removed = true
+        await mutateAccounts((current) => {
+          current.accounts = current.accounts.filter(
+            (candidate) => candidate.id !== accountId,
+          )
+          return current
+        }, configPath)
+      }
+      return loaded
+    }
+  }
+
+  return new RemovingManager(options)
+}
 
 describe('accounts store', () => {
   it('load/save round-trip: accounts, main provider, version', async () => {
@@ -240,6 +296,293 @@ describe('accounts store', () => {
       'latest-writer',
       'stale-writer',
     ])
+  })
+})
+
+describe('account store migration locking', () => {
+  it('serializes first-run migration with a concurrent structural add', async () => {
+    const { loadAccounts, migrateIfNeeded, mutateAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({ webSockets: true, dump: false })}\n`,
+    )
+
+    const lock = await acquireRefreshFileLock({
+      name: 'save',
+      ttlMs: 10_000,
+      path: cfgPath,
+    })
+    expect(lock).not.toBeNull()
+
+    let migrationSettled = false
+    let mutationSettled = false
+    const existingToken = {
+      type: 'oauth' as const,
+      access: 'existing-access',
+      refresh: 'existing-refresh',
+      expires: Date.now() + 3600_000,
+    }
+    const migration = migrateIfNeeded(existingToken, cfgPath).finally(() => {
+      migrationSettled = true
+    })
+    const addFallback = mutateAccounts((current) => {
+      current.accounts.push(oauthAccount('concurrent-fallback'))
+      return current
+    }, cfgPath).finally(() => {
+      mutationSettled = true
+    })
+
+    try {
+      await wait(75)
+      expect(migrationSettled).toBe(false)
+      expect(mutationSettled).toBe(false)
+    } finally {
+      await lock?.release()
+    }
+
+    await Promise.race([
+      Promise.all([migration, addFallback]),
+      wait(5_000).then(() => {
+        throw new Error('migration and structural add did not complete')
+      }),
+    ])
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.main?.provider).toBe('openai')
+    expect(loaded?.accounts.map((account) => account.id)).toContain(
+      'concurrent-fallback',
+    )
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.version).toBe(1)
+    expect(Array.isArray(cfg.accounts)).toBe(true)
+    expect(cfg.webSockets).toBe(true)
+  })
+
+  it('leaves an already migrated store unchanged on a second migration', async () => {
+    const { migrateIfNeeded } = await import('../core/accounts.ts')
+    writeFileSync(cfgPath, `${JSON.stringify({ webSockets: true })}\n`)
+
+    await migrateIfNeeded(
+      {
+        type: 'oauth' as const,
+        access: 'first-access',
+        refresh: 'first-refresh',
+        expires: Date.now() + 3600_000,
+      },
+      cfgPath,
+    )
+    const firstConfig = readFileSync(cfgPath, 'utf8')
+    const firstState = readFileSync(statePath, 'utf8')
+
+    await migrateIfNeeded(
+      {
+        type: 'oauth' as const,
+        access: 'second-access',
+        refresh: 'second-refresh',
+        expires: Date.now() + 3600_000,
+      },
+      cfgPath,
+    )
+
+    expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
+    expect(readFileSync(statePath, 'utf8')).toBe(firstState)
+  })
+})
+
+describe('removed fallback refresh guard', () => {
+  it('throws a distinct error and avoids the refresh call after removal', async () => {
+    const {
+      AccountRemovedDuringRefreshError,
+      FallbackAccountManager,
+      loadAccounts,
+      mutateAccounts,
+      saveAccounts,
+    } = await import('../core/accounts.ts')
+    const now = 1_700_000_000_000
+    const account = oauthAccount('removed-during-refresh', {
+      access: 'stale-access',
+      refresh: 'stale-refresh',
+      expires: now - 1_000,
+    })
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+      },
+      cfgPath,
+    )
+    const snapshot = (await loadAccounts(cfgPath))!
+    let refreshCalls = 0
+
+    const manager = createManagerRemovingAccountOnFirstLoad(
+      FallbackAccountManager,
+      mutateAccounts,
+      account.id,
+      cfgPath,
+      {
+        configPath: cfgPath,
+        now: () => now,
+        refreshFn: async () => {
+          refreshCalls++
+          return {
+            access: 'fresh-access',
+            refresh: 'fresh-refresh',
+            expires: now + 3600_000,
+            expiresIn: 3600,
+          }
+        },
+      },
+    )
+
+    let thrown: unknown
+    try {
+      await manager.refreshAccount(
+        snapshot.accounts[0] as OAuthAccount,
+        snapshot,
+      )
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(AccountRemovedDuringRefreshError)
+    expect((thrown as { code?: string }).code).toBe(
+      'ACCOUNT_REMOVED_DURING_REFRESH',
+    )
+    expect(refreshCalls).toBe(0)
+    expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
+  })
+
+  it('rejects and skips an account removed while provider refresh is in flight', async () => {
+    const {
+      AccountRemovedDuringRefreshError,
+      FallbackAccountManager,
+      loadAccounts,
+      mutateAccounts,
+      saveAccounts,
+    } = await import('../core/accounts.ts')
+    const now = 1_700_000_000_000
+    const account = oauthAccount('removed-during-provider-refresh', {
+      access: 'expired-access',
+      refresh: 'refresh-in-flight',
+      expires: now - 1_000,
+    })
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+        quota: { failClosedOnUnknownQuota: false },
+      },
+      cfgPath,
+    )
+    const snapshot = (await loadAccounts(cfgPath))!
+    let signalRefreshStarted: (() => void) | undefined
+    const refreshStarted = new Promise<void>((resolve) => {
+      signalRefreshStarted = resolve
+    })
+    let resolveRefresh:
+      | ((tokens: {
+          access: string
+          refresh: string
+          expires: number
+          expiresIn: number
+        }) => void)
+      | undefined
+    const manager = new FallbackAccountManager({
+      configPath: cfgPath,
+      now: () => now,
+      refreshFn: async () => {
+        signalRefreshStarted?.()
+        return new Promise((resolve) => {
+          resolveRefresh = resolve
+        })
+      },
+    })
+
+    const selectionPromise = manager.getUsableFallbackAccounts(snapshot)
+    await refreshStarted
+    const directRefreshPromise = manager.refreshAccount(
+      snapshot.accounts[0] as OAuthAccount,
+      snapshot,
+    )
+    await mutateAccounts((current) => {
+      current.accounts = current.accounts.filter(
+        (candidate) => candidate.id !== account.id,
+      )
+      return current
+    }, cfgPath)
+    resolveRefresh?.({
+      access: 'fresh-access',
+      refresh: 'fresh-refresh',
+      expires: now + 3600_000,
+      expiresIn: 3600,
+    })
+
+    const [selectionResult, directRefreshResult] = await Promise.allSettled([
+      selectionPromise,
+      directRefreshPromise,
+    ])
+    expect(selectionResult.status).toBe('fulfilled')
+    expect(
+      selectionResult.status === 'fulfilled' ? selectionResult.value : null,
+    ).toEqual([])
+    expect(directRefreshResult.status).toBe('rejected')
+    expect(
+      directRefreshResult.status === 'rejected'
+        ? directRefreshResult.reason
+        : null,
+    ).toBeInstanceOf(AccountRemovedDuringRefreshError)
+    expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
+  })
+
+  it('skips a removed account instead of selecting it through fail-open', async () => {
+    const {
+      FallbackAccountManager,
+      loadAccounts,
+      mutateAccounts,
+      saveAccounts,
+    } = await import('../core/accounts.ts')
+    const now = 1_700_000_000_000
+    const account = oauthAccount('removed-before-selection', {
+      access: 'still-unexpired-access',
+      refresh: 'stale-refresh',
+      expires: now + 60_000,
+    })
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+        quota: { failClosedOnUnknownQuota: false },
+      },
+      cfgPath,
+    )
+    const snapshot = (await loadAccounts(cfgPath))!
+    let refreshCalls = 0
+
+    const manager = createManagerRemovingAccountOnFirstLoad(
+      FallbackAccountManager,
+      mutateAccounts,
+      account.id,
+      cfgPath,
+      {
+        configPath: cfgPath,
+        now: () => now,
+        refreshFn: async () => {
+          refreshCalls++
+          throw new Error('refresh endpoint unavailable')
+        },
+      },
+    )
+
+    const usable = await manager.getUsableFallbackAccounts(snapshot)
+
+    expect(usable).toEqual([])
+    expect(refreshCalls).toBe(0)
   })
 })
 

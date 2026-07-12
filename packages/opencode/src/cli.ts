@@ -6,7 +6,11 @@ import {
   mutateAccounts,
   type OAuthAccount,
 } from './core/accounts'
-import { beginAccountLogin, upsertAccount } from './core/oauth'
+import {
+  assertFallbackAccountIdAllowed,
+  beginAccountLogin,
+  upsertAccount,
+} from './core/oauth'
 import { openUrl } from './util/open-url'
 
 export { openUrl as openBrowserForLogin } from './util/open-url'
@@ -56,6 +60,15 @@ async function main() {
     case 'login': {
       const label = typeof flags.label === 'string' ? flags.label : undefined
       const headless = Boolean(flags.headless)
+
+      try {
+        assertFallbackAccountIdAllowed(label)
+      } catch (error) {
+        console.error(
+          `\nError: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        process.exit(1)
+      }
 
       const { url, instructions, completion } = await beginAccountLogin({
         label,
