@@ -33,15 +33,28 @@ export interface CreateWebSocketFetchOptions {
   /**
    * Push per-turn quota from a codex.rate_limits in-band frame.
    *
-   * Receives the snapshot plus the per-request account identity (access token
-   * and accountId) captured at send time so the frame is attributed to the
-   * connection's own account, not a shared mutable global.
+   * Receives the snapshot plus the per-request account identity (access token,
+   * internal quota account key, and served ChatGPT account id) captured at send
+   * time so the frame is attributed to the connection's own account, not a
+   * shared mutable global.
    */
   onQuota?: (
     s: Record<string, unknown>,
     accessToken: string,
     accountId: string | undefined,
+    servedChatgptAccountId: string | undefined,
   ) => void
+  /**
+   * Fires when a response.failed frame carries a rate_limit_reached_type —
+   * mid-stream quota exhaustion the reactive HTTP-status fallback cannot see
+   * on the WebSocket transport (ws.ts synthesizes status:200 at upgrade,
+   * before generation runs).
+   *
+   * Receives the window label plus the per-request internal quota account key
+   * captured at send time, same as onQuota, so the signal is attributed to
+   * the connection's own account rather than a shared mutable global.
+   */
+  onRateLimitReached?: (window: string, accountId: string | undefined) => void
 }
 
 interface PoolEntry {
@@ -118,6 +131,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const firstEventGraceMs = options?.firstEventGraceMs ?? 250
   const rawWebSocket = options?.rawWebSocket ?? false
   const onQuota = options?.onQuota
+  const onRateLimitReached = options?.onRateLimitReached
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (
     typeof pruneTimer === 'object' &&
@@ -221,9 +235,25 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
           ? internalHeaders[QUOTA_ACCOUNT_HEADER]
           : undefined
+      const requestServedChatgptAccountId =
+        typeof sourceHeaders['chatgpt-account-id'] === 'string'
+          ? sourceHeaders['chatgpt-account-id']
+          : undefined
       const requestOnQuota = onQuota
         ? (s: Record<string, unknown>) =>
-            onQuota(s, requestAccessToken, requestAccountId)
+            onQuota(
+              s,
+              requestAccessToken,
+              requestAccountId,
+              requestServedChatgptAccountId,
+            )
+        : undefined
+      // Same capture-at-send-time discipline as requestOnQuota: the
+      // response.failed frame arrives asynchronously, so it must be
+      // attributed to THIS connection's account, never a shared mutable
+      // global a concurrent request could have overwritten.
+      const requestOnRateLimitReached = onRateLimitReached
+        ? (window: string) => onRateLimitReached(window, requestAccountId)
         : undefined
 
       const socketHeaders =
@@ -245,6 +275,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           sessionID: dumpSessionID,
           url: options?.url ?? url,
           headers: wsInit?.headers,
+          onRateLimitReached: requestOnRateLimitReached,
         })
       }
       let resolveFirstEvent: (
@@ -282,6 +313,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         idleTimeout,
         signal: init?.signal ?? undefined,
         onQuota: requestOnQuota,
+        onRateLimitReached: requestOnRateLimitReached,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onComplete: (event, finalizedCallIds) => {
           const usage = responseUsage(event)
@@ -503,6 +535,7 @@ async function prewarm(
     sessionID?: string
     url?: string
     headers?: HeadersInit
+    onRateLimitReached?: (window: string) => void
   },
 ) {
   if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
@@ -523,6 +556,10 @@ async function prewarm(
     sessionID: options.sessionID,
     idleTimeout,
     signal: options.signal,
+    // A rate-limit response.failed can arrive on the prewarm connection too;
+    // mark the account here so the retry (the prewarm failure surfaces as a
+    // retryable stream error) reroutes off it instead of hitting it again.
+    onRateLimitReached: options.onRateLimitReached,
     onComplete: (event, finalizedCallIds) => {
       void dumpDiagnostic({
         component: 'ws-pool',
@@ -626,7 +663,7 @@ function prewarmHeaders(input: Record<string, string>) {
 }
 
 // Codex serializes the response.create body in this exact key order.
-const CODEX_BODY_KEY_ORDER = [
+export const CODEX_BODY_KEY_ORDER = [
   'type',
   'model',
   'instructions',
@@ -654,7 +691,7 @@ function normalizeResponseBody(body: Record<string, unknown>) {
 
 // Reconstruct the body in Codex's exact key order; append any unexpected keys at the end.
 // Applied at the final send so continuation/prewarm fields land in the right position.
-function orderCodexBody(body: Record<string, unknown>) {
+export function orderCodexBody(body: Record<string, unknown>) {
   const next: Record<string, unknown> = {}
   for (const key of CODEX_BODY_KEY_ORDER) if (key in body) next[key] = body[key]
   for (const key of Object.keys(body)) if (!(key in next)) next[key] = body[key]

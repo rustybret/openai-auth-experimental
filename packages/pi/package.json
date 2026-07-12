@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/pi-openai-auth",
-  "version": "0.3.0",
+  "version": "0.3.3",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -31,6 +31,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc",
     "prepublishOnly": "bun run build"
