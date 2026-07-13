@@ -31,6 +31,18 @@
       "agent-harness-0367cd71": {
         "access": "allow",
         "intent_budget": "plan"
+      },
+      "aft-5fc3f7ed": {
+        "access": "allow",
+        "intent_budget": "plan"
+      },
+      "anthropic-auth-1369fa0e": {
+        "access": "allow",
+        "intent_budget": "plan"
+      },
+      "magic-context-6deb493e": {
+        "access": "allow",
+        "intent_budget": "plan"
       }
         }
     }
