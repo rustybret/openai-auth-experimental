@@ -40,3 +40,6 @@ temp/
 !.github/*
 .opencode/package-lock.json
 .opencode/package.json
+.omo/mailbox-trace.jsonl
+.omo/omo.jsonc
+/coordination_notes
