@@ -3,13 +3,13 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
-// Evergreen regression check: the ./tui export ships raw source
-// (exports["./tui"].import === "./src/tui.tsx"), so every src/ file
-// transitively reachable from that entry must be listed in package.json
-// "files" — otherwise the published tarball is missing modules and the
-// ./tui import throws ERR_MODULE_NOT_FOUND at load time.  This test walks
-// the import graph dynamically from package.json and asserts no reachable
-// src/ file is uncovered.
+// Evergreen regression check: the ./tui export ships a runtime shim that can
+// load either the host-runtime compiled TUI or the raw-TSX fallback. Every
+// transitively reachable src/ file from that shim must be listed in package.json
+// "files", otherwise the published tarball is missing modules and the
+// ./tui import throws ERR_MODULE_NOT_FOUND at load time. This test walks both
+// branches of the relative import graph and asserts no reachable src/ file is
+// uncovered.
 // ---------------------------------------------------------------------------
 
 const PKG_DIR = join(import.meta.dir!, '..', '..')
@@ -123,14 +123,16 @@ function uncoveredFiles(reachable: Set<string>, files: string[]): string[] {
     .sort()
 }
 
-describe('tui packaging (raw-source ./tui entry)', () => {
+describe('tui packaging (compiled ./tui entry shim)', () => {
   test('every reachable src/ file is covered by package.json files', () => {
     const pkg = readJson(join(PKG_DIR, 'package.json'))
     const tuiEntry: string = pkg.exports['./tui'].import
+    expect(tuiEntry).toBe('./src/tui/entry.mjs')
+    expect(pkg.files).toContain('src/tui-compiled')
 
     if (!tuiEntry.startsWith('./')) {
       throw new Error(
-        `Expected exports["./tui"].import to be a raw-source entry like "./src/tui.tsx", got ${JSON.stringify(tuiEntry)}`,
+        `Expected exports["./tui"].import to be a package entry, got ${JSON.stringify(tuiEntry)}`,
       )
     }
 
@@ -140,5 +142,39 @@ describe('tui packaging (raw-source ./tui entry)', () => {
     const uncovered = uncoveredFiles(reachable, pkg.files)
 
     expect(uncovered).toEqual([])
+  })
+
+  // The compiled TUI bundle is produced from the static shippedSourceFiles
+  // list in scripts/build-tui.ts. A source file reachable from tui.tsx but
+  // missing from that list is absent from src/tui-compiled/, and the compiled
+  // bundle then fails at load time with "Cannot find module" — the host
+  // silently drops the sidebar. Walk the real import graph and require the
+  // build list to cover it exactly.
+  test('every src/ file reachable from tui.tsx is in build-tui shippedSourceFiles', () => {
+    const script = readFileSync(
+      join(PKG_DIR, 'scripts', 'build-tui.ts'),
+      'utf8',
+    )
+    const arrayMatch = script.match(
+      /const shippedSourceFiles = \[([\s\S]*?)\] as const/,
+    )
+    if (!arrayMatch) {
+      throw new Error(
+        'scripts/build-tui.ts no longer declares shippedSourceFiles — update this test to match the new build mechanism',
+      )
+    }
+    const shipped = new Set(
+      [...arrayMatch[1]!.matchAll(/'([^']+)'/g)].map((m) => m[1]!),
+    )
+
+    // tui-compiled is build output; the graph of interest is the raw source
+    // fallback starting at src/tui.tsx (the same graph build-tui compiles).
+    const reachable = [...collectReachableSrcFiles('src/tui.tsx')]
+      .filter((rel) => !rel.startsWith('src/tui-compiled/'))
+      .map((rel) => rel.replace(/^src\//, ''))
+      .sort()
+
+    const missing = reachable.filter((rel) => !shipped.has(rel))
+    expect(missing).toEqual([])
   })
 })

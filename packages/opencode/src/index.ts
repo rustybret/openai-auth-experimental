@@ -67,7 +67,6 @@ import {
 import { codexRefreshFn, whamUsageFn } from './core/provider'
 import {
   QuotaManager,
-  quotaWindowResetIsPast,
   resolveMidStreamRateLimitResetAt,
 } from './core/quota-manager'
 import { refreshAllQuota } from './core/refresh-all-quota'
@@ -79,8 +78,12 @@ import {
   translateHostedWebSearchResponse,
 } from './hosted-web-search'
 import { createLogger, setLogLevel } from './logger'
+import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
-import { normalizeQuotaHeaders } from './quota-normalize'
+import {
+  isCompleteQuotaHeaderFrame,
+  normalizeQuotaHeaders,
+} from './quota-normalize'
 import {
   drainNotifications,
   isTuiConnected,
@@ -94,10 +97,16 @@ import type {
 import { getRpcDir } from './rpc/rpc-dir'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
+  type AccountQuota,
   getSidebarStateFile,
+  removeSidebarActiveRouting,
+  type SidebarMachineState,
   type SidebarState,
-  setSidebarState,
+  setSidebarLegacyRouting,
+  setSidebarMachineState,
+  upsertSidebarActiveRouting,
 } from './sidebar-state'
+import { errorMessage } from './util/error'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
@@ -115,6 +124,12 @@ const ALLOWED_MODELS = new Set([
 // api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
 // keeping the working variants (api.id gpt-5.6-luna, etc.).
 const DISALLOWED_MODELS = new Set(['gpt-5.6'])
+// Exact models currently marked `use_responses_lite` in Codex's catalog.
+const RESPONSES_LITE_MODELS = new Set([
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 // gpt-5.6 requires Codex client >= 0.144.0 (older versions 400 with "requires a
@@ -138,6 +153,9 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+const logModels = createLogger('models')
+let loggedCostRestoration = false
+let warnedCostCatalogUnavailable = false
 
 export class AuthPersistError extends Error {
   readonly code = 'OPENAI_AUTH_PERSIST_FAILED'
@@ -173,6 +191,7 @@ interface CodexAuthPluginOptions {
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
+  responsesLite?: boolean
 }
 
 interface CodexSessionMetadata {
@@ -317,24 +336,15 @@ function updateHttpTurnMetadata(
   if (input) metadata.input = input
 }
 
-// Internal signal header: the `chat.headers` hook sees the outer variant id
-// (e.g. gpt-5.6-sol-pro) and sets this so the fetch layer — which only sees the
-// base slug — knows to inject the reasoning effort onto the wire. Stripped before
-// the request leaves the process.
-const REASONING_EFFORT_HEADER = 'x-codex-reasoning-effort'
-
 function prepareCodexRequest(input: {
   init: RequestInit | undefined
   headers: Headers
   metadata: CodexSessionMetadata | undefined
   installationID: string
   websocket: boolean
+  responsesLite: boolean
   dumpSessionID?: string
 }): PreparedCodexRequest {
-  // Capture + strip the internal effort signal up front so it never leaks to the
-  // wire, even on the early-return paths below.
-  const effortSignal = input.headers.get(REASONING_EFFORT_HEADER)
-  input.headers.delete(REASONING_EFFORT_HEADER)
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
   if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
@@ -380,29 +390,21 @@ function prepareCodexRequest(input: {
 
   const parsed = body
   if (!parsed) return { init: input.init }
+  const useResponsesLite =
+    input.responsesLite &&
+    typeof parsed.model === 'string' &&
+    RESPONSES_LITE_MODELS.has(parsed.model)
+  if (useResponsesLite && !input.websocket)
+    input.headers.set('x-openai-internal-codex-responses-lite', 'true')
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
-  // OpenCode's `-pro` moniker means max reasoning effort, but the pinned
-  // @ai-sdk/openai validates reasoningEffort against ["none".."xhigh"] and drops
-  // "max", and its `reasoning.mode:"pro"` is never emitted. The Codex OAuth
-  // backend has no reasoning-mode field; its pro tier is reasoning.effort:"max"
-  // (what codex CLI and Pi send). chat.headers flags -pro via an internal header
-  // (captured + stripped up top); inject it onto the wire here.
-  if (effortSignal) {
-    const reasoning =
-      typeof parsed.reasoning === 'object' && parsed.reasoning !== null
-        ? (parsed.reasoning as Record<string, unknown>)
-        : {}
-    delete reasoning.mode
-    reasoning.effort = effortSignal
-    parsed.reasoning = reasoning
-  }
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
   removeHostedWebSearchFunctionTool(parsed)
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
+  if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
     parsed.client_metadata !== null
@@ -414,6 +416,9 @@ function prepareCodexRequest(input: {
   if (input.websocket) {
     clientMetadata['x-codex-turn-metadata'] = turnMetadata
     clientMetadata['x-codex-ws-stream-request-start-ms'] = String(Date.now())
+    if (useResponsesLite)
+      clientMetadata.ws_request_header_x_openai_internal_codex_responses_lite =
+        'true'
   }
   parsed.client_metadata = clientMetadata
   input.headers.delete('content-length')
@@ -432,6 +437,116 @@ export function findCachekeepFallbackAccount(
       a.enabled !== false &&
       isOAuthAccount(a) &&
       (a.id === accountId || a.accountId === accountId),
+  )
+}
+
+// wham is the only source that reports reset-credit counts; header/WS pushes
+// never carry the field. An incoming push that omits it inherits the last
+// known count for the same account so the sidebar does not flicker it away
+// on every per-turn header/WS update — but an explicit incoming value
+// (including 0) always wins over a stale cached one.
+export function mergePushedQuotaMetadata(
+  incoming: OAuthQuotaSnapshot,
+  previous: OAuthQuotaSnapshot | undefined,
+): OAuthQuotaSnapshot {
+  if (
+    incoming.resetCreditsAvailable !== undefined ||
+    previous?.resetCreditsAvailable === undefined
+  ) {
+    return incoming
+  }
+  return {
+    ...incoming,
+    resetCreditsAvailable: previous.resetCreditsAvailable,
+  }
+}
+
+export function buildSidebarMachineState(
+  qm: QuotaManager,
+  store: AccountStorage,
+  now = Date.now(),
+): SidebarMachineState {
+  const mainQuota = qm.getMain()?.quota
+  return {
+    main: {
+      quota: (mainQuota as AccountQuota | undefined) ?? null,
+      killed: false,
+      ...(mainQuota?.resetCreditsAvailable !== undefined
+        ? { resetCredits: mainQuota.resetCreditsAvailable }
+        : {}),
+    },
+    fallbacks: store.accounts
+      .filter((account) => account.enabled)
+      .map((account) => {
+        const fallbackQuota = qm.getFallback(account.id)?.quota
+        return {
+          id: account.id,
+          label: (account as { label?: string }).label,
+          quota: (fallbackQuota as AccountQuota | undefined) ?? null,
+          killed: false,
+          enabled: true,
+          ...(fallbackQuota?.resetCreditsAvailable !== undefined
+            ? { resetCredits: fallbackQuota.resetCreditsAvailable }
+            : {}),
+        }
+      }),
+    route: store.routing?.mode ?? 'main-first',
+    lastUpdated: now,
+  }
+}
+
+export function buildSidebarState(
+  qm: QuotaManager,
+  store: AccountStorage,
+  activeId: string,
+  now = Date.now(),
+): SidebarState {
+  return { ...buildSidebarMachineState(qm, store, now), activeId }
+}
+
+function effectiveRequestHeaders(
+  requestInput: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Headers {
+  if (init?.headers !== undefined) return new Headers(init.headers)
+  if (requestInput instanceof Request) return new Headers(requestInput.headers)
+  return new Headers()
+}
+
+async function materializeRequestInit(
+  requestInput: RequestInfo | URL,
+  init: RequestInit | undefined,
+): Promise<RequestInit | undefined> {
+  if (!(requestInput instanceof Request)) return init
+  const request = new Request(requestInput, init)
+  const method = request.method.toUpperCase()
+  const body =
+    method === 'GET' || method === 'HEAD' || request.body === null
+      ? undefined
+      : await request.text()
+  return {
+    method: request.method,
+    headers: new Headers(request.headers),
+    body,
+    signal: request.signal,
+    cache: request.cache,
+    credentials: request.credentials,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    mode: request.mode,
+    redirect: request.redirect,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+  }
+}
+
+export function resolveSidebarSessionId(headers: Headers): string | undefined {
+  return (
+    headers.get('x-session-affinity') ??
+    headers.get('x-opencode-session') ??
+    headers.get('x-session-id') ??
+    headers.get('session-id') ??
+    undefined
   )
 }
 
@@ -459,6 +574,50 @@ function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
       search_content_types: ['text', 'image'],
     },
   ]
+}
+
+function stripResponsesLiteImageDetails(value: unknown) {
+  if (Array.isArray(value)) {
+    for (const item of value) stripResponsesLiteImageDetails(item)
+    return
+  }
+  if (!isRecord(value)) return
+  if (value.type === 'input_image') delete value.detail
+  for (const nested of Object.values(value))
+    stripResponsesLiteImageDetails(nested)
+}
+
+// Responses Lite trades capabilities for Codex's compact request shape. It is
+// opt-in because it disables parallel tool calls and excludes hosted tools.
+function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
+  const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
+  reasoning.context = 'all_turns'
+  parsed.reasoning = reasoning
+  parsed.parallel_tool_calls = false
+
+  const input = Array.isArray(parsed.input) ? parsed.input : []
+  stripResponsesLiteImageDetails(input)
+  const tools = Array.isArray(parsed.tools)
+    ? parsed.tools.filter(
+        (tool) => !(isRecord(tool) && tool.type === 'web_search'),
+      )
+    : []
+  const prefix: unknown[] = [
+    { type: 'additional_tools', role: 'developer', tools },
+  ]
+  if (
+    typeof parsed.instructions === 'string' &&
+    parsed.instructions.length > 0
+  ) {
+    prefix.push({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: parsed.instructions }],
+    })
+  }
+  parsed.input = [...prefix, ...input]
+  delete parsed.tools
+  delete parsed.instructions
 }
 
 function removeHostedWebSearchFunctionTool(parsed: Record<string, unknown>) {
@@ -531,6 +690,7 @@ export async function CodexAuthPlugin(
   // the command is rejected with a message.
   let cmdCtx: CommandContext | null = null
   let activeRpcServer: RpcServerHandle | null = null
+  let sidebarStateFileForEvents: string | undefined
 
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
@@ -539,7 +699,7 @@ export async function CodexAuthPlugin(
     if (typeof session?.promptAsync === 'function') {
       // OpenCode records this hidden noReply message as a user message. Without
       // the previous model/variant, its next real prompt inherits the synthetic
-      // default and silently switches the model (e.g. drops -pro). Thread the
+      // default and can silently drop a selected reasoning variant. Thread the
       // last assistant's model/agent/variant so the user's selection is kept.
       const promptContext = await resolvePromptContext(input.client, sessionId)
       const body: Record<string, unknown> = {
@@ -578,6 +738,14 @@ export async function CodexAuthPlugin(
         cmdCtx?.cacheKeepManager?.remove(meta.threadID)
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
+      if (sidebarStateFileForEvents) {
+        const accounts = (await loadAccounts(getConfigPath()))?.accounts ?? []
+        await removeSidebarActiveRouting(
+          info.id,
+          accounts,
+          sidebarStateFileForEvents,
+        )
+      }
       for (const websocketFetch of websocketFetches)
         websocketFetch.remove(info.id)
     },
@@ -588,10 +756,22 @@ export async function CodexAuthPlugin(
 
         const storage = await loadAccounts(getConfigPath())
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
+        const catalog = zeroCosts ? null : await loadModelsDevCosts()
+        if (!zeroCosts && catalog && !loggedCostRestoration) {
+          loggedCostRestoration = true
+          logModels.debug('restoring OAuth model costs from models.dev catalog')
+        }
+        if (!zeroCosts && !catalog && !warnedCostCatalogUnavailable) {
+          warnedCostCatalogUnavailable = true
+          logModels.warn(
+            'models.dev catalog unavailable; OAuth model costs could not be restored',
+          )
+        }
 
         return Object.fromEntries(
           Object.entries(provider.models)
             .filter(([, model]) => {
+              if (model.options.reasoningMode === 'pro') return false
               if (ALLOWED_MODELS.has(model.api.id)) return true
               if (DISALLOWED_MODELS.has(model.api.id)) return false
               const match = model.api.id.match(/^gpt-(\d+\.\d+)/)
@@ -604,7 +784,9 @@ export async function CodexAuthPlugin(
                 ...model,
                 cost: zeroCosts
                   ? { input: 0, output: 0, cache: { read: 0, write: 0 } }
-                  : model.cost,
+                  : (catalog?.[model.api.id] ??
+                    catalog?.[modelID] ??
+                    model.cost),
                 limit: model.id.includes('gpt-5.5')
                   ? {
                       context: 400_000,
@@ -1025,8 +1207,9 @@ export async function CodexAuthPlugin(
           // ChatGPT account identity for the MAIN account, so the killswitch's
           // policy read survives a token refresh but still drops on a switch.
           mainAccountIdentity?: string,
+          completeSnapshot = false,
         ) {
-          if (Object.keys(snapshot).length === 0) return
+          if (Object.keys(snapshot).length === 0 && !completeSnapshot) return
           const now = Date.now()
           const quota = snapshot as OAuthQuotaSnapshot
           let entry: Parameters<typeof quotaManager.setMain>[1] = {
@@ -1035,26 +1218,22 @@ export async function CodexAuthPlugin(
             checkedAt: now,
           }
           if (accountId && accountId !== 'main') {
-            const previous = quotaManager.getFallback(accountId, accessToken)
-            if (previous && previous.refreshAfter > now) {
-              const mergedQuota: OAuthQuotaSnapshot = { ...quota }
-              if (
-                !mergedQuota.primary &&
-                previous.quota.primary &&
-                !quotaWindowResetIsPast(previous.quota.primary, now)
-              ) {
-                mergedQuota.primary = previous.quota.primary
-              }
-              if (
-                !mergedQuota.secondary &&
-                previous.quota.secondary &&
-                !quotaWindowResetIsPast(previous.quota.secondary, now)
-              ) {
-                mergedQuota.secondary = previous.quota.secondary
-              }
-              entry = { ...entry, quota: mergedQuota }
-            }
-            quotaManager.setFallback(accountId, entry, accessToken)
+            // Quota-bearing transports report every live window rather than a
+            // partial subset, so an absent slot means the wire dropped it.
+            // Only the wham-only reset-credit metadata carries forward.
+            const previousForMetadata =
+              quotaManager.peekFallbackForPolicy(accountId)?.quota
+            const mergedQuota = mergePushedQuotaMetadata(
+              quota,
+              previousForMetadata,
+            )
+            entry = { ...entry, quota: mergedQuota }
+            quotaManager.setFallback(
+              accountId,
+              entry,
+              accessToken,
+              completeSnapshot,
+            )
           } else {
             let resolvedMainIdentity = mainAccountIdentity
             if (!resolvedMainIdentity && accessToken) {
@@ -1075,24 +1254,35 @@ export async function CodexAuthPlugin(
               })
               return
             }
-            quotaManager.setMain(accessToken, entry, resolvedMainIdentity)
+            const previousForMetadata =
+              quotaManager.peekMainForPolicy(resolvedMainIdentity)?.quota
+            const mergedQuota = mergePushedQuotaMetadata(
+              quota,
+              previousForMetadata,
+            )
+            entry = { ...entry, quota: mergedQuota }
+            quotaManager.setMain(
+              accessToken,
+              entry,
+              resolvedMainIdentity,
+              completeSnapshot,
+            )
           }
           logQ.debug('quota pushed', {
             pid: process.pid,
             accountId: accountId ?? 'main',
-            snapshot,
+            snapshot: entry.quota,
           })
           const latestStorage = await loadRequestAccounts()
-          await writeSidebarState(quotaManager, latestStorage)
+          await writeMachineSidebarState(quotaManager, latestStorage)
         }
 
-        // Resolve when a mid-stream-exhausted account's window actually resets,
-        // from its own last-known cached quota. The resolution logic itself
-        // lives in quota-manager.ts (single source of truth, unit-tested
-        // there) — this wrapper only supplies the account's cached snapshot.
+        // The pure resolver prefers an admission error's explicit reset and
+        // otherwise uses this account's cached named-window quota.
         function midStreamRateLimitResetAt(
           accountKey: string,
           window: string,
+          explicitResetAt?: number,
         ): number {
           const quota =
             accountKey === 'main'
@@ -1103,6 +1293,7 @@ export async function CodexAuthPlugin(
             window,
             Date.now(),
             DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS,
+            explicitResetAt,
           )
         }
 
@@ -1120,15 +1311,13 @@ export async function CodexAuthPlugin(
                   accessToken,
                   accountId,
                   isMainBucket ? servedChatgptAccountId : undefined,
+                  true,
                 )
               },
-              // Mid-stream quota exhaustion (response.failed carrying
-              // rate_limit_reached_type) — the frame itself is the authority,
-              // so this marks the account rate-limited without any quota-API
-              // call. The fetch override then reroutes away from it: a
-              // rate-limited main is treated like a killswitch block, and a
-              // rate-limited fallback is dropped from candidate selection.
-              onRateLimitReached: (window, accountId) => {
+              // WS quota exhaustion is authoritative without a quota-API call.
+              // Admission errors supply their own reset; response.failed uses
+              // the cached named-window reset or the bounded default.
+              onRateLimitReached: (window, accountId, explicitResetAt) => {
                 if (!accountId) {
                   // The loader always sets the internal quota-account header,
                   // so this should never fire today — but a future call site
@@ -1140,7 +1329,11 @@ export async function CodexAuthPlugin(
                   )
                 }
                 const accountKey = accountId ?? 'main'
-                const resetAt = midStreamRateLimitResetAt(accountKey, window)
+                const resetAt = midStreamRateLimitResetAt(
+                  accountKey,
+                  window,
+                  explicitResetAt,
+                )
                 quotaManager.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
@@ -1156,8 +1349,8 @@ export async function CodexAuthPlugin(
         }
 
         // -------------------------------------------------------------------
-        // writeSidebarState — snapshot the QuotaManager's view into the
-        // sidebar-state.json file for the TUI to read. Best-effort.
+        // Machine snapshots refresh shared quota and routing configuration;
+        // request writers record only the account that served that request.
         //
         // The sidebar path is resolved ONCE here (at loader-run time) and
         // captured in boundSidebarFile. All writes from this loader instance
@@ -1167,40 +1360,43 @@ export async function CodexAuthPlugin(
         // during tests where afterEach restores the env floor).
         // -------------------------------------------------------------------
         const boundSidebarFile = getSidebarStateFile()
-        // Display-only: the account that actually served the most recent request
-        // (main or a fallback id). Routing has no persisted pin, so this is how
-        // the sidebar shows the true active account. Defaults to main.
-        let lastServedActiveId = 'main'
-        async function writeSidebarState(
+        sidebarStateFileForEvents = boundSidebarFile
+
+        async function writeMachineSidebarState(
           qm: QuotaManager,
           store: Awaited<ReturnType<typeof loadAccounts>>,
         ) {
           if (!store) return
-          const mainQuota = qm.getMain()?.quota
-          const sidebar: SidebarState = {
-            main: {
-              quota: mainQuota ?? null,
-              killed: false,
-            },
-            fallbacks: store.accounts
-              .filter((a) => a.enabled)
-              .map((a) => {
-                const fbQuota = qm.getFallback(a.id)?.quota ?? null
-                return {
-                  id: a.id,
-                  label: (a as { label?: string }).label,
-                  quota: fbQuota,
-                  killed: false,
-                  enabled: true,
-                }
-              }),
-            activeId: lastServedActiveId,
-            route: store.routing?.mode ?? 'main-first',
-            lastUpdated: Date.now(),
+          await setSidebarMachineState(
+            buildSidebarMachineState(qm, store),
+            boundSidebarFile,
+          )
+        }
+
+        async function writeRequestSidebarRouting(
+          sessionId: string | undefined,
+          parentSessionId: string | undefined,
+          activeId: string,
+          route: RoutingMode,
+          accounts: readonly { id: string; enabled?: boolean }[],
+        ) {
+          const input = { activeId, route, updatedAt: Date.now() }
+          if (sessionId) {
+            await upsertSidebarActiveRouting(
+              { sessionId, ...input },
+              accounts,
+              boundSidebarFile,
+            )
+            if (parentSessionId && parentSessionId !== sessionId) {
+              await upsertSidebarActiveRouting(
+                { sessionId: parentSessionId, ...input },
+                accounts,
+                boundSidebarFile,
+              )
+            }
+            return
           }
-          // Pass the bound path so this instance's writes always go to the
-          // file that was configured when the loader ran.
-          await setSidebarState(sidebar, boundSidebarFile)
+          await setSidebarLegacyRouting(input, boundSidebarFile)
         }
 
         // -------------------------------------------------------------------
@@ -1224,7 +1420,7 @@ export async function CodexAuthPlugin(
           },
           refreshSidebar: async () => {
             const store = await loadAccounts(getConfigPath())
-            await writeSidebarState(quotaManager, store)
+            await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
             refreshAllQuota({
@@ -1233,7 +1429,7 @@ export async function CodexAuthPlugin(
               fallbackManager,
               quotaManager,
               loadAccounts,
-              writeSidebarState,
+              writeSidebarState: writeMachineSidebarState,
               client: input.client as CommandContext['client'],
               fetchImpl: fetch,
               now: Date.now,
@@ -1286,34 +1482,7 @@ export async function CodexAuthPlugin(
           accountId?: string,
           keepwarmAccountKey: string = 'main',
         ): Promise<Response> {
-          const headers = new Headers()
-          if (init?.headers) {
-            if (init.headers instanceof Headers) {
-              init.headers.forEach((value, key) => {
-                headers.set(key, value)
-              })
-              init.headers.delete('x-api-key')
-              init.headers.delete('api-key')
-            } else if (Array.isArray(init.headers)) {
-              for (const [key, value] of init.headers) {
-                if (value !== undefined) headers.set(key, String(value))
-              }
-              init.headers = init.headers.filter(([key]) => {
-                const lower = String(key).toLowerCase()
-                return lower !== 'x-api-key' && lower !== 'api-key'
-              })
-            } else {
-              for (const [key, value] of Object.entries(init.headers)) {
-                if (value !== undefined) headers.set(key, String(value))
-              }
-              for (const key of Object.keys(init.headers)) {
-                const lower = key.toLowerCase()
-                if (lower === 'x-api-key' || lower === 'api-key') {
-                  delete init.headers[key]
-                }
-              }
-            }
-          }
+          const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
           headers.delete('api-key')
           headers.set('authorization', `Bearer ${accessToken}`)
@@ -1329,11 +1498,7 @@ export async function CodexAuthPlugin(
             keepwarmAccountKey,
           )
 
-          const sessionID =
-            headers.get('x-session-affinity') ??
-            headers.get('x-session-id') ??
-            headers.get('session-id') ??
-            undefined
+          const sessionID = resolveSidebarSessionId(headers)
 
           const codexMetadata = sessionID
             ? getCodexSessionMetadata(
@@ -1368,6 +1533,7 @@ export async function CodexAuthPlugin(
             websocket: Boolean(
               websocketFetch && parsed.pathname.endsWith('/responses'),
             ),
+            responsesLite: options.responsesLite ?? false,
             dumpSessionID: sessionID,
           })
           const requestInit = prepared.init
@@ -1522,11 +1688,15 @@ export async function CodexAuthPlugin(
               (a): a is OAuthAccount =>
                 a.enabled !== false && isOAuthAccount(a),
             )
-            .map((a) => ({ quota: quotaManager.getFallback(a.id)?.quota }))
+            .map((a) => ({
+              accountId: a.id,
+              quota: quotaManager.getFallback(a.id)?.quota,
+            }))
           let retryAfter = killswitchRetryAfterSeconds(
             mainQuota,
             fallbackAccounts,
             now,
+            storage,
           )
           if (
             reason === 'mid-stream-rate-limit' &&
@@ -1620,13 +1790,13 @@ export async function CodexAuthPlugin(
         ) {
           try {
             const snapshot = normalizeQuotaHeaders(response.headers)
-            if (Object.keys(snapshot).length > 0) {
-              await pushQuota(
-                snapshot,
-                candidate.access,
-                candidate.quotaAccountId,
-              )
-            }
+            await pushQuota(
+              snapshot as Record<string, unknown>,
+              candidate.access,
+              candidate.quotaAccountId,
+              undefined,
+              isCompleteQuotaHeaderFrame(response.headers),
+            )
           } catch {
             // Quota headers from a failed candidate are advisory; routing must continue.
           }
@@ -1781,7 +1951,7 @@ export async function CodexAuthPlugin(
           bootQuotaSeedStarted = true
 
           // Seed fallback quota from persisted account.quota so the immediate
-          // writeSidebarState shows last-known fallback numbers, not null.
+          // The immediate machine snapshot shows last-known fallback numbers.
           if (storage) {
             const oauthAccts: OAuthAccount[] = []
             for (const a of storage.accounts) {
@@ -1791,7 +1961,7 @@ export async function CodexAuthPlugin(
           }
 
           // Immediate: show persisted quota so the sidebar isn't blank
-          void writeSidebarState(quotaManager, storage).catch(() => {})
+          void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
           // Background: refresh from the API, then the sidebar shows fresh numbers
           void refreshAllQuota({
@@ -1800,7 +1970,7 @@ export async function CodexAuthPlugin(
             fallbackManager,
             quotaManager,
             loadAccounts,
-            writeSidebarState,
+            writeSidebarState: writeMachineSidebarState,
             client: input.client as Parameters<
               typeof refreshAllQuota
             >[0]['client'],
@@ -1811,7 +1981,12 @@ export async function CodexAuthPlugin(
             isOAuthAccountFn: isOAuthAccount,
             whamFn: whamUsageFn,
             respectBackoff: true,
-          }).catch(() => {})
+          }).catch((error) =>
+            logQ.warn('boot quota seed failed', {
+              pid: process.pid,
+              error: errorMessage(error),
+            }),
+          )
         }
 
         // -------------------------------------------------------------------
@@ -1843,6 +2018,10 @@ export async function CodexAuthPlugin(
               return fetch(requestInput, init)
             }
 
+            const requestHeaders = effectiveRequestHeaders(requestInput, init)
+            const sidebarSessionId = resolveSidebarSessionId(requestHeaders)
+            const sidebarParentSessionId =
+              requestHeaders.get('x-parent-session-id')?.trim() || undefined
             // Routing is purely mode-driven. The primary is ALWAYS the main
             // account; fallback-first is handled by a proactive gate below that
             // tries usable fallbacks before main. There is no per-account pin.
@@ -1857,35 +2036,8 @@ export async function CodexAuthPlugin(
             } = await getAuth()
             const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+            init = await materializeRequestInit(requestInput, init)
             let primaryAccess: string = currentAuth.access ?? ''
-
-            // Strip any existing auth headers — we set them
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.delete('authorization')
-                init.headers.delete('Authorization')
-                init.headers.delete('x-api-key')
-                init.headers.delete('api-key')
-              } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(([key]) => {
-                  const lower = String(key).toLowerCase()
-                  return (
-                    lower !== 'authorization' &&
-                    lower !== 'x-api-key' &&
-                    lower !== 'api-key'
-                  )
-                })
-              } else {
-                delete init.headers.authorization
-                delete init.headers.Authorization
-                for (const key of Object.keys(init.headers)) {
-                  const lower = key.toLowerCase()
-                  if (lower === 'x-api-key' || lower === 'api-key') {
-                    delete init.headers[key]
-                  }
-                }
-              }
-            }
 
             // Refresh expired main tokens and mirror them into opencode's slot.
             if (
@@ -2052,30 +2204,36 @@ export async function CodexAuthPlugin(
               }
             }
 
-            // Record which account served so the sidebar shows the true active
-            // account (display only — not a persisted pin).
-            lastServedActiveId = servedActiveId
-
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
                 await pushQuota(
-                  snapshot,
+                  snapshot as Record<string, unknown>,
                   fallbackQuotaAccess,
                   fallbackQuotaAccountId,
+                  undefined,
+                  isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               } else {
                 await pushQuota(
-                  snapshot,
+                  snapshot as Record<string, unknown>,
                   primaryAccess,
                   undefined,
                   mainAccountIdentity,
+                  isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               }
             } catch {
               // Quota push is best-effort — never break the response
             }
 
+            await writeRequestSidebarRouting(
+              sidebarSessionId,
+              sidebarParentSessionId,
+              servedActiveId,
+              mode,
+              reqStorage?.accounts ?? [],
+            ).catch(() => {})
             return finalResponse
           },
           async dispose() {
@@ -2180,12 +2338,6 @@ export async function CodexAuthPlugin(
       // context can be passed directly instead of smuggled through headers.
       if (websocketFetchInstalled && input.agent === 'title')
         output.headers[OpenAIWebSocketPool.TITLE_HEADER] = 'true'
-      // OpenCode's `-pro` moniker (e.g. gpt-5.6-sol-pro) is a separate model id
-      // whose outer id is only visible here, not at the fetch layer (which sees
-      // the base slug). Flag it so prepareCodexRequest injects reasoning.effort
-      // "max" onto the wire — the Codex OAuth pro tier.
-      if (input.model.id.endsWith('-pro'))
-        output.headers[REASONING_EFFORT_HEADER] = 'max'
     },
     'chat.params': async (input, output) => {
       if (input.model.providerID !== 'openai') return
@@ -2279,6 +2431,7 @@ export const OpenAIAuthPlugin: Plugin = async (input) => {
   return CodexAuthPlugin(input, {
     codexApiEndpoint: settings.codexApiEndpoint,
     experimentalWebSockets: settings.webSockets,
+    responsesLite: settings.responsesLite,
   })
 }
 

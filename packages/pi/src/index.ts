@@ -4,16 +4,11 @@ import type {
   AssistantMessageEventStream,
   Context,
   Model,
-  OAuthCredentials,
-  OAuthLoginCallbacks,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/api/openai-codex-responses'
-import {
-  loginOpenAICodex,
-  refreshOpenAICodexToken,
-} from '@earendil-works/pi-ai/oauth'
+
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { RawWebSocket } from './raw-ws-node.ts'
@@ -116,24 +111,6 @@ const OPENAI_CODEX_MODELS: CodexModel[] = [
   },
 ]
 
-async function loginOpenAI(
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
-  return loginOpenAICodex({
-    onAuth: callbacks.onAuth,
-    onPrompt: callbacks.onPrompt,
-    onProgress: callbacks.onProgress,
-    onManualCodeInput: callbacks.onManualCodeInput,
-    originator: 'pi',
-  })
-}
-
-async function refreshOpenAI(
-  credentials: OAuthCredentials,
-): Promise<OAuthCredentials> {
-  return refreshOpenAICodexToken(credentials.refresh)
-}
-
 function streamOpenAI(
   model: Model<Api>,
   context: Context,
@@ -203,12 +180,6 @@ export default function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     baseUrl: BASE_URL,
     api: 'openai-codex-responses',
     models: OPENAI_CODEX_MODELS,
-    oauth: {
-      name: 'ChatGPT Plus/Pro (CortexKit)',
-      login: loginOpenAI,
-      refreshToken: refreshOpenAI,
-      getApiKey: (credentials: OAuthCredentials) => credentials.access,
-    },
     streamSimple: streamOpenAI,
   })
 }

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
@@ -17,6 +18,7 @@ const INTERNAL_HEADERS = new Set([
   TITLE_HEADER,
   DUMP_SESSION_HEADER,
   QUOTA_ACCOUNT_HEADER,
+  'x-opencode-session',
 ])
 
 export interface CreateWebSocketFetchOptions {
@@ -44,17 +46,12 @@ export interface CreateWebSocketFetchOptions {
     accountId: string | undefined,
     servedChatgptAccountId: string | undefined,
   ) => void
-  /**
-   * Fires when a response.failed frame carries a rate_limit_reached_type —
-   * mid-stream quota exhaustion the reactive HTTP-status fallback cannot see
-   * on the WebSocket transport (ws.ts synthesizes status:200 at upgrade,
-   * before generation runs).
-   *
-   * Receives the window label plus the per-request internal quota account key
-   * captured at send time, same as onQuota, so the signal is attributed to
-   * the connection's own account rather than a shared mutable global.
-   */
-  onRateLimitReached?: (window: string, accountId: string | undefined) => void
+  /** Receives quota exhaustion plus the account identity captured at send time. */
+  onRateLimitReached?: (
+    window: string,
+    accountId: string | undefined,
+    resetAt?: number,
+  ) => void
 }
 
 interface PoolEntry {
@@ -196,6 +193,14 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     )
     const acctDisc = accountDiscriminator(sourceHeadersForKey)
     const key = `${sessionID}:${acctDisc}:conversation`
+    const requestAccountId =
+      typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
+        ? internalHeaders[QUOTA_ACCOUNT_HEADER]
+        : undefined
+    const requestOnRateLimitReached = onRateLimitReached
+      ? (window: string, resetAt?: number) =>
+          onRateLimitReached(window, requestAccountId, resetAt)
+      : undefined
 
     const entry = pool.get(key) ?? {
       lastUsedAt: Date.now(),
@@ -231,10 +236,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       // (the account this request was actually sent on), NOT the wire
       // chatgpt-account-id header. The internal key was read from the raw init
       // before internal-header stripping.
-      const requestAccountId =
-        typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
-          ? internalHeaders[QUOTA_ACCOUNT_HEADER]
-          : undefined
       const requestServedChatgptAccountId =
         typeof sourceHeaders['chatgpt-account-id'] === 'string'
           ? sourceHeaders['chatgpt-account-id']
@@ -248,14 +249,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
               requestServedChatgptAccountId,
             )
         : undefined
-      // Same capture-at-send-time discipline as requestOnQuota: the
-      // response.failed frame arrives asynchronously, so it must be
-      // attributed to THIS connection's account, never a shared mutable
-      // global a concurrent request could have overwritten.
-      const requestOnRateLimitReached = onRateLimitReached
-        ? (window: string) => onRateLimitReached(window, requestAccountId)
-        : undefined
-
       const socketHeaders =
         !entry.socket && !entry.continuation
           ? prewarmHeaders(sourceHeaders)
@@ -386,6 +379,23 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         entry.continuation = undefined
         invalidate(entry)
         throw error
+      }
+
+      const admissionRateLimit = OpenAIWebSocket.parseRateLimitSignal(error)
+      if (admissionRateLimit) {
+        requestOnRateLimitReached?.(
+          admissionRateLimit.window,
+          admissionRateLimit.resetAt,
+        )
+      }
+
+      // A native (non-raw) WebSocket exposes no HTTP status/body on a failed
+      // upgrade, so an admission 429 there is invisible to parseRateLimitSignal.
+      // Fall back to HTTP — which surfaces the real status — on any upgrade
+      // failure for the standard client. The raw client classifies its own
+      // upgrade 429s above and keeps its mark-and-reroute path.
+      if (OpenAIWebSocket.isUpgradeFailure(error) && !rawWebSocket) {
+        entry.fallback = true
       }
 
       recordStreamFailure(entry)
@@ -535,7 +545,7 @@ async function prewarm(
     sessionID?: string
     url?: string
     headers?: HeadersInit
-    onRateLimitReached?: (window: string) => void
+    onRateLimitReached?: (window: string, resetAt?: number) => void
   },
 ) {
   if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
@@ -926,39 +936,10 @@ function hasInputPrefix(prefix: unknown[], input: unknown[]) {
   return true
 }
 
-function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
-  if (init?.method?.toUpperCase() !== 'POST') return init
-  const headers = new Headers(init.headers)
-  headers.set('accept', 'text/event-stream')
-  headers.set('content-type', 'application/json')
-  return {
-    ...init,
-    headers,
-    body: sanitizeHttpFallbackBody(init.body),
-  }
-}
-
-function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
-  if (typeof body !== 'string') return body
-  try {
-    const parsed = JSON.parse(body)
-    if (!isRecord(parsed) || !isRecord(parsed.client_metadata)) return body
-    if (
-      !(
-        'x-codex-turn-metadata' in parsed.client_metadata ||
-        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
-      )
-    ) {
-      return body
-    }
-    const clientMetadata = { ...parsed.client_metadata }
-    delete clientMetadata['x-codex-turn-metadata']
-    delete clientMetadata['x-codex-ws-stream-request-start-ms']
-    return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
-  } catch {
-    return body
-  }
-}
+export {
+  hasWebSocketResponsesLiteMetadata,
+  sanitizeHttpFallbackBody,
+} from './codex-http'
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   init: T | undefined,

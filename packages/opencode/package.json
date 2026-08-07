@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
-  "version": "0.3.3",
+  "version": "0.4.3",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -20,7 +20,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./src/tui.tsx"
+      "import": "./src/tui/entry.mjs"
     },
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
@@ -37,17 +37,20 @@
   "files": [
     "dist",
     "src/tui.tsx",
-    "src/tui/command-dialogs.tsx",
+    "src/tui",
+    "src/tui-compiled",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
     "src/logger.ts",
+    "src/core/refresh-file-lock.ts",
     "src/util",
     "src/rpc",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build:tui": "bun scripts/build-tui.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",
@@ -58,10 +61,10 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@opentui/core": ">=0.4.0",
-    "@opentui/solid": ">=0.4.0",
-    "ai": "^6.0.208",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "ai": "^7.0.34",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "^1.9.10"
+    "solid-js": "1.9.12"
   }
 }

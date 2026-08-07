@@ -65,7 +65,7 @@ export async function startRpcServer(
   server.requestTimeout = timeoutMs
   server.headersTimeout = timeoutMs
 
-  async function dispatch(req: IncomingMessage, res: ServerResponse) {
+  async function dispatch(req: any, res: any) {
     const json = (status: number, value: unknown) => {
       // Guard against writing to a socket that was destroyed (e.g. when
       // readBody rejected after req.destroy() on an oversized body).
