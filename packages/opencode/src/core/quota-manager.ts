@@ -53,23 +53,27 @@ export function quotaWindowResetIsPast(
 }
 
 /**
- * Resolve when a mid-stream-exhausted account's window actually resets, from
- * its own last-known cached quota snapshot (a response.failed frame carries no
- * reset time itself). The frame always names the exhausted window (primary or
- * secondary), so use only THAT window's cached reset; if it's unknown, fall
- * back to a conservative bounded default rather than borrowing the OTHER
- * window's reset — an unrelated window can reset far in the future and would
- * blackhole the account long past its actual rate-limit. The default is
- * self-correcting: if the account is still exhausted, the next response.failed
- * frame re-marks it. Pure — single source of truth shared by the fetch-override
- * reroute and its unit tests.
+ * Resolve when a WS-exhausted account becomes usable. Admission errors can
+ * carry the provider's authoritative reset; response.failed frames do not, so
+ * those fall back to the named window in the last-known quota snapshot. Never
+ * borrow the other window's reset — an unrelated window can blackhole the
+ * account long past its actual limit. The bounded default self-corrects when a
+ * later request reports exhaustion again.
  */
 export function resolveMidStreamRateLimitResetAt(
   quota: OAuthQuotaSnapshot | undefined,
   window: string,
   now: number,
   defaultMs: number,
+  explicitResetAt?: number,
 ): number {
+  if (
+    explicitResetAt !== undefined &&
+    Number.isFinite(explicitResetAt) &&
+    explicitResetAt > now
+  ) {
+    return explicitResetAt
+  }
   const named =
     window === PRIMARY
       ? quota?.primary
@@ -101,7 +105,7 @@ function getQuotaNextRefreshAt(
   const blockedResetTimes: number[] = []
   for (const key of ['primary', 'secondary'] as const) {
     const window = quota?.[key]
-    if (!window) return now + getQuotaCheckIntervalMs(storage)
+    if (!window) continue
     if (window.remainingPercent >= thresholds[key]) continue
     const resetTime = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN
     if (!Number.isFinite(resetTime) || resetTime <= now) {
@@ -287,10 +291,15 @@ export class QuotaManager {
   // persisted account.quota on boot)
   // =========================================================================
 
-  setMain(accessToken: string, entry: QuotaEntry, accountId?: string): void {
-    // Conditional-push guard: never overwrite a valid cached snapshot with
-    // an empty one (no window data).
-    if (!hasAnyQuotaWindow(entry.quota)) return
+  setMain(
+    accessToken: string,
+    entry: QuotaEntry,
+    accountId?: string,
+    completeSnapshot = false,
+  ): void {
+    // Empty snapshots replace cache only when their transport guarantees a
+    // complete frame; otherwise a non-quota response could erase good data.
+    if (!completeSnapshot && !hasAnyQuotaWindow(entry.quota)) return
     this.mainTokenFp = tokenFingerprint(accessToken)
     // A genuine account SWITCH (same identity condition as peekMainForPolicy)
     // invalidates the OLD account's mid-stream mark — otherwise the new
@@ -345,10 +354,11 @@ export class QuotaManager {
     accountId: string,
     entry: QuotaEntry,
     accessToken?: string,
+    completeSnapshot = false,
   ): void {
-    // Conditional-push guard: never overwrite a valid cached snapshot with
-    // an empty one (no window data).
-    if (!hasAnyQuotaWindow(entry.quota)) return
+    // Empty snapshots replace cache only when their transport guarantees a
+    // complete frame; otherwise a non-quota response could erase good data.
+    if (!completeSnapshot && !hasAnyQuotaWindow(entry.quota)) return
     this.fallbacks.set(accountId, entry)
     if (accessToken) {
       this.fallbackTokenFps.set(accountId, tokenFingerprint(accessToken))
@@ -783,6 +793,7 @@ export class QuotaManager {
               checkedAt: now,
             },
             accessToken,
+            true,
           )
           this.fallbackApiErrors.delete(accountId)
           this.fallbackErrorTokenFps.delete(accountId)
@@ -867,9 +878,12 @@ export class QuotaManager {
 // Conditional-push guard
 // ---------------------------------------------------------------------------
 
+// Window presence, NOT key presence — `resetCreditsAvailable` is metadata
+// riding alongside the windows, not a window itself, so a metadata-only
+// snapshot (e.g. a wham-only reset-credit update with no window data) must
+// not count as "has a quota window" and bypass the conditional-push guard.
 function hasAnyQuotaWindow(quota: OAuthQuotaSnapshot): boolean {
-  for (const _key of Object.keys(quota)) return true
-  return false
+  return Boolean(quota.primary || quota.secondary)
 }
 
 // ---------------------------------------------------------------------------
@@ -877,16 +891,19 @@ function hasAnyQuotaWindow(quota: OAuthQuotaSnapshot): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * True when a freshly pushed snapshot shows BOTH windows present and under
- * 100% used — positive full evidence the account is no longer exhausted, so
- * a stale mid-stream rate-limit mark can be cleared before its read-time
- * expiry. A mark is per-account, not per-window, so a partial snapshot (only
- * one window present — e.g. a malformed refreshAllQuota result) is not
- * evidence: the OTHER window could be the one that's actually exhausted.
- * Clears only on a snapshot where both windows are present and under 100%.
+ * True when a freshly pushed snapshot shows at least one present window and
+ * every PRESENT window is under 100% used — positive evidence the account
+ * is no longer exhausted, so a stale mid-stream rate-limit mark can be
+ * cleared before its read-time expiry. An absent window is not applicable
+ * (not uncertainty), so it does not block the clear — the wire may only
+ * ever report a single live window (e.g. one 7-day primary). A present
+ * window still at 100% is real evidence the account remains exhausted, so
+ * it blocks the clear even alongside a healthy sibling.
  */
 function quotaLooksHealthy(quota: OAuthQuotaSnapshot): boolean {
   const { primary, secondary } = quota
-  if (!primary || !secondary) return false
-  return primary.usedPercent < 100 && secondary.usedPercent < 100
+  if (!primary && !secondary) return false
+  if (primary && primary.usedPercent >= 100) return false
+  if (secondary && secondary.usedPercent >= 100) return false
+  return true
 }

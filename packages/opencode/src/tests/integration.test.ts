@@ -1,5 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,16 +19,21 @@ import {
   findCachekeepFallbackAccount,
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
+  resolveSidebarSessionId,
 } from '../index.ts'
+import { resetModelCostsForTest } from '../model-costs.ts'
 import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
+  normalizeSidebarState,
+  resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
+  FLOOR_MODELS_CACHE,
   FLOOR_SIDEBAR_STATE_FILE,
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
@@ -82,6 +93,7 @@ type FakeWebSocketContext = {
   close(code?: number, reason?: string): void
   /** The `authorization` connect header for this socket, if present. */
   authorization: string
+  upgradeHeaders: Record<string, string>
 }
 
 type FakeWebSocketBehavior = {
@@ -130,6 +142,7 @@ async function withFakeWebSocket(
           this.emit('close', { code, reason })
         },
         authorization: options?.headers?.authorization ?? '',
+        upgradeHeaders: options?.headers ?? {},
       })
       if (this.behavior.autoOpen !== false) {
         queueMicrotask(() => {
@@ -304,6 +317,7 @@ describe('integration: HTTP quota push', () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
     process.env.NODE_ENV = 'test'
     process.env.OPENCODE_CONFIG_DIR = configDir
+    resetModelCostsForTest()
   })
 
   afterEach(async () => {
@@ -378,7 +392,7 @@ describe('integration: HTTP quota push', () => {
 
       expect(loaderResult).toBeDefined()
       const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
@@ -407,6 +421,294 @@ describe('integration: HTTP quota push', () => {
       )
       expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
       expect(sidebar.main.quota?.secondary?.usedPercent).toBe(15)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('records served routing for child and parent sessions', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const serve = async (sessionId: string, parentId?: string) => {
+        const headers = new Headers({
+          'content-type': 'application/json',
+          'session-id': sessionId,
+        })
+        if (parentId) headers.set('x-parent-session-id', parentId)
+        const response = await fetchOverride(
+          'https://api.openai.com/v1/responses',
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          },
+        )
+        expect(response.status).toBe(200)
+        await response.body?.cancel()
+      }
+
+      await serve('child-session', 'parent-session')
+      await serve('child-only-session')
+      await serve('same-session', 'same-session')
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(Object.keys(sidebar.activeRouting ?? {}).sort()).toEqual([
+        'child-only-session',
+        'child-session',
+        'parent-session',
+        'same-session',
+      ])
+      expect(sidebar.activeRouting?.['child-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeRouting?.['parent-session']).toEqual(
+        sidebar.activeRouting?.['child-session'],
+      )
+      expect(sidebar.activeRouting?.['child-only-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeRouting?.['same-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+
+      renameSync(sidebarFile, `${sidebarFile}.saved`)
+      mkdirSync(sidebarFile)
+      await serve('unwritable-child', 'unwritable-parent')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a complete header frame reporting every window retired clears cached windows', async () => {
+    const store = {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts: [],
+    }
+    writeFileSync(configFile, JSON.stringify(store))
+
+    // First response carries a real primary window — seeds the cache.
+    let respondWithRealWindow = true
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const headers = new Headers(
+        respondWithRealWindow
+          ? {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '42',
+              'x-codex-primary-window-minutes': '10080',
+              'x-codex-primary-reset-at': '1781729038',
+            }
+          : {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '0',
+              'x-codex-primary-window-minutes': '0',
+              'x-codex-secondary-used-percent': '0',
+              'x-codex-secondary-window-minutes': '0',
+            },
+      )
+      return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
+        status: 200,
+        headers,
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput()
+      hooks = await CodexAuthPlugin(input, { experimentalWebSockets: false })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const request = (): RequestInit => ({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+
+      const seed = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await seed.body?.cancel()
+      await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary?.usedPercent === 42,
+      )
+
+      respondWithRealWindow = false
+      const retired = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await retired.body?.cancel()
+
+      const sidebar = await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary === undefined,
+      )
+      expect(sidebar.main.quota?.primary).toBeUndefined()
+      expect(sidebar.main.quota?.secondary).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a truly empty header set (no x-codex-* headers) does NOT clobber cached windows', async () => {
+    const store = {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts: [],
+    }
+    writeFileSync(configFile, JSON.stringify(store))
+
+    let respondWithRealWindow = true
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const headers = new Headers(
+        respondWithRealWindow
+          ? {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '42',
+              'x-codex-primary-window-minutes': '10080',
+              'x-codex-primary-reset-at': '1781729038',
+            }
+          : { 'content-type': 'text/event-stream' },
+      )
+      return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
+        status: 200,
+        headers,
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput()
+      hooks = await CodexAuthPlugin(input, { experimentalWebSockets: false })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const request = (): RequestInit => ({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+
+      const seed = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await seed.body?.cancel()
+      await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary?.usedPercent === 42,
+      )
+
+      respondWithRealWindow = false
+      const nonQuota = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await nonQuota.body?.cancel()
+
+      // Give any (incorrect) clearing write a chance to land before asserting
+      // the cache survived.
+      await drainSidebarWrites()
+      const sidebar = JSON.parse(
+        readFileSync(sidebarFile, 'utf8'),
+      ) as SidebarState
+      expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -1288,6 +1590,123 @@ describe('integration: killswitch enforcement', () => {
     )
   })
 
+  it('reroutes to a healthy fallback after main rejects WebSocket admission with usage_limit_reached', async () => {
+    const fallback: OAuthAccount = {
+      id: 'fb-admission-healthy',
+      type: 'oauth',
+      access: 'sk-fb-admission-access',
+      refresh: 'sk-fb-admission-refresh',
+      expires: Date.now() + 24 * 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let mainSends = 0
+    let fallbackSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          if (authorization === 'Bearer access-main-admission-rl') {
+            mainSends++
+            message(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'usage_limit_reached',
+                  message: 'The usage limit has been reached',
+                  plan_type: 'team',
+                  resets_at: 1_784_958_366,
+                  eligible_promo: null,
+                  resets_in_seconds: 514_504,
+                },
+              }),
+            )
+            return
+          }
+          fallbackSends++
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_fb_admission_${fallbackSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-admission-rl',
+              refresh: refreshToken,
+              expires: Date.now() + 24 * 3600_000,
+              accountId: 'chatgpt-main-admission-rl',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-admission-rate-limit-reroute-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await expect(first.text()).rejects.toMatchObject({
+            isRetryable: true,
+          })
+
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(200)
+          await second.text()
+
+          expect(mainSends).toBe(1)
+          expect(fallbackSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
   it('excludes a rate-limited fallback from candidate selection after a mid-stream mark', async () => {
     // fallback-first: the single fallback is tried before main. Its own
     // mid-stream rate_limit_reached_type mark must make usableFallbackCandidates
@@ -1686,6 +2105,184 @@ describe('integration: WS quota push', () => {
     delete process.env.NODE_ENV
   })
 
+  it('attributes an early fallback WS quota push to the served fallback', async () => {
+    const now = Date.now()
+    const fallback = {
+      id: 'fallback-1',
+      type: 'oauth' as const,
+      label: 'Fallback 1',
+      enabled: true,
+      access: 'fallback-access',
+      refresh: 'fallback-refresh',
+      expires: now + 24 * 3600_000,
+      accountId: 'chatgpt-fallback-1',
+    }
+    const quota = (usedPercent: number, resetCreditsAvailable: number) => ({
+      primary: {
+        usedPercent,
+        remainingPercent: 100 - usedPercent,
+        checkedAt: now,
+        windowMinutes: 300,
+      },
+      resetCreditsAvailable,
+    })
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [{ ...fallback, quota: quota(30, 2) }],
+        routing: { mode: 'fallback-first' },
+        quota: {
+          mainQuota: quota(20, 4),
+          mainQuotaCheckedAt: now,
+        },
+      }),
+    )
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: { quota: quota(20, 4), killed: false },
+        fallbacks: [
+          {
+            id: fallback.id,
+            label: fallback.label,
+            quota: quota(30, 2),
+            killed: false,
+            enabled: true,
+            resetCredits: 2,
+          },
+        ],
+        activeId: 'main',
+        route: 'fallback-first',
+        lastUpdated: 1,
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    let hooks: Hooks | undefined
+    let releaseFirstEvent: (() => void) | undefined
+    let quotaFrameSent: (() => void) | undefined
+    const quotaFrameSentPromise = new Promise<void>((resolve) => {
+      quotaFrameSent = resolve
+    })
+
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          expect(authorization).toBe('Bearer fallback-access')
+          message(
+            JSON.stringify({
+              type: 'codex.rate_limits',
+              rate_limits: {
+                primary: { used_percent: 35, window_minutes: 300 },
+              },
+            }),
+          )
+          releaseFirstEvent = () => {
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'resp_fallback_1' },
+              }),
+            )
+          }
+          quotaFrameSent?.()
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: now + 3600_000,
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const responsePromise = fetchOverride(
+            'https://api.openai.com/v1/responses',
+            {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'session-id': 'early-fallback-quota',
+              },
+              body: JSON.stringify({
+                model: 'gpt-5.5',
+                input: [],
+                stream: true,
+              }),
+            },
+          )
+
+          await quotaFrameSentPromise
+          const sidebarWaitMs = 2000
+          const sidebarDeadline = Date.now() + sidebarWaitMs
+          let sidebarWriteLanded = false
+          while (Date.now() < sidebarDeadline) {
+            const earlySidebar = JSON.parse(
+              await readFile(sidebarFile, 'utf8'),
+            ) as SidebarState
+            if (
+              earlySidebar.fallbacks.find(
+                (account) => account.id === fallback.id,
+              )?.quota?.primary?.usedPercent === 35
+            ) {
+              sidebarWriteLanded = true
+              break
+            }
+            await Promise.resolve()
+          }
+          if (!sidebarWriteLanded) {
+            throw new Error(
+              `early fallback WS sidebar write did not land within ${sidebarWaitMs}ms`,
+            )
+          }
+          expect(releaseFirstEvent).toBeDefined()
+          releaseFirstEvent?.()
+
+          const response = await responsePromise
+          expect(response.status).toBe(200)
+          await response.body?.cancel()
+          await drainSidebarWrites()
+
+          const sidebar = JSON.parse(
+            await readFile(sidebarFile, 'utf8'),
+          ) as SidebarState
+          expect(sidebar.activeId).toBe('fallback-1')
+          expect(
+            sidebar.activeRouting?.['early-fallback-quota']?.activeId,
+          ).toBe('fallback-1')
+          expect(
+            sidebar.fallbacks.find((account) => account.id === fallback.id)
+              ?.resetCredits,
+          ).toBe(2)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
   it('onQuota fires for codex.rate_limits frame and the frame is NOT relayed as SSE output', async () => {
     const { streamResponsesWebSocket } = await import('../ws.ts')
 
@@ -1901,7 +2498,7 @@ describe('integration: 429 → reactive fallback', () => {
       )
 
       const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
@@ -1972,9 +2569,11 @@ describe('integration: active fallback routing', () => {
     input: PluginInput,
     mainExpires: number,
     experimentalWebSockets = false,
+    responsesLite = false,
   ) {
     const hooks = await CodexAuthPlugin(input, {
       experimentalWebSockets,
+      responsesLite,
     })
     const authHook = hooks.auth
     if (!authHook?.loader) throw new Error('No auth loader')
@@ -1994,7 +2593,7 @@ describe('integration: active fallback routing', () => {
     )
 
     const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-      | ((url: string, init?: RequestInit) => Promise<Response>)
+      | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
       | undefined
     if (!fetchOverride) throw new Error('No fetch in loader result')
     return { hooks, fetchOverride }
@@ -2046,6 +2645,107 @@ describe('integration: active fallback routing', () => {
     }
   }
 
+  function responsesLiteRequestInit(
+    model: string,
+    sessionID: string,
+    options: { stream?: boolean; hostedTool?: boolean } = {},
+  ): RequestInit {
+    return {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'session-id': sessionID },
+      body: JSON.stringify({
+        model,
+        instructions: 'Be concise',
+        input: [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'hi' },
+              {
+                type: 'input_image',
+                image_url: 'data:image/png;base64,AA==',
+                detail: 'high',
+              },
+            ],
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: [
+              {
+                type: 'input_image',
+                image_url: 'https://example.test/function.png',
+                detail: 'low',
+              },
+            ],
+          },
+          {
+            type: 'custom_tool_call_output',
+            call_id: 'call_2',
+            output: [
+              {
+                type: 'input_image',
+                image_url: 'https://example.test/custom.png',
+                detail: 'auto',
+              },
+            ],
+          },
+        ],
+        tools: [
+          { type: 'function', name: 'read', parameters: {} },
+          ...(options.hostedTool ? [{ type: 'web_search' }] : []),
+        ],
+        reasoning: { effort: 'low' },
+        stream: options.stream ?? false,
+      }),
+    }
+  }
+
+  function seedEmptyAccountStorage() {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+  }
+
+  async function captureResponsesLiteHttpRequest(
+    model: string,
+    responsesLite: boolean,
+    sessionID: string,
+    options: { hostedTool?: boolean } = {},
+  ) {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let captured: RequestInit | undefined
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        captured = init
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        responsesLite,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responsesLiteRequestInit(model, sessionID, options),
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    if (!captured) throw new Error('missing captured request')
+    return captured
+  }
+
   function headerValue(init: unknown, name: string) {
     const headers = (init as { headers?: HeadersInit } | undefined)?.headers
     if (!headers) return ''
@@ -2081,6 +2781,246 @@ describe('integration: active fallback routing', () => {
       }),
     )
   }
+
+  test.each([
+    [
+      {
+        'x-session-affinity': 'affinity',
+        'x-opencode-session': 'opencode',
+        'x-session-id': 'x-session',
+        'session-id': 'session',
+      },
+      'affinity',
+    ],
+    [
+      { 'x-opencode-session': 'opencode', 'x-session-id': 'x-session' },
+      'opencode',
+    ],
+    [{ 'x-session-id': 'x-session', 'session-id': 'session' }, 'x-session'],
+    [{ 'session-id': 'session' }, 'session'],
+    [{}, undefined],
+  ])(
+    'resolves sidebar session headers by documented precedence',
+    (raw, expected) => {
+      expect(resolveSidebarSessionId(new Headers(raw))).toBe(expected)
+    },
+  )
+
+  it('keeps different served accounts under different session keys', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-opencode-session': 'sess-fallback' }),
+      )
+
+      seedStorage({ access: 'fallback-access-token' }, { mode: 'main-first' })
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-opencode-session': 'sess-main' }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['sess-fallback']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+      expect(sidebar.activeRouting?.['sess-main']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeId).toBe('main')
+      expect(sidebar.route).toBe('main-first')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('records fallback-served routing on the parent session', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-opencode-session': 'child-session',
+          'x-parent-session-id': 'parent-session',
+        }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['child-session']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+      // A fallback (not main) served the child; the parent entry must mirror
+      // that same fallback so the parent's sidebar highlights the live account.
+      expect(sidebar.activeRouting?.['parent-session']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('uses legacy display routing when the request carries no session headers', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit(),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      // Sessionless requests write only the legacy display fields, never a
+      // per-session entry.
+      expect(sidebar.activeRouting).toBeUndefined()
+      expect(sidebar.activeId).toBe('fallback-1')
+      expect(sidebar.route).toBe('fallback-first')
+      // Resolving without a session reads those legacy fields and must yield
+      // defined routing rather than crash or return undefined.
+      expect(resolveSessionSidebarRouting(sidebar, undefined)).toEqual({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('reads the sidebar session from a Request and strips it before the wire', async () => {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let wireHeaders = new Headers()
+    let wireMethod: string | undefined
+    let wireBody: BodyInit | null | undefined
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      wireHeaders = new Headers(init?.headers)
+      wireMethod = init?.method
+      wireBody = init?.body
+      return new Response('{}', { status: 200 })
+    }) as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      const requestBody = responseRequestInit()
+      const request = new Request('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-opencode-session': 'request-session',
+        },
+        body: requestBody.body,
+      })
+      await loaded.fetchOverride(request)
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['request-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(wireHeaders.has('x-opencode-session')).toBe(false)
+      expect(wireMethod).toBe('POST')
+      expect(JSON.parse(String(wireBody)).model).toBe('gpt-5.5')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does not mutate frozen caller-owned request headers', async () => {
+    seedEmptyAccountStorage()
+    const callerHeaders = Object.freeze({
+      authorization: 'Bearer caller-token',
+      'content-type': 'application/json',
+      'x-api-key': 'caller-key',
+    })
+    const callerInit = Object.freeze({
+      method: 'POST',
+      headers: callerHeaders,
+      body: responseRequestInit().body,
+    }) as RequestInit
+    const originalFetch = globalThis.fetch
+    let wireHeaders = new Headers()
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      wireHeaders = new Headers(init?.headers)
+      return new Response('{}', { status: 200 })
+    }) as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        callerInit,
+      )
+
+      expect(callerHeaders.authorization).toBe('Bearer caller-token')
+      expect(callerHeaders['x-api-key']).toBe('caller-key')
+      expect(wireHeaders.get('authorization')).toBe('Bearer main-stale-token')
+      expect(wireHeaders.has('x-api-key')).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
 
   it('uses the active fallback token without writing it to the auth slot', async () => {
     seedStorage({ access: 'fallback-access-token' })
@@ -2187,7 +3127,7 @@ describe('integration: active fallback routing', () => {
         models: [],
       } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1])
       const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
@@ -2268,7 +3208,7 @@ describe('integration: active fallback routing', () => {
         models: [],
       } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1])
       const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
@@ -2567,6 +3507,7 @@ describe('integration: active fallback routing', () => {
             ?.usedPercent === 63,
       )
       expect(sidebar.activeId).toBe('work-alt')
+      expect(sidebar.activeRouting).toBeUndefined()
       expect(sidebar.main.quota).toBeNull()
       expect(
         sidebar.fallbacks.find((a) => a.id === 'work-alt')?.quota?.primary
@@ -3126,7 +4067,10 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('preserves a fresh fallback quota window when a partial failed snapshot arrives', async () => {
+  it('a later single-primary snapshot fully replaces an earlier two-window snapshot, not merges with it', async () => {
+    // Header/WS pushes are always complete snapshots of every live window
+    // (never a partial subset), so a later push that omits a window means
+    // the wire genuinely dropped it — the cached value must not survive.
     seedStorage({ access: 'fallback-access-token' })
     const originalFetch = globalThis.fetch
     let fallbackCalls = 0
@@ -3174,74 +4118,9 @@ describe('integration: active fallback routing', () => {
         sidebarFile,
         (s) =>
           s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.primary
-            ?.usedPercent === 20 &&
-          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary
-            ?.usedPercent === 95,
+            ?.usedPercent === 20,
       )
       const quota = sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota
-      expect(quota?.primary?.usedPercent).toBe(20)
-      expect(quota?.secondary?.usedPercent).toBe(95)
-    } finally {
-      globalThis.fetch = originalFetch
-      await hooks?.dispose?.()
-    }
-  })
-
-  it('does not preserve a fallback quota window after its reset passed', async () => {
-    seedStorage({ access: 'fallback-access-token' })
-    const originalFetch = globalThis.fetch
-    const pastReset = Math.floor((Date.now() - 60_000) / 1000)
-    let fallbackCalls = 0
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
-      const auth = headerValue(init, 'authorization')
-      if (auth.includes('fallback-access-token')) {
-        fallbackCalls++
-        return new Response('{}', {
-          status: 429,
-          headers:
-            fallbackCalls === 1
-              ? {
-                  'x-codex-primary-used-percent': '10',
-                  'x-codex-secondary-used-percent': '95',
-                  'x-codex-secondary-reset-at': String(pastReset),
-                }
-              : { 'x-codex-primary-used-percent': '20' },
-        })
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof globalThis.fetch
-
-    let hooks: Hooks | undefined
-    try {
-      const loaded = await loadFetchOverride(
-        createMockPluginInput(),
-        Date.now() + 3600_000,
-      )
-      hooks = loaded.hooks
-
-      const first = await loaded.fetchOverride(
-        'https://api.openai.com/v1/responses',
-        requestInit(),
-      )
-      expect(first.status).toBe(200)
-      await first.body?.cancel()
-
-      const second = await loaded.fetchOverride(
-        'https://api.openai.com/v1/responses',
-        requestInit(),
-      )
-      expect(second.status).toBe(200)
-      await second.body?.cancel()
-
-      const sidebar = await waitForSidebarState(sidebarFile, (state) => {
-        const quota = state.fallbacks.find(
-          (account) => account.id === 'fallback-1',
-        )?.quota
-        return quota?.primary?.usedPercent === 20 && !quota.secondary
-      })
-      const quota = sidebar.fallbacks.find(
-        (account) => account.id === 'fallback-1',
-      )?.quota
       expect(quota?.primary?.usedPercent).toBe(20)
       expect(quota?.secondary).toBeUndefined()
     } finally {
@@ -3432,7 +4311,7 @@ describe('integration: active fallback routing', () => {
         previous_response_id: 'resp_prev',
         model: 'gpt-5.5',
         type: 'response.create',
-        reasoning: { effort: 'low' },
+        reasoning: { effort: 'max', summary: 'auto' },
         tools: [],
         store: false,
       }),
@@ -3515,8 +4394,242 @@ describe('integration: active fallback routing', () => {
       },
     )
 
-    expect(Object.keys(JSON.parse(httpBody))).toEqual(expectedKeys)
-    expect(Object.keys(JSON.parse(wsBody))).toEqual(expectedKeys)
+    const parsedHttpBody = JSON.parse(httpBody)
+    const parsedWsBody = JSON.parse(wsBody)
+    expect(Object.keys(parsedHttpBody)).toEqual(expectedKeys)
+    expect(Object.keys(parsedWsBody)).toEqual(expectedKeys)
+    expect(parsedHttpBody.reasoning).toEqual({ effort: 'max', summary: 'auto' })
+    expect(parsedWsBody.reasoning).toEqual({ effort: 'max', summary: 'auto' })
+  })
+
+  it('gates Responses Lite by setting and exact HTTP model', async () => {
+    const cases = [
+      { name: 'sol', model: 'gpt-5.6-sol', enabled: true, marked: true },
+      {
+        name: 'legacy-pro',
+        model: 'gpt-5.6-sol-pro',
+        enabled: true,
+        marked: false,
+      },
+      { name: 'disabled', model: 'gpt-5.6-sol', enabled: false, marked: false },
+    ]
+    for (const testCase of cases) {
+      const captured = await captureResponsesLiteHttpRequest(
+        testCase.model,
+        testCase.enabled,
+        `responses-lite-${testCase.name}`,
+      )
+      expect(
+        new Headers(captured.headers).get(
+          'x-openai-internal-codex-responses-lite',
+        ),
+      ).toBe(testCase.marked ? 'true' : null)
+    }
+  })
+
+  it('rewrites an eligible HTTP body for Responses Lite', async () => {
+    const captured = await captureResponsesLiteHttpRequest(
+      'gpt-5.6-sol',
+      true,
+      'responses-lite-body',
+      { hostedTool: true },
+    )
+    const body = JSON.parse(String(captured.body)) as Record<string, unknown>
+    expect(body.reasoning).toEqual({ effort: 'low', context: 'all_turns' })
+    expect(body.parallel_tool_calls).toBe(false)
+    expect('instructions' in body).toBe(false)
+    expect('tools' in body).toBe(false)
+
+    const input = body.input as Array<Record<string, unknown>>
+    expect(input[0]).toMatchObject({
+      type: 'additional_tools',
+      role: 'developer',
+    })
+    expect(input[0]?.tools).toContainEqual({
+      type: 'function',
+      name: 'read',
+      strict: false,
+      parameters: {},
+    })
+    expect(
+      (input[0]?.tools as Array<Record<string, unknown>> | undefined)?.some(
+        (tool) => tool.type === 'web_search',
+      ) ?? false,
+    ).toBe(false)
+    expect(input[1]).toEqual({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'Be concise' }],
+    })
+    const sourceInput = input.slice(2)
+    expect([
+      (
+        sourceInput[0]?.content as Array<Record<string, unknown>> | undefined
+      )?.[1]?.detail,
+      (
+        sourceInput[1]?.output as Array<Record<string, unknown>> | undefined
+      )?.[0]?.detail,
+      (
+        sourceInput[2]?.output as Array<Record<string, unknown>> | undefined
+      )?.[0]?.detail,
+    ]).toEqual([undefined, undefined, undefined])
+  })
+
+  it('preserves the standard body when Responses Lite is disabled', async () => {
+    const captured = await captureResponsesLiteHttpRequest(
+      'gpt-5.6-sol',
+      false,
+      'responses-lite-disabled',
+    )
+    const body = JSON.parse(String(captured.body)) as Record<string, unknown>
+    const input = body.input as Array<Record<string, unknown>>
+    expect([
+      (input[0]?.content as Array<Record<string, unknown>> | undefined)?.[1]
+        ?.detail,
+      (input[1]?.output as Array<Record<string, unknown>> | undefined)?.[0]
+        ?.detail,
+      (input[2]?.output as Array<Record<string, unknown>> | undefined)?.[0]
+        ?.detail,
+    ]).toEqual(['high', 'low', 'auto'])
+    expect(body.parallel_tool_calls).toBe(true)
+    expect(body.instructions).toBe('Be concise')
+    expect(body.tools).toBeDefined()
+  })
+
+  it('marks Responses Lite in WS metadata and still prewarms', async () => {
+    seedEmptyAccountStorage()
+    const sent: Array<Record<string, unknown>> = []
+    let seenUpgradeHeaders: Record<string, string> = {}
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, upgradeHeaders }) => ({
+        send(data) {
+          seenUpgradeHeaders = upgradeHeaders
+          const body = JSON.parse(data) as Record<string, unknown>
+          sent.push(body)
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: body.generate === false ? 'resp_prewarm' : 'resp_main',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            Date.now() + 3600_000,
+            true,
+            true,
+          )
+          hooks = loaded.hooks
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            responsesLiteRequestInit('gpt-5.6-sol', 'responses-lite-ws', {
+              stream: true,
+            }),
+          )
+          await response.text()
+        } finally {
+          await hooks?.dispose?.()
+        }
+      },
+    )
+
+    expect(sent).toHaveLength(2)
+    expect(sent[0]?.generate).toBe(false)
+    const main = sent[1]!
+    expect(
+      (main.client_metadata as Record<string, unknown>)
+        .ws_request_header_x_openai_internal_codex_responses_lite,
+    ).toBe('true')
+    expect(
+      seenUpgradeHeaders['x-openai-internal-codex-responses-lite'],
+    ).toBeUndefined()
+  })
+
+  it('converts a WS Responses Lite capture into a sanitized HTTP cachekeep request', async () => {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    let now = originalNow()
+    const warmRequests: RequestInit[] = []
+    let hooks: Hooks | undefined
+    Date.now = () => now
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        if (init) warmRequests.push(init)
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      await withFakeWebSocket(
+        ({ message }) => ({
+          send(data) {
+            const body = JSON.parse(data) as Record<string, unknown>
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id: body.generate === false ? 'resp_prewarm' : 'resp_main',
+                },
+              }),
+            )
+          },
+        }),
+        async () => {
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            now + 3600_000,
+            true,
+            true,
+          )
+          hooks = loaded.hooks
+          await runCommand(hooks, 'openai-cachekeep', 'on')
+          const request = responsesLiteRequestInit(
+            'gpt-5.6-sol',
+            'responses-lite-keepwarm',
+            { stream: true },
+          )
+          const headers = new Headers(request.headers)
+          headers.set('x-opencode-session', 'internal-session')
+          request.headers = headers
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request,
+          )
+          await response.text()
+          now += 30 * 60_000
+          const manager = (
+            globalThis as typeof globalThis & {
+              __openaiAuthCacheKeepManager?: { tick(): Promise<void> }
+            }
+          ).__openaiAuthCacheKeepManager
+          if (!manager) throw new Error('missing cachekeep manager')
+          await manager.tick()
+        },
+      )
+    } finally {
+      Date.now = originalNow
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+
+    expect(warmRequests).toHaveLength(1)
+    const warm = warmRequests[0]!
+    const warmHeaders = new Headers(warm.headers)
+    expect(warmHeaders.get('x-openai-internal-codex-responses-lite')).toBe(
+      'true',
+    )
+    expect(warmHeaders.has('x-opencode-session')).toBe(false)
+    const body = JSON.parse(String(warm.body)) as Record<string, unknown>
+    const metadata = body.client_metadata as Record<string, unknown>
+    expect('x-codex-turn-metadata' in metadata).toBe(false)
+    expect('x-codex-ws-stream-request-start-ms' in metadata).toBe(false)
+    expect(
+      'ws_request_header_x_openai_internal_codex_responses_lite' in metadata,
+    ).toBe(false)
   })
 
   it('keeps the main refresh advisory lease shorter than the file lock TTL', () => {
@@ -3654,6 +4767,85 @@ describe('integration: active fallback routing', () => {
       await hooks?.dispose?.()
     }
   })
+
+  it('a fallback that stops sending a secondary window does not keep resurrecting it from cache', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    const farFuture = Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000)
+    let responseHeaders: Record<string, string> = {
+      'x-codex-primary-used-percent': '10',
+      'x-codex-primary-window-minutes': '300',
+      'x-codex-primary-reset-at': String(farFuture),
+      'x-codex-secondary-used-percent': '20',
+      'x-codex-secondary-window-minutes': '10080',
+      'x-codex-secondary-reset-at': String(farFuture),
+    }
+    globalThis.fetch = (async () => {
+      return new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json', ...responseHeaders },
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      // First push: real two-window frame — cache now holds both windows.
+      let response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      await waitForSidebarState(
+        sidebarFile,
+        (s) =>
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary
+            ?.usedPercent === 20,
+      )
+
+      // The backend stops sending a secondary window entirely (the current
+      // live wire shape) — every subsequent push is single-primary.
+      responseHeaders = {
+        'x-codex-primary-used-percent': '15',
+        'x-codex-primary-window-minutes': '300',
+        'x-codex-primary-reset-at': String(farFuture),
+      }
+      response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      const sidebar = await waitForSidebarState(
+        sidebarFile,
+        (s) =>
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.primary
+            ?.usedPercent === 15,
+      )
+      // The removed secondary must not be perpetuated from the stale cache.
+      expect(
+        sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary,
+      ).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -3725,6 +4917,7 @@ describe('integration: no real config read', () => {
 describe('integration: models cost-zeroing', () => {
   let configDir: string
   let configFile: string
+  let modelsCacheFile: string
   let stateFile: string
 
   function mockProvider() {
@@ -3790,19 +4983,24 @@ describe('integration: models cost-zeroing', () => {
   beforeEach(() => {
     configDir = tempDir('oai-int-models-')
     configFile = join(configDir, 'openai-auth.json')
+    modelsCacheFile = join(configDir, 'models.json')
     stateFile = join(configDir, 'openai-auth-state.json')
     process.env.OPENCODE_OPENAI_AUTH_FILE = configFile
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = modelsCacheFile
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = stateFile
     process.env.NODE_ENV = 'test'
     process.env.OPENCODE_CONFIG_DIR = configDir
+    resetModelCostsForTest()
   })
 
   afterEach(() => {
     // Restore path envs to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
     delete process.env.OPENCODE_CONFIG_DIR
     delete process.env.NODE_ENV
+    resetModelCostsForTest()
   })
 
   it('OAuth + no costZeroing key → costs ZEROED (default-on preserved)', async () => {
@@ -3820,13 +5018,45 @@ describe('integration: models cost-zeroing', () => {
     })
   })
 
-  it('OAuth + costZeroing.enabled === false → original cost PRESERVED', async () => {
+  it('OAuth + costZeroing.enabled === false → catalog cost RESTORED', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
         version: 1,
         accounts: [],
         costZeroing: { enabled: false },
+      }),
+    )
+    writeFileSync(
+      modelsCacheFile,
+      JSON.stringify({
+        openai: {
+          models: {
+            'gpt-5.5': {
+              cost: {
+                input: 5,
+                output: 30,
+                cache_read: 0.5,
+                cache_write: 6.25,
+                tiers: [
+                  {
+                    input: 10,
+                    output: 45,
+                    cache_read: 1,
+                    cache_write: 12.5,
+                    tier: { type: 'context', size: 272_000 },
+                  },
+                ],
+                context_over_200k: {
+                  input: 10,
+                  output: 45,
+                  cache_read: 1,
+                  cache_write: 12.5,
+                },
+              },
+            },
+          },
+        },
       }),
     )
     const input = createMockPluginInput()
@@ -3836,9 +5066,22 @@ describe('integration: models cost-zeroing', () => {
     const result = await modelsFn(mockProvider(), oauthCtx())
     const model = result['gpt-5.5']!
     expect(model.cost).toEqual({
-      input: 15,
-      output: 60,
-      cache: { read: 7.5, write: 15 },
+      input: 5,
+      output: 30,
+      cache: { read: 0.5, write: 6.25 },
+      tiers: [
+        {
+          input: 10,
+          output: 45,
+          cache: { read: 1, write: 12.5 },
+          tier: { type: 'context', size: 272_000 },
+        },
+      ],
+      experimentalOver200K: {
+        input: 10,
+        output: 45,
+        cache: { read: 1, write: 12.5 },
+      },
     })
   })
 
