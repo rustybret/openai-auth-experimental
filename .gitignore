@@ -40,3 +40,7 @@ coverage/
 tmp/
 temp/
 /.omo/run-continuation
+.omo/mailbox-trace.jsonl
+.omo/omo.jsonc
+/coordination_notes
+/.omo/run-continuation
