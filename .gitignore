@@ -34,13 +34,12 @@ coverage/
 tmp/
 temp/
 /.omo/run-continuation
-/.omo/run-continuation
+.omo/mailbox-trace.jsonl
+.omo/omo.jsonc
+/coordination_notes
 **.*.md
 !**.*.md
 .github/
 !.github/*
 .opencode/package-lock.json
 .opencode/package.json
-.omo/mailbox-trace.jsonl
-.omo/omo.jsonc
-/coordination_notes

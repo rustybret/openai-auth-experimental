@@ -19,7 +19,7 @@
 │   │   │   ├── logger.ts          # Leveled, redacting, rotating logger
 │   │   │   ├── model-costs.ts     # Dev catalog parser and cost restorer
 │   │   │   ├── quota-normalize.ts # HTTP/WS/wham → OAuthQuotaSnapshot
-│   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot file
+│   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot and sticky-pin state
 │   │   │   ├── tui-preferences.ts # Shared tui-preferences.jsonc reader/writer/watcher
 │   │   │   ├── tui.tsx            # TUI sidebar component
 │   │   │   ├── ws.ts              # Low-level WS connect/stream
@@ -27,6 +27,7 @@
 │   │   │   ├── raw-ws.ts          # Runtime-aware RawWebSocket selector
 │   │   │   ├── raw-ws-bun.ts      # Bun.connect-backed hand-rolled client
 │   │   │   ├── raw-ws-node.ts     # node:net/node:tls-backed hand-rolled client
+│   │   │   ├── raw-ws-upgrade.ts  # HTTP upgrade status & header parser for rejected handshakes
 │   │   │   ├── hosted-web-search.ts # Provider-hosted web_search tool + replay/SSE translation
 │   │   │   ├── response-stream-error.ts # Stream error type for WS/HTTP
 │   │   │   ├── prompt-context.ts  # Assistant model/variant resolver for synthetic replies
@@ -74,7 +75,7 @@
 - Key files:
   - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache, backoff, and mid-stream rate limit marking
-  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, and idle pruning)
+  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
   - `packages/opencode/src/core/backoff.ts` — refresh/quota backoff math + `hashRefreshToken`
   - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock
@@ -136,7 +137,7 @@
 - `packages/opencode/src/core/accounts.ts` — multi-account store, `FallbackAccountManager`.
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
 - `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
-- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, and subagent warm caps.
+- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, subagent warm caps, and main-only sustain that bypasses idle pruning but not memory/LRU caps.
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
@@ -144,10 +145,10 @@
 - `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool.
 - `packages/opencode/src/ws.ts` — low-level WS connect/stream.
 - `packages/opencode/src/WEBSOCKET.md` — developer reference for WebSocket flow, lifetime, and retry strategies.
-- `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` — hand-rolled RFC 6455 clients.
+- `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` / `packages/opencode/src/raw-ws-upgrade.ts` — hand-rolled RFC 6455 clients and HTTP upgrade response parser.
 - `packages/opencode/src/hosted-web-search.ts` — provider-hosted `web_search` tool + replay/SSE translation.
 - `packages/opencode/src/quota-normalize.ts` — HTTP/WS/wham → `OAuthQuotaSnapshot`.
-- `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot file + tolerant reader.
+- `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot, tolerant reader, and SHA-256-keyed sticky session assignments with seven-day TTL.
 - `packages/opencode/src/dump.ts` — optional transport request dumps for cache debugging.
 - `packages/opencode/src/logger.ts` — leveled, secret-redacting, size-rotating logger.
 - `packages/opencode/src/model-costs.ts` — model cost resolution and restoration from `models.dev` catalog.
@@ -159,7 +160,7 @@
 
 ## Naming Conventions
 
-**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
+**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
 Example: `packages/opencode/src/core/cachekeep.ts`, `packages/opencode/src/rpc/rpc-server.ts`.
 
 **Directories:** lowercase-kebab. Subdirectories group by layer (`core/`, `rpc/`, `tests/`, `tui/`, `util/`).

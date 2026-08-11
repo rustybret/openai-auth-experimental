@@ -8,7 +8,7 @@ import {
 import { join } from 'node:path'
 import { createLogger } from '../logger'
 import type { drainNotifications } from './notifications'
-import { writePortFile } from './port-file'
+import { sweepRpcState, writePortFile } from './port-file'
 import type { ApplyRequest, ApplyResult } from './protocol'
 
 const log = createLogger('rpc')
@@ -21,6 +21,8 @@ export interface RpcServerHandle {
 
 export interface RpcServerOptions {
   dir: string
+  secureDir?: boolean
+  sweepRoot?: string
   drain: typeof drainNotifications
   apply: (request: ApplyRequest) => Promise<ApplyResult>
   timeoutMs?: number
@@ -112,8 +114,22 @@ export async function startRpcServer(
     })
   })
   server.unref()
+  if (options.sweepRoot) {
+    try {
+      await sweepRpcState(options.sweepRoot, options.dir)
+    } catch (error) {
+      log.warn('rpc state sweep failed', {
+        pid: process.pid,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
   try {
-    await writePortFile(options.dir, { port, token, pid: process.pid })
+    await writePortFile(
+      options.dir,
+      { port, token, pid: process.pid },
+      { secureDir: options.secureDir },
+    )
     log.debug('rpc server pid', {
       pid: process.pid,
       rpcPort: port,

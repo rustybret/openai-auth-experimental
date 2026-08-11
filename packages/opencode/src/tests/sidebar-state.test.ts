@@ -1,27 +1,46 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
+import type { AccountStorage } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock'
+import { buildSidebarMachineState } from '../index.ts'
+import { flushForTest, setLogLevel } from '../logger'
 import {
   ACTIVE_ROUTING_MAX_AGE_MS,
   type AccountQuota,
+  clearSidebarStickyAssignment,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
+  exhaustedQuotaResetAt,
   formatWindowLabel,
   getCollapsedQuotaSummary,
   getPresentQuotaWindows,
   getSidebarState,
   getSidebarStateFile,
+  hashSidebarSessionId,
+  isQuotaExhausted,
   isUsableRoutingEntry,
   normalizeSidebarState,
   pruneActiveRouting,
+  pruneStickyAssignments,
   removeSidebarActiveRouting,
   resolveActiveAccount,
+  resolveSessionSidebarRouting,
+  resolveSidebarStickyAssignment,
   type SidebarAccountState,
   type SidebarState,
+  STICKY_ASSIGNMENT_MAX_ENTRIES,
   setSidebarLegacyRouting,
   setSidebarMachineState,
   setSidebarState,
@@ -35,8 +54,12 @@ import { FLOOR_SIDEBAR_STATE_FILE } from './setup-env.ts'
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
 
-const quota = (used: number): AccountQuota => ({
-  primary: { usedPercent: used, remainingPercent: 100 - used },
+const quota = (used: number, checkedAt?: number): AccountQuota => ({
+  primary: {
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    ...(checkedAt === undefined ? {} : { checkedAt }),
+  },
   secondary: { usedPercent: used, remainingPercent: 100 - used },
 })
 
@@ -97,6 +120,30 @@ describe('normalizeSidebarState', () => {
     expect(result.main.killed).toBe(false)
   })
 
+  test('main account identity is preserved only when it is a string', () => {
+    const valid = normalizeSidebarState({
+      main: { quota: null, mainAccountId: 'chatgpt-main' },
+    })
+    const malformed = normalizeSidebarState({
+      main: { quota: null, mainAccountId: 42 },
+    })
+
+    expect(valid.main.mainAccountId).toBe('chatgpt-main')
+    expect(malformed.main.mainAccountId).toBeUndefined()
+  })
+
+  test('fallback account identity is preserved only when it is a string', () => {
+    const result = normalizeSidebarState({
+      fallbacks: [
+        { id: 'fb1', accountId: 'chatgpt-fb1' },
+        { id: 'fb2', accountId: 42 },
+      ],
+    })
+
+    expect(result.fallbacks[0]?.accountId).toBe('chatgpt-fb1')
+    expect(result.fallbacks[1]?.accountId).toBeUndefined()
+  })
+
   // (d) fallbacks is a non-array value
   test('{"fallbacks":"notarray"} — fallbacks coerced to []', () => {
     const result = normalizeSidebarState({ fallbacks: 'notarray' })
@@ -132,6 +179,7 @@ describe('normalizeSidebarState', () => {
           },
           secondary: { usedPercent: 17, remainingPercent: 83 },
         },
+        mainAccountId: 'chatgpt-main',
         killed: true,
         quotaBackedOff: true,
         quotaBackoffUntil: 1234567890,
@@ -143,6 +191,7 @@ describe('normalizeSidebarState', () => {
         {
           id: 'fb1',
           label: 'work',
+          accountId: 'chatgpt-fb1',
           quota: { primary: { usedPercent: 5, remainingPercent: 95 } },
           killed: false,
           enabled: true,
@@ -172,10 +221,12 @@ describe('normalizeSidebarState', () => {
     expect(result.main.refreshBackedOff).toBe(false)
     expect(result.main.refreshBackoffUntil).toBe(9876543210)
     expect(result.main.resetCredits).toBe(4)
+    expect(result.main.mainAccountId).toBe('chatgpt-main')
     expect(result.fallbacks).toHaveLength(1)
     const fb0 = result.fallbacks[0]!
     expect(fb0.id).toBe('fb1')
     expect(fb0.label).toBe('work')
+    expect(fb0.accountId).toBe('chatgpt-fb1')
     expect(fb0.resetCredits).toBe(2)
     expect(result.activeId).toBe('fb1')
     expect(result.route).toBe('fallback')
@@ -317,6 +368,878 @@ describe('normalizeSidebarState', () => {
     expect(result.activeRouting).toBeUndefined()
     expect(result.activeId).toBe('fallback-1')
     expect(result.route).toBe('fallback-first')
+  })
+
+  test('normalizes sticky assignments without retaining malformed siblings', () => {
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      stickyAssignments: {
+        [hashSidebarSessionId('valid-session')]: {
+          accountId: 'fallback-1',
+          assignedAt: 100,
+          lastSeenAt: 200,
+          inputBytes: 300,
+          quotaCheckedAt: 400,
+        },
+        missingAccount: { assignedAt: 100, lastSeenAt: 200, inputBytes: 300 },
+        invalidTimestamp: {
+          accountId: 'fallback-1',
+          assignedAt: Number.NaN,
+          lastSeenAt: 200,
+          inputBytes: 300,
+        },
+        negativeBytes: {
+          accountId: 'fallback-1',
+          assignedAt: 100,
+          lastSeenAt: 200,
+          inputBytes: -1,
+        },
+      },
+    })
+
+    expect(result.stickyAssignments).toEqual({
+      [hashSidebarSessionId('valid-session')]: {
+        accountId: 'fallback-1',
+        assignedAt: 100,
+        lastSeenAt: 200,
+        inputBytes: 300,
+        quotaCheckedAt: 400,
+      },
+    })
+  })
+
+  test('old files without sticky assignments remain valid', () => {
+    expect(
+      normalizeSidebarState(DEFAULT_SIDEBAR_STATE).stickyAssignments,
+    ).toBeUndefined()
+  })
+})
+
+describe('sticky assignments', () => {
+  const now = 2 * 7 * 24 * 60 * 60 * 1000
+
+  test('hashes session ids without retaining the source identifier', () => {
+    expect(hashSidebarSessionId('session-a')).toMatch(/^[a-f0-9]{64}$/)
+    expect(hashSidebarSessionId('session-a')).not.toContain('session-a')
+    expect(hashSidebarSessionId('session-a')).toBe(
+      hashSidebarSessionId('session-a'),
+    )
+  })
+
+  test('unknown roster keeps fresh fallback pins while expiry and explicit removal still prune', () => {
+    const result = pruneStickyAssignments(
+      {
+        freshFallback: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        expired: {
+          accountId: 'fallback-2',
+          assignedAt: 1,
+          lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+          inputBytes: 2,
+        },
+        explicitlyRemoved: {
+          accountId: 'fallback-3',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 3,
+        },
+      },
+      undefined,
+      now,
+      'explicitlyRemoved',
+    )
+
+    expect(result).toEqual({
+      freshFallback: {
+        accountId: 'fallback-1',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 1,
+      },
+    })
+  })
+
+  test('prunes expired, disabled, and explicitly removed assignments', () => {
+    const result = pruneStickyAssignments(
+      {
+        stale: {
+          accountId: 'main',
+          assignedAt: 1,
+          lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+          inputBytes: 1,
+        },
+        disabled: {
+          accountId: 'disabled-fallback',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+        removed: {
+          accountId: 'main',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 3,
+        },
+        keep: {
+          accountId: 'main',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 4,
+        },
+      },
+      new Set(['main']),
+      now,
+      'removed',
+    )
+
+    expect(result).toEqual({
+      keep: {
+        accountId: 'main',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 4,
+      },
+    })
+  })
+
+  test('logs pruned sticky assignments by reason without raw session ids', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-prune-log-'))
+    const logFile = join(tempDir, 'sidebar.log')
+    const originalLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+    await flushForTest()
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    setLogLevel('debug')
+
+    try {
+      pruneStickyAssignments(
+        {
+          'raw-session-account': {
+            accountId: 'removed-fallback',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+          'raw-session-expired': {
+            accountId: 'main',
+            assignedAt: 1,
+            lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+            inputBytes: 2,
+          },
+          'raw-session-explicit': {
+            accountId: 'main',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 3,
+          },
+        },
+        new Set(['main']),
+        now,
+        'raw-session-explicit',
+      )
+      await flushForTest()
+
+      const text = readFileSync(logFile, 'utf8')
+      expect(text).toContain('[sidebar] pruned sticky assignments')
+      expect(text).toContain('"removed":3')
+      expect(text).toContain('"account-not-in-roster":1')
+      expect(text).toContain('"expired":1')
+      expect(text).toContain('"explicit-removal":1')
+      expect(text).not.toContain('raw-session-')
+    } finally {
+      await flushForTest()
+      setLogLevel(undefined)
+      if (originalLogFile === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = originalLogFile
+      }
+    }
+  })
+
+  test('returns a fresh valid sticky assignment without choosing', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-resolve-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'fresh-session'
+    const assignment = {
+      accountId: 'account-a',
+      assignedAt: now - 1,
+      lastSeenAt: now,
+      inputBytes: 128,
+      quotaCheckedAt: 10,
+    }
+    await setSidebarState(
+      make({
+        stickyAssignments: { [hashSidebarSessionId(sessionId)]: assignment },
+        lastUpdated: now,
+      }),
+      file,
+    )
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 128,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a fresh valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(result).toEqual(assignment)
+  })
+
+  test('replaces excluded, expired, and disabled sticky assignments', async () => {
+    const cases = [
+      {
+        name: 'excluded',
+        lastSeenAt: now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        excludeAccountIds: ['account-a'],
+      },
+      {
+        name: 'expired',
+        lastSeenAt: now - SEVEN_DAY_MS - 1,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+      },
+      {
+        name: 'disabled',
+        lastSeenAt: now,
+        validPinnedAccountIds: ['account-b'],
+      },
+    ]
+
+    for (const scenario of cases) {
+      const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-replace-'))
+      const file = join(tempDir, 'sidebar-state.json')
+      const sessionId = `${scenario.name}-session`
+      await setSidebarState(
+        make({
+          stickyAssignments: {
+            [hashSidebarSessionId(sessionId)]: {
+              accountId: 'account-a',
+              assignedAt: now - 100,
+              lastSeenAt: scenario.lastSeenAt,
+              inputBytes: 100,
+              quotaCheckedAt: 10,
+            },
+          },
+          lastUpdated: now,
+        }),
+        file,
+      )
+      let chooseCalls = 0
+
+      const result = await resolveSidebarStickyAssignment(
+        {
+          sessionId,
+          requestBytes: 200,
+          now,
+          validPinnedAccountIds: scenario.validPinnedAccountIds,
+          ...(scenario.excludeAccountIds
+            ? { excludeAccountIds: scenario.excludeAccountIds }
+            : {}),
+          quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+          choose: () => {
+            chooseCalls += 1
+            return { accountId: 'account-b', quotaCheckedAt: 20 }
+          },
+        },
+        file,
+      )
+
+      expect(chooseCalls).toBe(1)
+      expect(result).toEqual({
+        accountId: 'account-b',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 200,
+        quotaCheckedAt: 20,
+      })
+    }
+  })
+
+  test('evicts the least recently seen assignment when adding beyond the sticky cap', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-cap-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'current-session'
+    const entries = Object.fromEntries(
+      Array.from({ length: STICKY_ASSIGNMENT_MAX_ENTRIES }, (_, index) => {
+        const entrySessionId = `existing-${index}`
+        return [
+          hashSidebarSessionId(entrySessionId),
+          {
+            accountId: 'account-a',
+            assignedAt: now - index,
+            lastSeenAt: now - index,
+            inputBytes: 1,
+          },
+        ]
+      }),
+    )
+    await setSidebarState(make({ stickyAssignments: entries }), file)
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 10,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+        choose: () => ({ accountId: 'account-b', quotaCheckedAt: 20 }),
+      },
+      file,
+    )
+
+    const assignments = (await getSidebarState(file)).stickyAssignments
+    expect(Object.keys(assignments ?? {})).toHaveLength(
+      STICKY_ASSIGNMENT_MAX_ENTRIES,
+    )
+    expect(assignments?.[hashSidebarSessionId('existing-255')]).toBeUndefined()
+    expect(assignments?.[hashSidebarSessionId(sessionId)]).toMatchObject({
+      accountId: 'account-b',
+      lastSeenAt: now,
+    })
+  })
+
+  test('does not lower sticky assignment input-byte high water', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-high-water-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'high-water-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 200,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.inputBytes,
+    ).toBe(200)
+  })
+
+  test('raises sticky assignment input-byte high water', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-high-water-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'raise-high-water-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 200,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(result?.inputBytes).toBe(200)
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.inputBytes,
+    ).toBe(200)
+  })
+
+  test('touches sticky assignment last-seen time only after one hour', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-last-seen-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'last-seen-session'
+    const initialLastSeenAt = now - 30 * 60 * 1000
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: initialLastSeenAt,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.lastSeenAt,
+    ).toBe(initialLastSeenAt)
+
+    const afterOneHour = now + 31 * 60 * 1000
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now: afterOneHour,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.lastSeenAt,
+    ).toBe(afterOneHour)
+  })
+
+  test('clears only one hashed sticky assignment', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-clear-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'session-to-clear'
+    const otherSessionId = 'session-to-keep'
+    await setSidebarState(
+      make({
+        activeRouting: {
+          routing: { activeId: 'main', route: 'main-first', updatedAt: now },
+        },
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 100,
+          },
+          [hashSidebarSessionId(otherSessionId)]: {
+            accountId: 'account-b',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 200,
+          },
+        },
+        lastUpdated: now,
+      }),
+      file,
+    )
+    const before = await getSidebarState(file)
+
+    expect(await clearSidebarStickyAssignment(sessionId, file)).toBe(true)
+    const after = await getSidebarState(file)
+    const {
+      stickyAssignments: _beforeAssignments,
+      lastUpdated: _beforeUpdated,
+      ...beforeRest
+    } = before
+    const { stickyAssignments, lastUpdated, ...afterRest } = after
+    expect(afterRest).toEqual(beforeRest)
+    expect(lastUpdated).toBeGreaterThan(before.lastUpdated)
+    expect(stickyAssignments).toEqual({
+      [hashSidebarSessionId(otherSessionId)]: {
+        accountId: 'account-b',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 200,
+      },
+    })
+
+    const rawAfterFirstClear = readFileSync(file, 'utf8')
+    const serializedAssignments =
+      JSON.parse(rawAfterFirstClear).stickyAssignments
+    expect(Object.keys(serializedAssignments)).toEqual([
+      hashSidebarSessionId(otherSessionId),
+    ])
+    expect(Object.keys(serializedAssignments)[0]).toMatch(/^[a-f0-9]{64}$/)
+    expect(rawAfterFirstClear).not.toContain(sessionId)
+    expect(rawAfterFirstClear).not.toContain(otherSessionId)
+
+    expect(await clearSidebarStickyAssignment(sessionId, file)).toBe(false)
+    expect(readFileSync(file, 'utf8')).toBe(rawAfterFirstClear)
+  })
+
+  test('concurrent resolution for one new session returns one assignment', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-same-session-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'same-new-session'
+    let releaseFirstWrite: (() => void) | undefined
+    const firstWriteReleased = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve
+    })
+    let firstWriteEntered: (() => void) | undefined
+    const firstWriteReached = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve
+    })
+    let chooseCalls = 0
+    const input = {
+      sessionId,
+      requestBytes: 100,
+      now,
+      validPinnedAccountIds: ['account-a'],
+      quotaCheckedAtByAccount: { 'account-a': 10 },
+      choose: () => {
+        chooseCalls += 1
+        return { accountId: 'account-a', quotaCheckedAt: 10 }
+      },
+    }
+
+    const first = resolveSidebarStickyAssignment(input, file, {
+      beforeRecheck: async () => {
+        firstWriteEntered?.()
+        await firstWriteReleased
+      },
+    })
+    await firstWriteReached
+    const second = resolveSidebarStickyAssignment(input, file)
+    releaseFirstWrite?.()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(chooseCalls).toBe(1)
+    expect(secondResult).toEqual(firstResult)
+    expect(
+      Object.keys((await getSidebarState(file)).stickyAssignments ?? {}),
+    ).toEqual([hashSidebarSessionId(sessionId)])
+  })
+
+  test('disperses a thundering herd through shared pending bytes', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-herd-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    let releaseFirstWrite: (() => void) | undefined
+    const firstWriteReleased = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve
+    })
+    let firstWriteEntered: (() => void) | undefined
+    const firstWriteReached = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve
+    })
+    let secondPendingBytes: ReadonlyMap<string, number> | undefined
+
+    const first = resolveSidebarStickyAssignment(
+      {
+        sessionId: 'herd-first',
+        requestBytes: 400,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 10 },
+        choose: () => ({ accountId: 'account-a', quotaCheckedAt: 10 }),
+      },
+      file,
+      {
+        beforeRecheck: async () => {
+          firstWriteEntered?.()
+          await firstWriteReleased
+        },
+      },
+    )
+    await firstWriteReached
+    const second = resolveSidebarStickyAssignment(
+      {
+        sessionId: 'herd-second',
+        requestBytes: 250,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 10 },
+        choose: (pendingBytes) => {
+          secondPendingBytes = pendingBytes
+          return pendingBytes.get('account-a') === 400
+            ? { accountId: 'account-b', quotaCheckedAt: 10 }
+            : { accountId: 'account-a', quotaCheckedAt: 10 }
+        },
+      },
+      file,
+    )
+    releaseFirstWrite?.()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult?.accountId).toBe('account-a')
+    expect(secondPendingBytes?.get('account-a')).toBe(400)
+    expect(secondResult?.accountId).toBe('account-b')
+  })
+
+  test('drops pending bytes when an account has a fresh quota snapshot', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-pending-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId('prior-session')]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 400,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+    let pendingBytes: ReadonlyMap<string, number> | undefined
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId: 'fresh-snapshot-session',
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 11, 'account-b': 10 },
+        choose: (pending) => {
+          pendingBytes = pending
+          return pending.get('account-a') === undefined
+            ? { accountId: 'account-a', quotaCheckedAt: 11 }
+            : { accountId: 'account-b', quotaCheckedAt: 10 }
+        },
+      },
+      file,
+    )
+
+    expect(pendingBytes?.get('account-a')).toBeUndefined()
+    expect(result?.accountId).toBe('account-a')
+  })
+})
+
+describe('session sidebar routing with sticky assignments', () => {
+  const now = 2 * 7 * 24 * 60 * 60 * 1000
+
+  function stickyState(overrides: Partial<SidebarState> = {}): SidebarState {
+    return make({
+      route: 'sticky-balanced',
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          enabled: true,
+          killed: false,
+          quota: quota(20),
+        }),
+        fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: false,
+          quota: quota(30),
+        }),
+      ],
+      ...overrides,
+    })
+  }
+
+  test('uses a usable active routing entry before a sticky pin', () => {
+    const sessionId = 'active-routing-wins'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        activeRouting: {
+          [sessionId]: {
+            activeId: 'fallback-1',
+            route: 'sticky-balanced',
+            updatedAt: now,
+          },
+        },
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'fallback-1', route: 'sticky-balanced' })
+  })
+
+  test('uses a hashed usable sticky pin when no active routing entry survives', () => {
+    const sessionId = 'hashed-sticky-session'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        stickyAssignments: {
+          [sessionId]: {
+            accountId: 'fallback-1',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 2,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'fallback-2', route: 'sticky-balanced' })
+  })
+
+  test('falls back to the existing mode routing when no usable sticky pin exists', () => {
+    const sessionId = 'stale-sticky-session'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: 1,
+            lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+            inputBytes: 1,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'main', route: 'sticky-balanced' })
+  })
+
+  test('leaves non-sticky routing modes unchanged even when a sticky pin exists', () => {
+    const sessionId = 'non-sticky-session'
+    const assignment = {
+      [hashSidebarSessionId(sessionId)]: {
+        accountId: 'fallback-2',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 1,
+      },
+    }
+
+    expect(
+      resolveSessionSidebarRouting(
+        stickyState({ route: 'main-first', stickyAssignments: assignment }),
+        sessionId,
+        now,
+      ),
+    ).toEqual({ activeId: 'main', route: 'main-first' })
+    expect(
+      resolveSessionSidebarRouting(
+        stickyState({ route: 'fallback-first', stickyAssignments: assignment }),
+        sessionId,
+        now,
+      ),
+    ).toEqual({ activeId: 'fallback-1', route: 'fallback-first' })
+  })
+
+  test('does not display a sticky pin whose account is exhausted, disabled, or killed', () => {
+    const cases = [
+      {
+        name: 'exhausted',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: false,
+          quota: {
+            primary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: new Date(now + 60_000).toISOString(),
+            },
+          },
+        }),
+      },
+      {
+        name: 'disabled',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: false,
+          killed: false,
+          quota: quota(20),
+        }),
+      },
+      {
+        name: 'killed',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: true,
+          quota: quota(20),
+        }),
+      },
+    ]
+    for (const scenario of cases) {
+      const sessionId = `${scenario.name}-sticky-session`
+      const result = resolveSessionSidebarRouting(
+        stickyState({
+          fallbacks: [
+            fb({
+              id: 'fallback-1',
+              enabled: true,
+              killed: false,
+              quota: quota(20),
+            }),
+            scenario.fallback,
+          ],
+          stickyAssignments: {
+            [hashSidebarSessionId(sessionId)]: {
+              accountId: 'fallback-2',
+              assignedAt: now,
+              lastSeenAt: now,
+              inputBytes: 1,
+            },
+          },
+        }),
+        sessionId,
+        now,
+      )
+
+      expect(result).toEqual({ activeId: 'main', route: 'sticky-balanced' })
+    }
   })
 })
 
@@ -901,6 +1824,194 @@ test('upsert creates a missing sidebar state directory before locking', async ()
   })
 })
 
+test('upsert preserves fresh fallback pins when the roster is unknown', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-unknown-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const fallbackPinHash = hashSidebarSessionId('fresh-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [fallbackPinHash]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    undefined,
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [fallbackPinHash]: {
+      accountId: 'fallback-1',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 1,
+    },
+  })
+})
+
+test('upsert treats an empty roster as authoritative and prunes fallback pins', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-empty-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const fallbackPinHash = hashSidebarSessionId('empty-roster-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [fallbackPinHash]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [],
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toBeUndefined()
+})
+
+test('upsert prunes only fallback pins absent from an authoritative roster', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-populated-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const retainedHash = hashSidebarSessionId('retained-fallback-pin')
+  const prunedHash = hashSidebarSessionId('pruned-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [retainedHash]: {
+          accountId: 'fallback-present',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        [prunedHash]: {
+          accountId: 'fallback-removed',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [{ id: 'fallback-present', enabled: true }],
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [retainedHash]: {
+      accountId: 'fallback-present',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 1,
+    },
+  })
+})
+
+test('removal with an unknown roster preserves other pins and removes its explicit hash', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-unknown-removal-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [hashSidebarSessionId('removed-session')]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        [hashSidebarSessionId('other-session')]: {
+          accountId: 'fallback-2',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+      },
+    }),
+    file,
+  )
+
+  await removeSidebarActiveRouting('removed-session', undefined, file)
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [hashSidebarSessionId('other-session')]: {
+      accountId: 'fallback-2',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 2,
+    },
+  })
+})
+
+test('setSidebarState leaves an existing foreign directory permission unchanged', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-private-'))
+  const dir = join(tempDir, 'existing')
+  const file = join(dir, 'sidebar-state.json')
+  mkdirSync(dir, { mode: 0o755 })
+  chmodSync(dir, 0o755)
+  writeFileSync(file, JSON.stringify(DEFAULT_SIDEBAR_STATE), { mode: 0o644 })
+  chmodSync(file, 0o644)
+
+  await setSidebarState(make({ lastUpdated: 1 }), file)
+  await drainSidebarWrites()
+
+  expect(statSync(dirname(file)).mode & 0o777).toBe(0o755)
+  expect(statSync(file).mode & 0o777).toBe(0o600)
+})
+
 test('upserting session B preserves session A and refreshes legacy fields', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-routing-'))
   const file = join(tempDir, 'sidebar-state.json')
@@ -1324,6 +2435,408 @@ test('machine writes preserve routing while retaining reset-credit fields', asyn
   expect(written.activeRouting?.['sess-a']?.activeId).toBe('fallback-1')
 })
 
+test('every routing writer preserves sticky assignments', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-rmw-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stickyAssignments = {
+    [hashSidebarSessionId('session-a')]: {
+      accountId: 'fallback-1',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 128,
+    },
+  }
+
+  await setSidebarState(
+    make({
+      fallbacks: [fb({ id: 'fallback-1', enabled: true })],
+      stickyAssignments,
+    }),
+    file,
+  )
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [fb({ id: 'fallback-1', enabled: true })],
+      route: 'main-first',
+      lastUpdated: now,
+    },
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'routing-session',
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    [{ id: 'fallback-1', enabled: true }],
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await setSidebarLegacyRouting(
+    { activeId: 'main', route: 'main-first', updatedAt: now },
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await removeSidebarActiveRouting(
+    'routing-session',
+    [{ id: 'fallback-1', enabled: true }],
+    file,
+  )
+  await drainSidebarWrites()
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+})
+
+test('routing writers prune disabled and killed sticky assignments', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-prune-rmw-'))
+  const now = Date.now()
+  const accounts = [
+    { id: 'disabled', enabled: false },
+    { id: 'killed', enabled: true, killed: true },
+    { id: 'healthy', enabled: true },
+  ]
+  const fallbacks = accounts.map((account) => fb(account))
+  const expectedStickyAssignments = {
+    [hashSidebarSessionId('healthy-session')]: {
+      accountId: 'healthy',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 128,
+    },
+  }
+
+  async function seed(file: string) {
+    await setSidebarState(
+      make({
+        fallbacks,
+        stickyAssignments: {
+          [hashSidebarSessionId('disabled-session')]: {
+            accountId: 'disabled',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 128,
+          },
+          [hashSidebarSessionId('killed-session')]: {
+            accountId: 'killed',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 128,
+          },
+          ...expectedStickyAssignments,
+        },
+      }),
+      file,
+    )
+  }
+
+  const machineFile = join(tempDir, 'machine.json')
+  await seed(machineFile)
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks,
+      route: 'main-first',
+      lastUpdated: now,
+    },
+    machineFile,
+  )
+  expect((await getSidebarState(machineFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
+
+  const upsertFile = join(tempDir, 'upsert.json')
+  await seed(upsertFile)
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'routing-session',
+      activeId: 'healthy',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    accounts,
+    upsertFile,
+  )
+  expect((await getSidebarState(upsertFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
+
+  const removeFile = join(tempDir, 'remove.json')
+  await seed(removeFile)
+  await removeSidebarActiveRouting('routing-session', accounts, removeFile)
+  await drainSidebarWrites()
+  expect((await getSidebarState(removeFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
+})
+
+test('machine writes cannot clobber fresher main and fallback quota from disk', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  await setSidebarState(
+    make({
+      main: main(quota(10, now)),
+      fallbacks: [fb({ id: 'fallback-1', quota: quota(20, now) })],
+      activeRouting: {
+        session: {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(quota(90, stale)),
+      fallbacks: [fb({ id: 'fallback-1', quota: quota(80, stale) })],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary).toMatchObject({
+    usedPercent: 10,
+    checkedAt: now,
+  })
+  expect(written.fallbacks[0]?.quota?.primary).toMatchObject({
+    usedPercent: 20,
+    checkedAt: now,
+  })
+  expect(written.route).toBe('main-first')
+  expect(written.activeRouting?.session?.activeId).toBe('fallback-1')
+})
+
+test('machine write keeps the existing identity when the existing quota wins the merge (re-login race)', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-keep-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  // On disk: the OLD account's quota with a fresh checkedAt.
+  await setSidebarState(
+    make({
+      main: { ...main(quota(10, now)), mainAccountId: 'account-old' },
+      fallbacks: [
+        fb({ id: 'fallback-1', accountId: 'fb-old', quota: quota(20, now) }),
+      ],
+    }),
+    file,
+  )
+
+  // Incoming: the re-logged-in process has no quota yet (null) but a NEW
+  // identity. The existing quota is fresher so it wins the merge — the
+  // identity must follow it rather than be overwritten with the new
+  // account's id, or a reader would judge the new account by the old
+  // account's quota.
+  await setSidebarMachineState(
+    {
+      main: { ...main(null), mainAccountId: 'account-new' },
+      fallbacks: [fb({ id: 'fallback-1', accountId: 'fb-new', quota: null })],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(10)
+  expect(written.main.mainAccountId).toBe('account-old')
+  expect(written.fallbacks[0]?.quota?.primary?.usedPercent).toBe(20)
+  expect(written.fallbacks[0]?.accountId).toBe('fb-old')
+})
+
+test('machine write carries the incoming identity when the incoming quota wins the merge', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-take-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk: stale quota under the OLD identity.
+  await setSidebarState(
+    make({
+      main: { ...main(quota(10, stale)), mainAccountId: 'account-old' },
+    }),
+    file,
+  )
+
+  // Incoming: a fresher snapshot under the NEW identity wins the merge, and
+  // the identity follows it.
+  await setSidebarMachineState(
+    {
+      main: { ...main(quota(50, now)), mainAccountId: 'account-new' },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(50)
+  expect(written.main.mainAccountId).toBe('account-new')
+})
+
+test('concurrent machine writes under different identities never pair an identity with the wrong quota', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-race-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // Two writers race an account switch: whichever quota wins the freshness
+  // merge, its OWN identity must win with it — the new identity can never
+  // be paired with the old quota.
+  await setSidebarState(
+    make({
+      main: { ...main(quota(10, stale)), mainAccountId: 'account-a' },
+    }),
+    file,
+  )
+
+  // Writer B lands a FRESHER snapshot — B's quota and B's identity win.
+  await setSidebarMachineState(
+    {
+      main: { ...main(quota(60, now)), mainAccountId: 'account-b' },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+  let written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(60)
+  expect(written.main.mainAccountId).toBe('account-b')
+
+  // A stale write from A arrives afterwards — it cannot resurrect A's quota
+  // over B's fresher snapshot, and cannot attach A's identity to B's quota.
+  await setSidebarMachineState(
+    {
+      main: { ...main(quota(10, stale)), mainAccountId: 'account-a' },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 2,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+  written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(60)
+  expect(written.main.mainAccountId).toBe('account-b')
+})
+
+test('machine writes select quota freshness independently per account', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-mixed-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  await setSidebarState(
+    make({
+      fallbacks: [
+        fb({ id: 'fallback-a', quota: quota(10, stale) }),
+        fb({ id: 'fallback-b', quota: quota(20, now) }),
+      ],
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [
+        fb({ id: 'fallback-a', quota: quota(30, now) }),
+        fb({ id: 'fallback-b', quota: quota(40, stale) }),
+      ],
+      route: 'fallback-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(
+    written.fallbacks.find((row) => row.id === 'fallback-a')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(30)
+  expect(
+    written.fallbacks.find((row) => row.id === 'fallback-b')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(20)
+})
+
+test('valid checkedAt beats missing or invalid values while incoming wins ties without timestamps', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-invalid-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const invalidQuota = {
+    primary: {
+      usedPercent: 90,
+      remainingPercent: 10,
+      checkedAt: 'not-a-number',
+    },
+  } as unknown as AccountQuota
+  await setSidebarState(
+    make({
+      main: main(quota(10, now)),
+      fallbacks: [
+        fb({ id: 'incoming-valid', quota: invalidQuota }),
+        fb({ id: 'disk-valid', quota: quota(20, now) }),
+        fb({ id: 'both-missing', quota: quota(30) }),
+      ],
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [
+        fb({ id: 'incoming-valid', quota: quota(40, now) }),
+        fb({ id: 'disk-valid', quota: invalidQuota }),
+        fb({ id: 'both-missing', quota: quota(50) }),
+      ],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(10)
+  expect(
+    written.fallbacks.find((row) => row.id === 'incoming-valid')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(40)
+  expect(
+    written.fallbacks.find((row) => row.id === 'disk-valid')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(20)
+  expect(
+    written.fallbacks.find((row) => row.id === 'both-missing')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(50)
+})
+
 test('headerless request compatibility write does not create a session entry', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-legacy-'))
   const file = join(tempDir, 'sidebar-state.json')
@@ -1363,4 +2876,519 @@ test('machine refresh cannot replace request-authored legacy active id', async (
   expect(written.activeId).toBe('fallback-1')
   expect(written.route).toBe('main-first')
   expect(written.main.resetCredits).toBe(4)
+})
+
+describe('isQuotaExhausted / exhaustedQuotaResetAt', () => {
+  const now = 1_750_000_000_000
+  const future = new Date(now + 3600_000).toISOString()
+  const laterFuture = new Date(now + 7200_000).toISOString()
+  const past = new Date(now - 3600_000).toISOString()
+
+  const windowAt = (
+    usedPercent: number,
+    resetsAt?: string,
+  ): AccountQuota['primary'] => ({
+    usedPercent,
+    remainingPercent: 100 - usedPercent,
+    ...(resetsAt === undefined ? {} : { resetsAt }),
+  })
+
+  test('null, undefined, and empty quotas are never exhausted', () => {
+    expect(isQuotaExhausted(null, now)).toBe(false)
+    expect(isQuotaExhausted(undefined, now)).toBe(false)
+    expect(isQuotaExhausted({}, now)).toBe(false)
+    expect(exhaustedQuotaResetAt(null, now)).toBeUndefined()
+  })
+
+  test('a primary window at 100% with a future reset is exhausted', () => {
+    const quota: AccountQuota = { primary: windowAt(100, future) }
+    expect(isQuotaExhausted(quota, now)).toBe(true)
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: future,
+      resetAtMs: Date.parse(future),
+    })
+  })
+
+  test('an exhausted SECONDARY window alone exhausts the account', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(20, future),
+      secondary: windowAt(100, laterFuture),
+    }
+    expect(isQuotaExhausted(quota, now)).toBe(true)
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: laterFuture,
+      resetAtMs: Date.parse(laterFuture),
+    })
+  })
+
+  test('with both windows exhausted, the earliest future reset wins', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(100, laterFuture),
+      secondary: windowAt(100, future),
+    }
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: future,
+      resetAtMs: Date.parse(future),
+    })
+  })
+
+  test.each([
+    ['usage below 100%', { primary: windowAt(99, future) }],
+    ['missing reset', { primary: windowAt(100) }],
+    ['malformed reset', { primary: windowAt(100, 'not-a-date') }],
+    ['reset already past', { primary: windowAt(100, past) }],
+    [
+      'malformed usage',
+      {
+        primary: {
+          usedPercent: Number.NaN,
+          remainingPercent: 0,
+          resetsAt: future,
+        },
+      },
+    ],
+  ])('fails open on %s', (_label, quota) => {
+    expect(isQuotaExhausted(quota, now)).toBe(false)
+    expect(exhaustedQuotaResetAt(quota, now)).toBeUndefined()
+  })
+
+  test('an absent window is not applicable, not unknown', () => {
+    // Only secondary present and healthy — no primary to judge.
+    const quota: AccountQuota = { secondary: windowAt(30, future) }
+    expect(isQuotaExhausted(quota, now)).toBe(false)
+  })
+})
+test('machine write ranks a fresh secondary window above an older incoming primary', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-secondary-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk the primary window is retired (absent) but the secondary window is
+  // fresh; the incoming primary is older than that secondary. The merge must rank
+  // the disk's fresh secondary above the incoming primary and keep the disk quota,
+  // not discard it just because its primary slot is null.
+  await setSidebarState(
+    make({
+      main: {
+        ...main(null),
+        quota: {
+          secondary: { usedPercent: 25, remainingPercent: 75, checkedAt: now },
+        },
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main(null),
+        quota: {
+          primary: { usedPercent: 80, remainingPercent: 20, checkedAt: stale },
+        },
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.secondary?.usedPercent).toBe(25)
+  expect(written.main.quota?.primary).toBeUndefined()
+})
+
+test('machine write merges each quota window independently when the account identity matches', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-window-merge-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk: a stale primary but a fresh secondary, under identity "acct-x".
+  await setSidebarState(
+    make({
+      main: {
+        ...main(null),
+        mainAccountId: 'acct-x',
+        quota: {
+          primary: { usedPercent: 11, remainingPercent: 89, checkedAt: stale },
+          secondary: { usedPercent: 22, remainingPercent: 78, checkedAt: now },
+        },
+      },
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          accountId: 'fb-x',
+          quota: {
+            primary: {
+              usedPercent: 33,
+              remainingPercent: 67,
+              checkedAt: stale,
+            },
+            secondary: {
+              usedPercent: 44,
+              remainingPercent: 56,
+              checkedAt: now,
+            },
+          },
+        }),
+      ],
+    }),
+    file,
+  )
+
+  // Incoming: a fresh primary but a stale secondary, same identities. A
+  // whole-snapshot pick would drop one side's fresher window; the merge must
+  // keep the freshest primary AND the freshest secondary independently.
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main(null),
+        mainAccountId: 'acct-x',
+        quota: {
+          primary: { usedPercent: 55, remainingPercent: 45, checkedAt: now },
+          secondary: {
+            usedPercent: 66,
+            remainingPercent: 34,
+            checkedAt: stale,
+          },
+        },
+      },
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          accountId: 'fb-x',
+          quota: {
+            primary: { usedPercent: 77, remainingPercent: 23, checkedAt: now },
+            secondary: {
+              usedPercent: 88,
+              remainingPercent: 12,
+              checkedAt: stale,
+            },
+          },
+        }),
+      ],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // Main: primary from the incoming side (fresh), secondary from disk (fresh).
+  expect(written.main.quota?.primary).toMatchObject({
+    usedPercent: 55,
+    checkedAt: now,
+  })
+  expect(written.main.quota?.secondary).toMatchObject({
+    usedPercent: 22,
+    checkedAt: now,
+  })
+  expect(written.main.mainAccountId).toBe('acct-x')
+  // Fallback: the same per-window merge applies.
+  const fb1 = written.fallbacks.find((row) => row.id === 'fallback-1')
+  expect(fb1?.quota?.primary).toMatchObject({ usedPercent: 77, checkedAt: now })
+  expect(fb1?.quota?.secondary).toMatchObject({
+    usedPercent: 44,
+    checkedAt: now,
+  })
+  expect(fb1?.accountId).toBe('fb-x')
+})
+
+test("machine write keeps A's newer secondary when a concurrent normal write carries crossed timestamps (per-window merge fires on identity match)", async () => {
+  // A writes a snapshot with BOTH windows via the NORMAL writer path
+  // (buildSidebarMachineState → setSidebarMachineState). A's snapshot
+  // checkedAt is T2 (newer) and A's windows carry no per-window stamps —
+  // mirroring files written by code that only stamped the snapshot-level
+  // checkedAt. B then writes a snapshot via the SAME normal writer path
+  // with BOTH windows stamped at T1 < T2, under the same account identity
+  // so per-window merge fires.
+  //
+  // Under OLD code the per-window comparison falls back to "incoming wins"
+  // when both stamps are undefined, so B's older windows clobber A's newer
+  // secondary. Under the fix the per-window freshness comparison falls back
+  // to each side's snapshot stamp (A: T2, B: T1), so A's secondary is kept.
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-crossed-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const { QuotaManager } = await import('../core/quota-manager.ts')
+  const T2 = 1_700_000_000_000 // newer — A's snapshot
+  const T1 = T2 - 5_000 // older — B's snapshot
+
+  const qmA = new QuotaManager({ storage: null })
+  // Cast to bypass the required-checkedAt type so A's windows reach the
+  // file without per-window stamps — the same shape an old writer would
+  // produce.
+  qmA.setMain(
+    'token-a',
+    {
+      quota: {
+        primary: { usedPercent: 50, remainingPercent: 50 } as never,
+        secondary: { usedPercent: 30, remainingPercent: 70 } as never,
+      },
+      refreshAfter: T2 + 60_000,
+      checkedAt: T2,
+    },
+    'acct-x',
+    true,
+  )
+
+  const storeA: AccountStorage = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  }
+  await setSidebarMachineState(buildSidebarMachineState(qmA, storeA, T2), file)
+  await drainSidebarWrites()
+
+  const qmB = new QuotaManager({ storage: null })
+  qmB.setMain(
+    'token-b',
+    {
+      quota: {
+        primary: {
+          usedPercent: 60,
+          remainingPercent: 40,
+          checkedAt: T1,
+        },
+        secondary: {
+          usedPercent: 70,
+          remainingPercent: 30,
+          checkedAt: T1,
+        },
+      },
+      refreshAfter: T1 + 60_000,
+      checkedAt: T1,
+    },
+    'acct-x',
+    true,
+  )
+
+  const storeB: AccountStorage = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  }
+  await setSidebarMachineState(buildSidebarMachineState(qmB, storeB, T1), file)
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // A's primary: A's snapshot T2 > B's primary stamp T1 → A wins.
+  expect(written.main.quota?.primary?.usedPercent).toBe(50)
+  // A's secondary: A's snapshot T2 > B's secondary stamp T1 → A wins,
+  // even though A's window itself carried no stamp. The per-window merge
+  // must fall back to the enclosing snapshot's checkedAt for freshness,
+  // not blindly hand the slot to whoever happened to write last.
+  expect(written.main.quota?.secondary?.usedPercent).toBe(30)
+  expect(written.main.mainAccountId).toBe('acct-x')
+})
+
+test('read-side snapshot fallback keeps pre-fix unstamped windows alive against crossed per-window stamps', async () => {
+  // Seed the file directly with old-shape content — both windows present, NO
+  // per-window stamps, only snapshot-level checkedAt. This mirrors a file
+  // written by a pre-fix build that never propagated the entry timestamp onto
+  // each window. The read-side fallback (finiteWindowCheckedAt) must supply A's
+  // snapshot checkedAt as the freshness signal when a window itself carries no
+  // usable stamp, so A's unstamped windows are not blindly replaced by an
+  // incoming write.
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-oldshape-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const T2 = 1_700_000_000_000 // A's snapshot timestamp (newer)
+  const T1 = T2 - 5_000 // B's entry timestamp (older than A's snapshot)
+  const T3 = T2 + 5_000 // B's secondary per-window stamp (newer than A's snapshot)
+
+  // A: old-shape file on disk — both windows present, no per-window checkedAt,
+  // only the snapshot-level checkedAt.
+  writeFileSync(
+    file,
+    JSON.stringify({
+      main: {
+        quota: {
+          checkedAt: T2,
+          primary: { usedPercent: 50, remainingPercent: 50 },
+          secondary: { usedPercent: 30, remainingPercent: 70 },
+        },
+        mainAccountId: 'acct-x',
+        killed: false,
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: T2,
+    }),
+    'utf8',
+  )
+
+  // B: incoming write via the normal path (buildSidebarMachineState →
+  // setSidebarMachineState), same account identity so per-window merge fires.
+  // B carries crossed per-window stamps: primary at T1 (older than A's
+  // snapshot), secondary at T3 (newer).
+  const { QuotaManager: QM } = await import('../core/quota-manager.ts')
+  const qmB = new QM({ storage: null })
+  qmB.setMain(
+    'token-b',
+    {
+      quota: {
+        primary: { usedPercent: 60, remainingPercent: 40, checkedAt: T1 },
+        secondary: { usedPercent: 20, remainingPercent: 80, checkedAt: T3 },
+      } as never,
+      refreshAfter: T1 + 60_000,
+      checkedAt: T1,
+    },
+    'acct-x',
+    true,
+  )
+
+  const storeB: AccountStorage = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  }
+  await setSidebarMachineState(buildSidebarMachineState(qmB, storeB, T1), file)
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // A's primary: A's snapshot T2 (fallback) > B's primary T1 → A wins.
+  expect(written.main.quota?.primary?.usedPercent).toBe(50)
+  // A's secondary: A's snapshot T2 (fallback) < B's secondary T3 → B wins.
+  expect(written.main.quota?.secondary?.usedPercent).toBe(20)
+  // Both windows survive the merge — neither slot is dropped.
+  expect(written.main.quota?.primary).toBeDefined()
+  expect(written.main.quota?.secondary).toBeDefined()
+  expect(written.main.mainAccountId).toBe('acct-x')
+})
+
+test('write-side stamping prevents snapshot-max freshness inflation in multi-generation merges', async () => {
+  // After mergeQuotaByWindow writes a file, the snapshot checkedAt is the max
+  // across both windows (line 652). If a winning window lands on disk WITHOUT
+  // a per-window stamp — because write-side stamping was not applied — and
+  // the OTHER window carries a fresher stamp, the unstamped window inherits
+  // that fresher stamp as its freshness on the NEXT read via the read-side
+  // fallback. An incoming write genuinely fresher than the unstamped window
+  // but older than the inflated max then loses a merge it should win.
+  //
+  // This is a gen-3 effect: merge #1 puts an unstamped window on disk next
+  // to a stamped one; merge #2 reads the inflated snapshot back and makes a
+  // wrong comparison. The test constructs the post-merge-#1 disk state
+  // directly — the state that WOULD exist if stampWindowCheckedAt were
+  // reverted during merge #1.
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-inflate-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  // True freshness of the unstamped window (when it was actually fetched).
+  const T2 = 1_700_000_000_000
+  // Incoming timestamp for merge #2 — genuinely fresher than T2,
+  // but older than the inflated snapshot max T3.
+  const T2_5 = T2 + 5_000
+  // Snapshot max from the OTHER window's stamp — the inflated value.
+  const T3 = T2 + 10_000
+
+  // --- Inflated disk state (simulates merge #1 with write-side reverted) ---
+  // primary: stamped T3 from a prior merge. secondary: unstamped — it won
+  // merge #1 from an incoming side that carried no per-window stamp.
+  // Snapshot checkedAt = max(T3, undefined) = T3 via line 659.
+  writeFileSync(
+    file,
+    JSON.stringify({
+      main: {
+        quota: {
+          checkedAt: T3,
+          primary: { usedPercent: 60, remainingPercent: 40, checkedAt: T3 },
+          secondary: { usedPercent: 80, remainingPercent: 20 },
+        },
+        mainAccountId: 'acct-x',
+        killed: false,
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: T3,
+    }),
+    'utf8',
+  )
+
+  // Merge #2: incoming at T2_5, both windows stamped.
+  const { QuotaManager: QM } = await import('../core/quota-manager.ts')
+  const qm = new QM({ storage: null })
+  qm.setMain(
+    'token',
+    {
+      quota: {
+        primary: { usedPercent: 70, remainingPercent: 30, checkedAt: T2_5 },
+        secondary: { usedPercent: 10, remainingPercent: 90, checkedAt: T2_5 },
+      } as never,
+      refreshAfter: T2_5 + 60_000,
+      checkedAt: T2_5,
+    },
+    'acct-x',
+    true,
+  )
+
+  const store = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  } as AccountStorage
+
+  await setSidebarMachineState(buildSidebarMachineState(qm, store, T2_5), file)
+  await drainSidebarWrites()
+
+  const inflated = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // Primary: existing T3 > incoming T2_5 → existing wins.
+  expect(inflated.main.quota?.primary?.usedPercent).toBe(60)
+  // Secondary: existing is UNSTAMPED, falls back to snapshot T3.
+  // T3 > incoming T2_5 → existing wins through INFLATED freshness.
+  // The CORRECT outcome (if the window carried its true stamp T2):
+  // T2_5 > T2 → incoming should win (secondary.usedPercent = 10).
+  expect(inflated.main.quota?.secondary?.usedPercent).toBe(80)
+
+  // --- Correct disk state (simulates merge #1 with write-side ACTIVE) ---
+  // Same data, but secondary carries its own stamp at true freshness T2.
+  writeFileSync(
+    file,
+    JSON.stringify({
+      main: {
+        quota: {
+          checkedAt: T3,
+          primary: { usedPercent: 60, remainingPercent: 40, checkedAt: T3 },
+          secondary: { usedPercent: 80, remainingPercent: 20, checkedAt: T2 },
+        },
+        mainAccountId: 'acct-x',
+        killed: false,
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: T3,
+    }),
+    'utf8',
+  )
+
+  const qm2 = new QM({ storage: null })
+  qm2.setMain(
+    'token2',
+    {
+      quota: {
+        primary: { usedPercent: 70, remainingPercent: 30, checkedAt: T2_5 },
+        secondary: { usedPercent: 10, remainingPercent: 90, checkedAt: T2_5 },
+      } as never,
+      refreshAfter: T2_5 + 60_000,
+      checkedAt: T2_5,
+    },
+    'acct-x',
+    true,
+  )
+
+  await setSidebarMachineState(buildSidebarMachineState(qm2, store, T2_5), file)
+  await drainSidebarWrites()
+
+  const correct = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(correct.main.quota?.primary?.usedPercent).toBe(60)
+  // Secondary: existing T2 < incoming T2_5 → incoming wins. CORRECT.
+  expect(correct.main.quota?.secondary?.usedPercent).toBe(10)
 })
