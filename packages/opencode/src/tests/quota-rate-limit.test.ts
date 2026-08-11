@@ -304,6 +304,119 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(true)
   })
 
+  it('setFallback clears a mark on a genuine fallback-account re-login', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_650_000
+    const fallbackId = 'fallback-1'
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+    const exhaustedEntry = {
+      quota: {
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
+      },
+      refreshAfter: now + 60_000,
+      checkedAt: now,
+    }
+
+    qm.setFallback(fallbackId, exhaustedEntry, 'token-a', false, 'acct-A')
+    qm.markRateLimited(fallbackId, now + 60_000)
+
+    // A different known identity is a re-login, not a routine quota push.
+    qm.setFallback(fallbackId, exhaustedEntry, 'token-b', false, 'acct-B')
+
+    expect(qm.isRateLimited(fallbackId)).toBe(false)
+  })
+
+  it('setFallback does NOT clear a mark when a quota push has the same identity', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_660_000
+    const fallbackId = 'fallback-1'
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+    const exhaustedEntry = {
+      quota: {
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
+      },
+      refreshAfter: now + 60_000,
+      checkedAt: now,
+    }
+
+    qm.setFallback(fallbackId, exhaustedEntry, 'token-a', false, 'acct-A')
+    qm.markRateLimited(fallbackId, now + 60_000)
+    qm.setFallback(
+      fallbackId,
+      exhaustedEntry,
+      'refreshed-token-a',
+      false,
+      'acct-A',
+    )
+
+    expect(qm.isRateLimited(fallbackId)).toBe(true)
+  })
+
+  it('setFallback preserves a mark and prior binding when the incoming identity is unknown', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_670_000
+    const fallbackId = 'fallback-1'
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+    const exhaustedEntry = {
+      quota: {
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
+      },
+      refreshAfter: now + 60_000,
+      checkedAt: now,
+    }
+
+    qm.setFallback(fallbackId, exhaustedEntry, 'token-a', false, 'acct-A')
+    qm.markRateLimited(fallbackId, now + 60_000)
+    qm.setFallback(fallbackId, exhaustedEntry, 'refreshed-token-a')
+
+    expect(qm.isRateLimited(fallbackId)).toBe(true)
+    expect(qm.peekFallbackForPolicy(fallbackId, 'acct-A')).not.toBeNull()
+    expect(qm.peekFallbackForPolicy(fallbackId, 'acct-B')).toBeNull()
+  })
+
+  it('setFallback preserves a mark on first identity binding', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_680_000
+    const fallbackId = 'fallback-1'
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+    const exhaustedEntry = {
+      quota: {
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
+      },
+      refreshAfter: now + 60_000,
+      checkedAt: now,
+    }
+
+    qm.markRateLimited(fallbackId, now + 60_000)
+    qm.setFallback(fallbackId, exhaustedEntry, 'token-a', false, 'acct-A')
+
+    expect(qm.isRateLimited(fallbackId)).toBe(true)
+  })
+
   it('refreshMain clears a stale main mark once a healthy quota poll lands (bypasses setMain)', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const now = 4_700_000

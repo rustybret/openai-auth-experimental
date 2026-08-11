@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -63,7 +63,7 @@
   "dependencies": {
     "@opentui/core": ">=0.4.5",
     "@opentui/solid": ">=0.4.5",
-    "ai": "^7.0.34",
+    "ai": "^7.0.48",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
   }

@@ -1,8 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { flushForTest } from '../logger'
 import {
   drainNotifications,
   pushNotification,
@@ -21,13 +31,17 @@ afterEach(async () => {
 })
 
 describe('rpc-server', () => {
-  test('health is open; pending-notifications requires bearer and drains', async () => {
+  test('apply callback receives sessionId unchanged; health is open and pending-notifications drains', async () => {
     resetNotificationsForTest()
     dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    let receivedApply: unknown
     const server = await startRpcServer({
       dir,
       drain: drainNotifications,
-      apply: async () => ({ text: 'ok', knobs: {} }),
+      apply: async (request) => {
+        receivedApply = request
+        return { text: 'ok', knobs: {} }
+      },
     })
     stop = server.stop
     const base = `http://127.0.0.1:${server.port}`
@@ -69,10 +83,19 @@ describe('rpc-server', () => {
         'content-type': 'application/json',
         authorization: `Bearer ${server.token}`,
       },
-      body: JSON.stringify({ command: 'openai-quota', arguments: '' }),
+      body: JSON.stringify({
+        command: 'openai-routing',
+        arguments: 'reset',
+        sessionId: 'session-a',
+      }),
     })
     expect(applyOk.status).toBe(200)
     expect(await applyOk.json()).toEqual({ text: 'ok', knobs: {} })
+    expect(receivedApply).toEqual({
+      command: 'openai-routing',
+      arguments: 'reset',
+      sessionId: 'session-a',
+    })
   })
 
   test('rejects body exceeding 1 MB byte limit', async () => {
@@ -180,5 +203,92 @@ describe('rpc-server', () => {
     })
 
     await expect(reqPromise).resolves.toBeUndefined()
+  })
+
+  test('starts when the state sweep fails', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    const badSweepRoot = join(dir, 'not-a-directory')
+    const logFile = join(dir, 'rpc.log')
+    const savedLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+
+    try {
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+      await writeFile(badSweepRoot, 'x', 'utf8')
+      const server = await startRpcServer({
+        dir: join(dir, 'rpc'),
+        sweepRoot: badSweepRoot,
+        drain: drainNotifications,
+        apply: async () => ({ text: 'ok', knobs: {} }),
+      })
+      stop = server.stop
+
+      expect(
+        (await fetch(`http://127.0.0.1:${server.port}/health`)).status,
+      ).toBe(200)
+      await flushForTest()
+      const log = await readFile(logFile, 'utf8')
+      expect(log).toContain('WARN [rpc] rpc state sweep failed')
+      expect(log).toContain(`"pid":${process.pid}`)
+    } finally {
+      if (savedLogFile === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
+      }
+    }
+  })
+
+  test('startup sweeps stale project state outside the active directory', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    const root = join(dir, 'state')
+    const staleDir = join(root, 'openai-auth-deadbeefdeadbeef')
+    await mkdir(staleDir, { recursive: true })
+    await writeFile(
+      join(staleDir, 'port-99999999.json'),
+      JSON.stringify({ port: 1, token: 'dead', pid: 99999999, startedAt: 1 }),
+      { encoding: 'utf8', mode: 0o600 },
+    )
+
+    const server = await startRpcServer({
+      dir: join(root, 'openai-auth-cafebabecafebabe'),
+      sweepRoot: root,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = server.stop
+
+    expect(await readdir(root)).toEqual(['openai-auth-cafebabecafebabe'])
+  })
+
+  test('creates a managed RPC directory with 0700 permissions', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    const managedDir = join(dir, 'managed', 'rpc')
+    await mkdir(managedDir, { recursive: true, mode: 0o755 })
+    await chmod(managedDir, 0o755)
+
+    const server = await startRpcServer({
+      dir: managedDir,
+      secureDir: true,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = server.stop
+
+    expect((await stat(managedDir)).mode & 0o777).toBe(0o700)
+  })
+
+  test('does not chmod a foreign RPC override directory', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    await chmod(dir, 0o755)
+
+    const server = await startRpcServer({
+      dir,
+      secureDir: false,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+    })
+    stop = server.stop
+
+    expect((await stat(dir)).mode & 0o777).toBe(0o755)
   })
 })
