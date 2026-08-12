@@ -819,6 +819,101 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('keeps rotating turn_id per user turn after a session falls back to HTTP', async () => {
+    // prepareCodexRequest skips HTTP turn rotation whenever the request was
+    // prepared for the WebSocket, leaving it to the pool. Once a session is
+    // stuck in fallback the pool used to hand the request straight to
+    // httpFetch, so nothing rotated and the session sent one frozen turn_id
+    // for the rest of its life — a cross-turn cache bust on every later turn.
+    const turnIds: Array<string | undefined> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 400,
+              error: {
+                code: 'websocket_connection_limit_reached',
+                message: 'Responses websocket connection limit reached',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const httpFetch: typeof globalThis.fetch = Object.assign(
+          async (_input: RequestInfo | URL, init?: RequestInit) => {
+            const header = new Headers(init?.headers).get(
+              'x-codex-turn-metadata',
+            )
+            turnIds.push(
+              header
+                ? (JSON.parse(header) as { turn_id?: string }).turn_id
+                : undefined,
+            )
+            return new Response('http')
+          },
+          { preconnect: () => {} },
+        )
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch,
+          firstEventGraceMs: 1,
+        })
+        const turn = (input: unknown[]) => ({
+          method: 'POST',
+          headers: {
+            'session-id': 'sess-frozen-turn',
+            'x-codex-turn-metadata': JSON.stringify({
+              session_id: 'thread-1',
+              thread_id: 'thread-1',
+              thread_source: 'user',
+              turn_id: 'initial-turn',
+              turn_started_at_unix_ms: 1,
+              request_kind: 'turn',
+              window_id: 'window-1',
+            }),
+          },
+          body: JSON.stringify({ stream: true, input }),
+        })
+
+        // Turn 1 trips the connection limit and pins the session to HTTP.
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn([
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+          ]),
+        )
+        // A tool continuation inside the SAME turn must not rotate.
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn([
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+          ]),
+        )
+        // A genuinely new user turn must rotate.
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn([
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+            { role: 'user', content: [{ type: 'input_text', text: 'two' }] },
+          ]),
+        )
+
+        expect(turnIds).toHaveLength(3)
+        // The stale inbound turn_id never survives to the wire.
+        expect(turnIds).not.toContain('initial-turn')
+        // Tool continuation reuses the turn; the new user turn mints a new one.
+        expect(turnIds[1]).toBe(turnIds[0])
+        expect(turnIds[2]).not.toBe(turnIds[0])
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('sanitizes websocket-shaped requests before HTTP fallback', async () => {
     let fallbackInit: RequestInit | undefined
     await withFakeWebSocket(
@@ -1030,6 +1125,220 @@ describe('createWebSocketFetch', () => {
         expect(sent[3]).toMatchObject({ generate: false, input: [] })
         expect(sent[4]?.previous_response_id).toBe('resp_prewarm_4')
         expect(sent[4]?.input).toHaveLength(5)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('reuses the socket and its continuation chain across a same-account token refresh', async () => {
+    // An OAuth refresh changes the bearer on a routine cadence. If the pool key
+    // includes the token, the next turn lands on a different key, gets a cold
+    // socket, and loses the previous_response_id chain (continuation is
+    // connection scoped) — a full prompt-cache bust for an event that is not a
+    // account change at all. Same ChatGPT identity must mean the same socket.
+    const sent: Array<Record<string, unknown>> = []
+    let sockets = 0
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        return {
+          send(data) {
+            const parsed = JSON.parse(data) as Record<string, unknown>
+            sent.push(parsed)
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id:
+                    parsed.generate === false
+                      ? `resp_prewarm_${sent.length}`
+                      : `resp_main_${sent.length}`,
+                },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const turn = (token: string, body: Record<string, unknown>) => ({
+          method: 'POST',
+          headers: {
+            'session-id': 'sess-refresh',
+            authorization: `Bearer ${token}`,
+            'chatgpt-account-id': 'chatgpt-stable-same',
+            'x-openai-auth-quota-account': 'main',
+          },
+          body: JSON.stringify({ stream: true, ...body }),
+        })
+
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('tok-before-refresh', {
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            ],
+          }),
+        )
+        // Same account, refreshed bearer.
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('tok-after-refresh', {
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+            ],
+          }),
+        )
+
+        // One socket across both turns: the refresh did not re-key the pool.
+        expect(sockets).toBe(1)
+        // Exactly one prewarm (the cold start). A re-key would prewarm again.
+        expect(sent.filter((body) => body.generate === false)).toHaveLength(1)
+        // The chain survived: the post-refresh turn continues from the prior
+        // response rather than replaying the whole conversation cold.
+        expect(sent[2]?.previous_response_id).toBe('resp_main_2')
+        expect(sent[2]?.input).toEqual([
+          { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+        ])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('never reuses a socket across two ChatGPT identities on the same session', async () => {
+    // The isolation the token hash used to provide must survive keying on
+    // identity: two different accounts sharing one session must never share a
+    // socket, or one account's codex.rate_limits frames and continuation chain
+    // leak into the other.
+    const sent: Array<Record<string, unknown>> = []
+    let sockets = 0
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        return {
+          send(data) {
+            const parsed = JSON.parse(data) as Record<string, unknown>
+            sent.push(parsed)
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id:
+                    parsed.generate === false
+                      ? `resp_prewarm_${sent.length}`
+                      : `resp_main_${sent.length}`,
+                },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const turn = (accountId: string) => ({
+          method: 'POST',
+          headers: {
+            'session-id': 'sess-switch',
+            authorization: 'Bearer tok-shared',
+            'chatgpt-account-id': accountId,
+            // Both are the primary account at their turn, so the internal quota
+            // key is 'main' for both. It therefore cannot be an isolation key.
+            'x-openai-auth-quota-account': 'main',
+          },
+          body: JSON.stringify({
+            stream: true,
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+            ],
+          }),
+        })
+
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('chatgpt-account-a'),
+        )
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('chatgpt-account-b'),
+        )
+
+        // A fresh socket per identity, each with its own cold-start prewarm.
+        expect(sockets).toBe(2)
+        expect(sent.filter((body) => body.generate === false)).toHaveLength(2)
+        // Account B never inherits A's chain.
+        expect(sent[3]?.previous_response_id).toBe('resp_prewarm_3')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('isolates two identity-less accounts that share the internal quota key', async () => {
+    // Guards the fallback branch specifically. The internal quota key is the
+    // literal 'main' for whichever account is primary, so it cannot stand in
+    // for identity: keying on it would let a re-login to a different account
+    // inherit the previous account's socket. With no wire identity present,
+    // the bearer token is the only thing separating these two, and it must
+    // still do so.
+    const sent: Array<Record<string, unknown>> = []
+    let sockets = 0
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        return {
+          send(data) {
+            const parsed = JSON.parse(data) as Record<string, unknown>
+            sent.push(parsed)
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id:
+                    parsed.generate === false
+                      ? `resp_prewarm_${sent.length}`
+                      : `resp_main_${sent.length}`,
+                },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const turn = (token: string) => ({
+          method: 'POST',
+          headers: {
+            'session-id': 'sess-no-identity',
+            authorization: `Bearer ${token}`,
+            // No chatgpt-account-id on the wire.
+            'x-openai-auth-quota-account': 'main',
+          },
+          body: JSON.stringify({
+            stream: true,
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+            ],
+          }),
+        })
+
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('tok-account-a'),
+        )
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          turn('tok-account-b'),
+        )
+
+        expect(sockets).toBe(2)
+        expect(sent.filter((body) => body.generate === false)).toHaveLength(2)
+        expect(sent[3]?.previous_response_id).toBe('resp_prewarm_3')
         websocketFetch.close()
       },
     )

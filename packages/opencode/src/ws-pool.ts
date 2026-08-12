@@ -90,32 +90,37 @@ const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = 'websocket_connection_limit_reached'
 
 /**
- * Derive a short, stable per-account discriminator from the request's
- * authorization header (Bearer token) and optional chatgpt-account-id.
+ * Derive a short, stable per-account discriminator for the pool key.
  *
- * Including the account identity in the pool key ensures that a socket is
- * NEVER reused across accounts: an account switch mid-session produces a
- * different key → fresh socket → no cross-account codex.rate_limits frame
- * leakage, and continuation chaining (previous_response_id, per-socket)
- * correctly restarts on switch.
+ * Prefer the ChatGPT account identity: it survives an OAuth token refresh, so
+ * a refresh no longer changes the key. That matters because a changed key
+ * hands the next turn a cold socket, and continuation state is connection
+ * scoped (see `invalidate`), so the whole `previous_response_id` chain is lost
+ * and the prompt cache goes cold on an event that happens on a routine
+ * refresh cadence.
  *
- * Same account + same session → same key → socket reuse preserved.
+ * Fall back to the bearer token only when the wire identity is absent. Do NOT
+ * fall back to the internal quota key: that value is the literal 'main' for
+ * whichever account is currently primary, so keying on it would let a
+ * re-login to a DIFFERENT ChatGPT account reuse the previous account's
+ * socket — leaking its codex.rate_limits frames and its continuation chain.
+ * The token hash keeps those two accounts apart.
+ *
+ * The two sources are namespaced so a token can never collide with an id.
  */
 function accountDiscriminator(headers: Record<string, string>): string {
+  const accountId =
+    typeof headers['chatgpt-account-id'] === 'string'
+      ? headers['chatgpt-account-id']
+      : ''
   const bearer =
     typeof headers.authorization === 'string' &&
     headers.authorization.startsWith('Bearer ')
       ? headers.authorization.slice('Bearer '.length)
       : ''
-  const accountId =
-    typeof headers['chatgpt-account-id'] === 'string'
-      ? headers['chatgpt-account-id']
-      : ''
+  const source = accountId ? `acct:${accountId}` : `tok:${bearer}`
   // A short hash is sufficient — we only need stable equality, not secrecy.
-  return createHash('sha256')
-    .update(`${bearer}:${accountId}`)
-    .digest('hex')
-    .slice(0, 12)
+  return createHash('sha256').update(source).digest('hex').slice(0, 12)
 }
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
@@ -136,6 +141,43 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     typeof pruneTimer.unref === 'function'
   ) {
     pruneTimer.unref()
+  }
+
+  // Every HTTP exit taken by a request that was prepared for the WebSocket has
+  // to rotate its own turn_id. prepareCodexRequest skips updateHttpTurnMetadata
+  // whenever websocket is true (index.ts), leaving rotation to the pool; if the
+  // pool then hands the request to httpFetch untouched, nothing rotates it and
+  // the session sends one frozen turn_id for the rest of its life, busting the
+  // prompt cache on every later user turn.
+  //
+  // The body's client_metadata copy is already stripped by
+  // sanitizeHttpFallbackBody, so on this path the turn lives in the header
+  // alone. Turn state still advances through the shared primitive, so a session
+  // that falls back mid-conversation keeps counting turns the same way it did
+  // on the socket.
+  function httpFallbackInit(
+    entry: PoolEntry,
+    body: Record<string, unknown> | undefined,
+    httpInit: RequestInit | undefined,
+  ): RequestInit | undefined {
+    if (!body || !httpInit) return httpInit
+    // Normalize first: the socket path records its turn input from the
+    // normalized body, and advanceTurn compares against that record to decide
+    // whether this is a fresh turn. Handing it the raw body would fail that
+    // comparison and mint a spurious turn_id on the very fallback we are here
+    // to keep stable.
+    advanceTurn(entry, normalizeResponseBody(body))
+    const headers = new Headers(httpInit.headers)
+    const existing = headers.get('x-codex-turn-metadata')
+    if (!existing) return httpInit
+    const turnMetadata = rewriteTurnMetadata(
+      existing,
+      entry.turnID,
+      entry.turnStartedAt,
+    )
+    if (!turnMetadata) return httpInit
+    headers.set('x-codex-turn-metadata', turnMetadata)
+    return { ...httpInit, headers }
   }
 
   async function websocketFetch(
@@ -211,10 +253,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pool.set(key, entry)
 
     if (entry.fallback) {
-      return httpFetch(input, httpInit)
+      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
     }
     if (entry.busy) {
-      return httpFetch(input, httpInit)
+      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
     }
 
     entry.busy = true
@@ -370,7 +412,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         })
       }
       if (!entry.fallback) return response
-      return httpFetch(input, httpInit)
+      // advanceTurn is idempotent for a body already applied this send, so the
+      // post-attempt exits re-stamp the header without minting a second turn.
+      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
@@ -401,7 +445,8 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       recordStreamFailure(entry)
       entry.continuation = undefined
       invalidate(entry)
-      if (entry.fallback) return httpFetch(input, httpInit)
+      if (entry.fallback)
+        return httpFetch(input, httpFallbackInit(entry, body, httpInit))
       return failedResponse(
         new ResponseStreamError(
           error instanceof Error ? error.message : String(error),
@@ -592,6 +637,17 @@ async function prewarm(
     onAbort: () => {
       entry.continuation = undefined
     },
+    // The connection limit is a property of the lane, not of this request, so
+    // it will reject the main turn too. Mark the session for HTTP and throw
+    // into the caller's catch: the main WebSocket attempt is never made, and
+    // the request takes a single HTTP fallback instead of wasting a second
+    // doomed round-trip to learn the same thing.
+    onRetryableTerminal: async (event) => {
+      const error = connectionLimitError(event)
+      if (!error) return undefined
+      entry.fallback = true
+      throw error
+    },
   })
   await drain(response)
 }
@@ -766,7 +822,11 @@ function updateContinuation(
 // messages do not look like a fresh turn. We key on a user/developer message — matching the HTTP
 // path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline function_call
 // does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
-export function applyTurnId(
+// Advance the entry's turn state for this send, minting a new turn_id only when a fresh user turn
+// starts. Split from the metadata rewrite because the WebSocket path carries turn metadata in the
+// body's client_metadata while the HTTP-fallback path carries it in a header — both must rotate off
+// the same decision, or a session that falls back mid-conversation freezes its turn_id.
+export function advanceTurn(
   entry: PoolEntry,
   body: Record<string, unknown>,
   fullBody: Record<string, unknown> = body,
@@ -787,30 +847,62 @@ export function applyTurnId(
   }
   entry.turnInput = fullInput.slice()
   entry.turnSignature = fullSignature
+}
+
+// Stabilize turn_id/turn_started_at across a turn's tool-loop, matching Codex. The *sent* input
+// is authoritative on the normal continuation path: a fresh user turn carries a user/developer
+// message; a tool continuation carries only tool *_output items (and possibly an inline,
+// unfinalized function_call kept by the continuation guard) and reuses the active turn_id. When a
+// reconnect forces a full replay, compare against the previous full input so historical user
+// messages do not look like a fresh turn. We key on a user/developer message — matching the HTTP
+// path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline function_call
+// does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
+export function applyTurnId(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  fullBody: Record<string, unknown> = body,
+) {
+  advanceTurn(entry, body, fullBody)
   const cm = body.client_metadata
   if (!isRecord(cm) || typeof cm['x-codex-turn-metadata'] !== 'string')
     return body
-  let meta: unknown
-  try {
-    meta = JSON.parse(cm['x-codex-turn-metadata'])
-  } catch {
-    return body
-  }
-  if (!isRecord(meta)) return body
-  const turnMetadata = JSON.stringify({
-    session_id: meta.session_id,
-    thread_id: meta.thread_id,
-    thread_source: meta.thread_source,
-    turn_id: entry.turnID,
-    sandbox: meta.sandbox,
-    turn_started_at_unix_ms: entry.turnStartedAt,
-    request_kind: 'turn',
-    window_id: meta.window_id,
-  })
+  const turnMetadata = rewriteTurnMetadata(
+    cm['x-codex-turn-metadata'],
+    entry.turnID,
+    entry.turnStartedAt,
+  )
+  if (!turnMetadata) return body
   return {
     ...body,
     client_metadata: { ...cm, 'x-codex-turn-metadata': turnMetadata },
   }
+}
+
+// Re-stamp an existing Codex turn-metadata blob with the entry's current turn.
+// Returns undefined when the blob is absent or unparseable, so callers leave
+// whatever was there untouched rather than inventing a shape.
+function rewriteTurnMetadata(
+  serialized: string,
+  turnID: string | undefined,
+  turnStartedAt: number | undefined,
+): string | undefined {
+  let meta: unknown
+  try {
+    meta = JSON.parse(serialized)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(meta)) return undefined
+  return JSON.stringify({
+    session_id: meta.session_id,
+    thread_id: meta.thread_id,
+    thread_source: meta.thread_source,
+    turn_id: turnID,
+    sandbox: meta.sandbox,
+    turn_started_at_unix_ms: turnStartedAt,
+    request_kind: 'turn',
+    window_id: meta.window_id,
+  })
 }
 
 function matchingInputPrefixLength(prefix: unknown[], input: unknown[]) {
