@@ -10,6 +10,7 @@ const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
   'sidebar-state.ts',
+  'core/account-paths.ts',
   'core/refresh-file-lock.ts',
   'tui-preferences.ts',
   'logger.ts',
@@ -17,6 +18,7 @@ const shippedSourceFiles = [
   'rpc/rpc-dir.ts',
   'rpc/port-file.ts',
   'rpc/protocol.ts',
+  'util/error.ts',
   'util/open-url.ts',
 ] as const
 const runtimeSpecifiers = new Set([

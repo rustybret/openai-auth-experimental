@@ -408,6 +408,46 @@ describe('normalizeSidebarState', () => {
     })
   })
 
+  test('normalizes a malformed sticky wire identity away without dropping the pin', () => {
+    const sessionHash = hashSidebarSessionId('malformed-sticky-identity')
+
+    expect(() =>
+      normalizeSidebarState({
+        ...DEFAULT_SIDEBAR_STATE,
+        stickyAssignments: {
+          [sessionHash]: {
+            accountId: 'fallback-1',
+            wireAccountId: 42,
+            assignedAt: 100,
+            lastSeenAt: 200,
+            inputBytes: 300,
+          },
+        },
+      }),
+    ).not.toThrow()
+    expect(
+      normalizeSidebarState({
+        ...DEFAULT_SIDEBAR_STATE,
+        stickyAssignments: {
+          [sessionHash]: {
+            accountId: 'fallback-1',
+            wireAccountId: 42,
+            assignedAt: 100,
+            lastSeenAt: 200,
+            inputBytes: 300,
+          },
+        },
+      }).stickyAssignments,
+    ).toEqual({
+      [sessionHash]: {
+        accountId: 'fallback-1',
+        assignedAt: 100,
+        lastSeenAt: 200,
+        inputBytes: 300,
+      },
+    })
+  })
+
   test('old files without sticky assignments remain valid', () => {
     expect(
       normalizeSidebarState(DEFAULT_SIDEBAR_STATE).stickyAssignments,
@@ -594,6 +634,274 @@ describe('sticky assignments', () => {
     )
 
     expect(result).toEqual(assignment)
+  })
+
+  test('replaces a pin when its known wire identity changes', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'identity-mismatch-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            wireAccountId: 'chatgpt-a-old',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 128,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+    let chooseCalls = 0
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 256,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+        wireAccountIdByAccount: {
+          'account-a': 'chatgpt-a-new',
+          'account-b': 'chatgpt-b-new',
+        },
+        choose: () => {
+          chooseCalls += 1
+          return { accountId: 'account-b', quotaCheckedAt: 20 }
+        },
+      },
+      file,
+    )
+
+    expect(chooseCalls).toBe(1)
+    expect(result).toEqual({
+      accountId: 'account-b',
+      wireAccountId: 'chatgpt-b-new',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 256,
+      quotaCheckedAt: 20,
+    })
+  })
+
+  test('excludes a mismatched pin from replacement pending bytes while retaining other valid pins', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'identity-mismatch-pending-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            wireAccountId: 'chatgpt-a-old',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+          [hashSidebarSessionId('other-valid-session')]: {
+            accountId: 'account-b',
+            wireAccountId: 'chatgpt-b',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 20,
+            quotaCheckedAt: 20,
+          },
+        },
+      }),
+      file,
+    )
+    let pendingBytes: ReadonlyMap<string, number> | undefined
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 50,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+        wireAccountIdByAccount: {
+          'account-a': 'chatgpt-a-new',
+          'account-b': 'chatgpt-b',
+        },
+        choose: (pending) => {
+          pendingBytes = pending
+          return pending.get('account-a') === undefined &&
+            pending.get('account-b') === 20
+            ? { accountId: 'account-a', quotaCheckedAt: 10 }
+            : { accountId: 'account-b', quotaCheckedAt: 20 }
+        },
+      },
+      file,
+    )
+
+    expect(pendingBytes?.get('account-a')).toBeUndefined()
+    expect(pendingBytes?.get('account-b')).toBe(20)
+    expect(result?.accountId).toBe('account-a')
+  })
+
+  test('keeps a pre-upgrade pin in replacement pending bytes', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'pre-upgrade-pending-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+    let pendingBytes: ReadonlyMap<string, number> | undefined
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 50,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        excludeAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+        wireAccountIdByAccount: { 'account-a': 'chatgpt-a' },
+        choose: (pending) => {
+          pendingBytes = pending
+          return { accountId: 'account-b', quotaCheckedAt: 20 }
+        },
+      },
+      file,
+    )
+
+    expect(pendingBytes?.get('account-a')).toBe(100)
+  })
+
+  test('retains a pre-upgrade pin and stamps its known current wire identity', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'identity-migration-session'
+    const assignment = {
+      accountId: 'account-a',
+      assignedAt: now - 1,
+      lastSeenAt: now,
+      inputBytes: 128,
+      quotaCheckedAt: 10,
+    }
+    await setSidebarState(
+      make({
+        stickyAssignments: { [hashSidebarSessionId(sessionId)]: assignment },
+      }),
+      file,
+    )
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 128,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        wireAccountIdByAccount: { 'account-a': 'chatgpt-a' },
+        choose: () => {
+          throw new Error('choose must not run for a pre-upgrade pin')
+        },
+      },
+      file,
+    )
+
+    expect(result).toEqual({ ...assignment, wireAccountId: 'chatgpt-a' })
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ],
+    ).toEqual({ ...assignment, wireAccountId: 'chatgpt-a' })
+  })
+
+  test('retains a pin when its current wire identity is unknown', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'identity-current-unknown-session'
+    const assignment = {
+      accountId: 'account-a',
+      wireAccountId: 'chatgpt-a',
+      assignedAt: now - 1,
+      lastSeenAt: now,
+      inputBytes: 128,
+      quotaCheckedAt: 10,
+    }
+    await setSidebarState(
+      make({
+        stickyAssignments: { [hashSidebarSessionId(sessionId)]: assignment },
+      }),
+      file,
+    )
+    const before = readFileSync(file, 'utf8')
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 128,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        wireAccountIdByAccount: {},
+        choose: () => {
+          throw new Error(
+            'choose must not run when current identity is unknown',
+          )
+        },
+      },
+      file,
+    )
+
+    expect(result).toEqual(assignment)
+    expect(readFileSync(file, 'utf8')).toBe(before)
+  })
+
+  test('retains a pin when its known wire identity matches without rewrite churn', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-identity-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'identity-match-session'
+    const assignment = {
+      accountId: 'account-a',
+      wireAccountId: 'chatgpt-a',
+      assignedAt: now - 1,
+      lastSeenAt: now,
+      inputBytes: 128,
+      quotaCheckedAt: 10,
+    }
+    await setSidebarState(
+      make({
+        stickyAssignments: { [hashSidebarSessionId(sessionId)]: assignment },
+      }),
+      file,
+    )
+    const before = readFileSync(file, 'utf8')
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 128,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        wireAccountIdByAccount: { 'account-a': 'chatgpt-a' },
+        choose: () => {
+          throw new Error('choose must not run when identities match')
+        },
+      },
+      file,
+    )
+
+    expect(result).toEqual(assignment)
+    expect(readFileSync(file, 'utf8')).toBe(before)
   })
 
   test('replaces excluded, expired, and disabled sticky assignments', async () => {

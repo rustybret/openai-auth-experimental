@@ -70,6 +70,10 @@ export interface RefreshAllQuotaOptions {
   accountKey?: string
 }
 
+export interface RefreshAllQuotaOptions {
+  accountKey?: string
+}
+
 export interface RefreshAllQuotaResult {
   account: string
   ok: boolean
@@ -128,7 +132,6 @@ export async function refreshAllQuota(
     .loadAccounts(deps.configPath)
     .catch(() => undefined)
   const liveMainAccountId = storage?.mainAccountId ?? deps.storageMainAccountId
-
   if (!options.accountKey || options.accountKey === 'main') {
     // --- MAIN ---
     try {

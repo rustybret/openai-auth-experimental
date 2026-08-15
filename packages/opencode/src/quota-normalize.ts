@@ -193,6 +193,7 @@ interface WhamUsageResponse {
   rate_limit: WhamRateLimits
   rate_limit_reset_credits?: {
     available_count?: number
+    applicable_available_count?: number
   } | null
 }
 
@@ -240,6 +241,12 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
   )
   if (resetCreditsAvailable !== undefined) {
     snapshot.resetCreditsAvailable = resetCreditsAvailable
+  }
+  const resetCreditsApplicable = nonNegativeFinite(
+    json.rate_limit_reset_credits?.applicable_available_count,
+  )
+  if (resetCreditsApplicable !== undefined) {
+    snapshot.resetCreditsApplicable = resetCreditsApplicable
   }
   return snapshot
 }

@@ -19,7 +19,9 @@ import {
   OPENAI_KILLSWITCH_COMMAND_NAME,
   OPENAI_LOGGING_COMMAND_NAME,
   OPENAI_QUOTA_COMMAND_NAME,
+  OPENAI_RESET_COMMAND_NAME,
   OPENAI_ROUTING_COMMAND_NAME,
+  type ResetTargetIdentity,
 } from './commands'
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import {
@@ -185,6 +187,173 @@ export class AuthPersistError extends Error {
       { cause },
     )
     this.name = 'AuthPersistError'
+  }
+}
+
+export type ResetTargetResolutionErrorKind =
+  | 'unknown_account'
+  | 'disabled_account'
+  | 'non_oauth_account'
+  | 'token_unavailable'
+
+export class ResetTargetResolutionError extends Error {
+  readonly code: ResetTargetResolutionErrorKind
+
+  constructor(code: ResetTargetResolutionErrorKind, message: string) {
+    super(message)
+    this.name = 'ResetTargetResolutionError'
+    this.code = code
+  }
+}
+
+interface ResetTargetResolverDeps {
+  getAuth: () => Promise<{
+    type: string
+    access?: string
+    refresh?: string
+    expires?: number
+  }>
+  refreshMainWithLease: () => Promise<{
+    access: string
+    refresh: string
+    expires: number
+  }>
+  refreshFallbackAccount: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<OAuthAccount>
+  loadAccounts: typeof loadAccounts
+  accountStoragePath: string
+  now: () => number
+}
+
+function resetTargetNeedsRefresh(
+  access: string | undefined,
+  expires: number | undefined,
+  storage: AccountStorage | null,
+  now: number,
+) {
+  const refreshBeforeExpiryMs =
+    (storage?.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
+  return !access || !expires || expires - now <= refreshBeforeExpiryMs
+}
+
+export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
+  return async (accountKey: string): Promise<ResetTargetIdentity> => {
+    if (accountKey === 'main') {
+      const storage = await deps.loadAccounts(deps.accountStoragePath)
+      let auth = await deps.getAuth()
+      if (auth.type !== 'oauth') {
+        throw new ResetTargetResolutionError(
+          'non_oauth_account',
+          'Main OpenAI account is not authenticated with OAuth.',
+        )
+      }
+      if (
+        resetTargetNeedsRefresh(auth.access, auth.expires, storage, deps.now())
+      ) {
+        auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
+      }
+      if (!auth.access) {
+        throw new ResetTargetResolutionError(
+          'token_unavailable',
+          'Main OpenAI account has no usable access token.',
+        )
+      }
+      // The access token's claims reflect the account authenticated right
+      // now; the persisted mainAccountId lags a re-login until the next
+      // storage write. Prefer the live identity, falling back to storage for
+      // token shapes that carry no account claim.
+      const claims = parseJwtClaims(auth.access)
+      const liveAccountId = claims
+        ? extractAccountIdFromClaims(claims)
+        : undefined
+      const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+      return {
+        accountKey,
+        label: 'Main account',
+        accessToken: auth.access,
+        chatgptAccountId: liveAccountId ?? freshStorage?.mainAccountId,
+      }
+    }
+
+    const storage = await deps.loadAccounts(deps.accountStoragePath)
+    const account = storage?.accounts.find(
+      (candidate) => candidate.id === accountKey,
+    )
+    if (!storage || !account) {
+      throw new ResetTargetResolutionError(
+        'unknown_account',
+        `Fallback account ${accountKey} was not found.`,
+      )
+    }
+    if (account.enabled === false) {
+      throw new ResetTargetResolutionError(
+        'disabled_account',
+        `Fallback account ${accountKey} is disabled.`,
+      )
+    }
+    if (!isOAuthAccount(account)) {
+      throw new ResetTargetResolutionError(
+        'non_oauth_account',
+        `Fallback account ${accountKey} is not an OAuth account.`,
+      )
+    }
+
+    let resolved = account
+    if (
+      resetTargetNeedsRefresh(
+        resolved.access,
+        resolved.expires,
+        storage,
+        deps.now(),
+      )
+    ) {
+      resolved = await deps.refreshFallbackAccount(resolved, storage)
+    }
+    if (!resolved.access) {
+      throw new ResetTargetResolutionError(
+        'token_unavailable',
+        `Fallback account ${accountKey} has no usable access token.`,
+      )
+    }
+
+    const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+    const freshAccount = freshStorage?.accounts.find(
+      (candidate) => candidate.id === accountKey,
+    )
+    if (!freshStorage || !freshAccount) {
+      throw new ResetTargetResolutionError(
+        'unknown_account',
+        `Fallback account ${accountKey} was not found.`,
+      )
+    }
+    if (freshAccount.enabled === false) {
+      throw new ResetTargetResolutionError(
+        'disabled_account',
+        `Fallback account ${accountKey} is disabled.`,
+      )
+    }
+    if (!isOAuthAccount(freshAccount)) {
+      throw new ResetTargetResolutionError(
+        'non_oauth_account',
+        `Fallback account ${accountKey} is not an OAuth account.`,
+      )
+    }
+    return {
+      accountKey,
+      label: resolved.label ?? accountKey,
+      accessToken: resolved.access,
+      chatgptAccountId: freshAccount.accountId,
+    }
+  }
+}
+
+export function buildResetRedemptionDeps() {
+  return {
+    fetchImpl: fetch,
+    now: Date.now,
+    randomUUID: () => crypto.randomUUID(),
   }
 }
 
@@ -460,24 +629,26 @@ export function findCachekeepFallbackAccount(
 }
 
 // wham is the only source that reports reset-credit counts; header/WS pushes
-// never carry the field. An incoming push that omits it inherits the last
-// known count for the same account so the sidebar does not flicker it away
-// on every per-turn header/WS update — but an explicit incoming value
-// (including 0) always wins over a stale cached one.
+// never carry the fields. An incoming push that omits them inherits the last
+// known counts for the same account so the sidebar and the reset dialog do
+// not lose them on every per-turn header/WS update — but an explicit incoming
+// value (including 0) always wins over a stale cached one.
 export function mergePushedQuotaMetadata(
   incoming: OAuthQuotaSnapshot,
   previous: OAuthQuotaSnapshot | undefined,
 ): OAuthQuotaSnapshot {
-  if (
-    incoming.resetCreditsAvailable !== undefined ||
-    previous?.resetCreditsAvailable === undefined
-  ) {
-    return incoming
+  if (!previous) return incoming
+  const merged: OAuthQuotaSnapshot = { ...incoming }
+  for (const key of [
+    'resetCreditsAvailable',
+    'resetCreditsApplicable',
+  ] as const) {
+    const carried = previous[key]
+    if (merged[key] === undefined && carried !== undefined) {
+      merged[key] = carried
+    }
   }
-  return {
-    ...incoming,
-    resetCreditsAvailable: previous.resetCreditsAvailable,
-  }
+  return merged
 }
 
 // Returns the window unchanged when it already carries a usable checkedAt, or
@@ -1542,6 +1713,16 @@ export async function CodexAuthPlugin(
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
+          resolveResetTarget: createResetTargetResolver({
+            getAuth,
+            refreshMainWithLease,
+            refreshFallbackAccount: (account, currentStorage) =>
+              fallbackManager.refreshAccount(account, currentStorage),
+            loadAccounts,
+            accountStoragePath: getConfigPath(),
+            now: Date.now,
+          }),
+          ...buildResetRedemptionDeps(),
           cacheKeepManager,
           setCacheKeepEnabled: (enabled) => {
             cacheKeepEnabled = enabled
@@ -1583,6 +1764,35 @@ export async function CodexAuthPlugin(
               isOAuthAccountFn: isOAuthAccount,
               whamFn: whamUsageFn,
             }),
+          refreshResetTargetQuota: async (accountKey) => {
+            const results = await refreshAllQuota(
+              {
+                getAuth,
+                codexRefreshFn,
+                refreshMainWithLease,
+                fallbackManager,
+                quotaManager,
+                loadAccounts,
+                writeSidebarState: writeMachineSidebarState,
+                client: input.client as CommandContext['client'],
+                fetchImpl: fetch,
+                now: Date.now,
+                configPath: getConfigPath(),
+                storageMainAccountId: storage?.mainAccountId,
+                isOAuthAccountFn: isOAuthAccount,
+                whamFn: whamUsageFn,
+                respectBackoff: false,
+              },
+              { accountKey },
+            )
+            return (
+              results.find((result) => result.account === accountKey) ?? {
+                account: accountKey,
+                ok: false,
+                error: 'targeted quota refresh returned no result',
+              }
+            )
+          },
         }
 
         let rpcServer: RpcServerHandle | null = null
@@ -2242,6 +2452,12 @@ export async function CodexAuthPlugin(
               candidate.quotaCheckedAt,
             ]),
           )
+          const wireAccountIdByAccount = Object.fromEntries(
+            eligibleCandidates.map((candidate) => [
+              candidate.accountId,
+              candidate.wireAccountId,
+            ]),
+          )
           const excluded = new Set(input.excludeAccountIds)
           let placement:
             | {
@@ -2258,6 +2474,7 @@ export async function CodexAuthPlugin(
               validPinnedAccountIds: [...candidatesById.keys()],
               excludeAccountIds: input.excludeAccountIds,
               quotaCheckedAtByAccount,
+              wireAccountIdByAccount,
               choose: (pendingBytes) => {
                 const eligible = eligibleCandidates.filter(
                   (candidate) => !excluded.has(candidate.accountId),
@@ -2465,7 +2682,13 @@ export async function CodexAuthPlugin(
               throw error
             }
             if (!shouldFallbackStatus(response.status, fallbackStorage)) {
-              await fallbackManager.markUsed(candidate.fallback)
+              // Not awaited: the response is already in hand, and this only
+              // stamps a telemetry timestamp nothing reads. Awaiting it puts a
+              // contended store write between the provider's answer and the
+              // user's screen — measured at 3.6s median and 15s worst case on a
+              // busy host. markUsed swallows its own failures, so a dropped
+              // stamp cannot surface as an unhandled rejection.
+              void fallbackManager.markUsed(candidate.fallback)
               return {
                 response,
                 accessToken: candidate.access,
@@ -2541,7 +2764,9 @@ export async function CodexAuthPlugin(
             }
 
             if (!shouldFallbackStatus(response.status, fallbackStorage)) {
-              await fallbackManager.markUsed(candidate.fallback)
+              // See the fallback-first path above: telemetry only, never awaited
+              // on the request path.
+              void fallbackManager.markUsed(candidate.fallback)
               return { response, ...lastQuotaTarget }
             }
             await pushFailedFallbackQuota(response, candidate)
@@ -2872,7 +3097,9 @@ export async function CodexAuthPlugin(
                   stickyCandidate.fallback &&
                   !shouldFallbackStatus(stickyResponse.status, reqStorage)
                 ) {
-                  await fallbackManager.markUsed(stickyCandidate.fallback)
+                  // See the fallback-first path above: telemetry only, never
+                  // awaited on the request path.
+                  void fallbackManager.markUsed(stickyCandidate.fallback)
                 }
                 await writeRequestSidebarRouting(
                   sidebarSessionId,
@@ -3242,6 +3469,10 @@ export async function CodexAuthPlugin(
           template: OPENAI_CACHEKEEP_COMMAND_NAME,
           description:
             'Keep Codex prompt cache alive during idle by shadow-replaying the last request.',
+        },
+        [OPENAI_RESET_COMMAND_NAME]: {
+          template: OPENAI_RESET_COMMAND_NAME,
+          description: 'Spend one reset credit on an exhausted Codex account.',
         },
       }
     },

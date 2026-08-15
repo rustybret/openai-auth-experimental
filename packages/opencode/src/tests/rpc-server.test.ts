@@ -163,12 +163,16 @@ describe('rpc-server', () => {
     expect(rejected).toBe(true)
   })
 
-  test('enforces request timeout', async () => {
+  test('destroys a socket that stalls part-way through sending a request', async () => {
     dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
     const server = await startRpcServer({
       dir,
       drain: drainNotifications,
       apply: async () => ({ text: 'ok', knobs: {} }),
+      // The socket inactivity timer is what reclaims a stalled connection.
+      // requestTimeout cannot: Node only samples it on the
+      // connectionsCheckingInterval tick (30s by default), so it is a coarse
+      // ceiling rather than the mechanism that frees this socket.
       timeoutMs: 100,
     })
     stop = server.stop
@@ -290,5 +294,33 @@ describe('rpc-server', () => {
     stop = server.stop
 
     expect((await stat(dir)).mode & 0o777).toBe(0o755)
+  })
+
+  test('default timeout lets a slow apply handler respond before the socket is destroyed', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    // No explicit timeoutMs — the server default is the safety net. A reset
+    // apply takes a few seconds (network call to Codex); the default must not
+    // destroy the socket before the handler responds.
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => {
+        await Bun.sleep(3_000)
+        return { text: 'slow-ok', knobs: {} }
+      },
+    })
+    stop = server.stop
+
+    const res = await fetch(`http://127.0.0.1:${server.port}/rpc/apply`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ command: 'openai-reset', arguments: '' }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ text: 'slow-ok', knobs: {} })
   })
 })

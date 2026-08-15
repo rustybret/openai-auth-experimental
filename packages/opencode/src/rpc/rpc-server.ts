@@ -25,7 +25,10 @@ export interface RpcServerOptions {
   sweepRoot?: string
   drain: typeof drainNotifications
   apply: (request: ApplyRequest) => Promise<ApplyResult>
+  // Bounds handler execution via the socket inactivity timer.
   timeoutMs?: number
+  // Bounds request delivery only (requestTimeout/headersTimeout).
+  receiptTimeoutMs?: number
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -57,15 +60,32 @@ export async function startRpcServer(
   options: RpcServerOptions,
 ): Promise<RpcServerHandle> {
   const token = randomBytes(32).toString('hex')
-  const timeoutMs = options.timeoutMs ?? 2000
+  // Two different bounds, deliberately not one value.
+  //
+  // requestTimeout/headersTimeout bound how long a client may take to DELIVER
+  // a request; they do not bound handler execution. A receipt bound of 500ms
+  // still returns 200 for a 3s handler. Over loopback with a 1 MiB body cap,
+  // seconds is already generous.
+  //
+  // The inactivity timer is the one that can kill a working handler: it
+  // destroys the socket out from under it. It must therefore outlast the
+  // slowest legitimate apply — a reset redemption is bounded by a 60s consume
+  // call — or the response is lost server-side no matter what deadline the
+  // client passed. Fast commands respond in milliseconds regardless.
+  //
+  // Collapsing these back into a single value reintroduces one of two bugs:
+  // a receipt bound that aborts a slow reset, or a socket timer that leaves
+  // every endpoint holding a dead connection for 90s.
+  const handlerTimeoutMs = options.timeoutMs ?? 90_000
+  const receiptTimeoutMs = options.receiptTimeoutMs ?? 2_000
   const server = createServer((req, res) => {
-    req.setTimeout(timeoutMs, () => {
+    req.setTimeout(handlerTimeoutMs, () => {
       req.socket.destroy()
     })
     void dispatch(req, res)
   })
-  server.requestTimeout = timeoutMs
-  server.headersTimeout = timeoutMs
+  server.requestTimeout = receiptTimeoutMs
+  server.headersTimeout = receiptTimeoutMs
 
   async function dispatch(req: any, res: any) {
     const json = (status: number, value: unknown) => {

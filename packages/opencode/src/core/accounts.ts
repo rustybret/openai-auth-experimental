@@ -1,8 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
+import {
+  ACCOUNT_FILE_NAME,
+  ACCOUNT_STATE_FILE_NAME,
+  deriveStatePath,
+  getAccountStatePath,
+  getAccountStoragePath,
+} from './account-paths'
 import { writeJsonAtomic } from './atomic-write'
 import {
   buildQuotaOperationError,
@@ -23,44 +28,29 @@ import { quotaWindowResetIsPast } from './quota-manager.ts'
 import { acquireRefreshFileLock } from './refresh-file-lock'
 
 const logR = createLogger('refresh')
+const logA = createLogger('accounts')
+// How long a holder's lock stays valid. A crashed holder blocks contenders for
+// at most this long before the eviction path reclaims it.
 const SAVE_ACCOUNTS_LOCK_TTL_MS = 10_000
+// How long an acquirer waits before giving up. Deliberately NOT the TTL: with
+// the two equal, a waiter can expire at the exact moment a live holder's lock
+// does, so a legitimately-busy store is indistinguishable from a wedged one.
+const SAVE_ACCOUNTS_LOCK_WAIT_MS = 15_000
 const SAVE_ACCOUNTS_LOCK_RETRY_MS = 50
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 
-export const ACCOUNT_FILE_NAME = 'openai-auth.json'
-export const ACCOUNT_STATE_FILE_NAME = 'openai-auth-state.json'
-
-function getConfigDir() {
-  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
-    return process.env.OPENCODE_CONFIG_DIR.trim()
-  }
-  return join(
-    process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
-    'opencode',
-  )
-}
-
-export function getAccountStoragePath() {
-  return (
-    process.env.OPENCODE_OPENAI_AUTH_FILE?.trim() ||
-    join(getConfigDir(), ACCOUNT_FILE_NAME)
-  )
-}
-
-export function getAccountStatePath(configPath = getAccountStoragePath()) {
-  const explicit = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
-  if (explicit) return explicit
-  return deriveStatePath(configPath)
-}
-
-/** Derive the state-file path from the config path without reading env vars. */
-function deriveStatePath(configPath: string): string {
-  return configPath.endsWith(ACCOUNT_FILE_NAME)
-    ? join(dirname(configPath), ACCOUNT_STATE_FILE_NAME)
-    : `${configPath}.state.json`
+// Re-exported so existing importers keep their current entry point; the
+// definitions live in account-paths.ts so the lock module can share them
+// without an import cycle.
+export {
+  ACCOUNT_FILE_NAME,
+  ACCOUNT_STATE_FILE_NAME,
+  deriveStatePath,
+  getAccountStatePath,
+  getAccountStoragePath,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +76,7 @@ export interface OAuthQuotaSnapshot {
   primary?: AccountQuotaWindow
   secondary?: AccountQuotaWindow
   resetCreditsAvailable?: number
+  resetCreditsApplicable?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +164,29 @@ export type KillswitchConfig = {
   accounts?: Record<string, KillswitchThresholds>
 }
 
+export interface ResetInFlight {
+  redeemRequestId: string
+  creditId: string
+  startedAt: number
+}
+
+export interface ResetLastOutcome {
+  code: string
+  at: number
+  previousOutcome?: {
+    code: string
+    at: number
+  }
+}
+
+export interface ResetAccountState {
+  inFlight?: ResetInFlight | Record<string, unknown>
+  lastOutcome?: ResetLastOutcome
+  cooldownUntil?: number
+}
+
+export type ResetStateByAccount = Record<string, ResetAccountState>
+
 export type AccountStorage = {
   version: 1
   main?: {
@@ -206,6 +220,7 @@ export type AccountStorage = {
     mainQuotaToken?: string
     mainLastQuotaApiError?: AccountOperationError
   }
+  reset?: ResetStateByAccount
   dump?: {
     enabled?: boolean
   }
@@ -325,6 +340,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
+const UNSAFE_RESET_ACCOUNT_KEYS = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+])
+
+export function isSafeResetAccountKey(accountKey: string): boolean {
+  return accountKey.length > 0 && !UNSAFE_RESET_ACCOUNT_KEYS.has(accountKey)
+}
+
 function isAccountRemovedDuringRefreshError(
   error: unknown,
 ): error is AccountRemovedDuringRefreshError {
@@ -402,12 +427,14 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     }
   }
 
-  const resetCreditsAvailable =
-    typeof value.resetCreditsAvailable === 'number'
-      ? value.resetCreditsAvailable
-      : Number.NaN
-  if (Number.isFinite(resetCreditsAvailable) && resetCreditsAvailable >= 0) {
-    quota.resetCreditsAvailable = resetCreditsAvailable
+  for (const key of [
+    'resetCreditsAvailable',
+    'resetCreditsApplicable',
+  ] as const) {
+    const credits = typeof value[key] === 'number' ? value[key] : Number.NaN
+    if (Number.isFinite(credits) && credits >= 0) {
+      quota[key] = credits
+    }
   }
 
   return Object.keys(quota).length ? quota : undefined
@@ -450,6 +477,54 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 }
 
+function normalizeResetState(value: unknown): ResetStateByAccount | undefined {
+  if (!isRecord(value)) return undefined
+
+  const normalized = Object.create(null) as ResetStateByAccount
+  for (const [accountId, candidate] of Object.entries(value)) {
+    if (!isSafeResetAccountKey(accountId) || !isRecord(candidate)) continue
+
+    const state: ResetAccountState = {}
+    if (isRecord(candidate.inFlight)) {
+      state.inFlight = { ...candidate.inFlight }
+    }
+    if (
+      isRecord(candidate.lastOutcome) &&
+      typeof candidate.lastOutcome.code === 'string' &&
+      candidate.lastOutcome.code.length > 0 &&
+      typeof candidate.lastOutcome.at === 'number' &&
+      Number.isFinite(candidate.lastOutcome.at)
+    ) {
+      state.lastOutcome = {
+        code: candidate.lastOutcome.code,
+        at: candidate.lastOutcome.at,
+        ...(isRecord(candidate.lastOutcome.previousOutcome) &&
+        typeof candidate.lastOutcome.previousOutcome.code === 'string' &&
+        candidate.lastOutcome.previousOutcome.code.length > 0 &&
+        typeof candidate.lastOutcome.previousOutcome.at === 'number' &&
+        Number.isFinite(candidate.lastOutcome.previousOutcome.at)
+          ? {
+              previousOutcome: {
+                code: candidate.lastOutcome.previousOutcome.code,
+                at: candidate.lastOutcome.previousOutcome.at,
+              },
+            }
+          : {}),
+      }
+    }
+    if (
+      typeof candidate.cooldownUntil === 'number' &&
+      Number.isFinite(candidate.cooldownUntil)
+    ) {
+      state.cooldownUntil = candidate.cooldownUntil
+    }
+
+    if (Object.keys(state).length > 0) normalized[accountId] = state
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined
+}
+
 function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
@@ -461,6 +536,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
       : undefined,
     refresh: isRecord(value.refresh) ? value.refresh : undefined,
     quota: isRecord(value.quota) ? value.quota : undefined,
+    reset: normalizeResetState(value.reset),
     dump: isRecord(value.dump) ? value.dump : undefined,
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
@@ -755,6 +831,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     fallbackOn: storage.fallbackOn,
     refresh,
     quota,
+    reset: storage.reset,
     dump: storage.dump,
     costZeroing: storage.costZeroing,
     killswitch: storage.killswitch,
@@ -783,8 +860,11 @@ function mergeStorageForSave(
 }
 
 async function acquireSaveAccountsLock(path: string) {
-  const deadline = Date.now() + SAVE_ACCOUNTS_LOCK_TTL_MS
+  const startedAt = Date.now()
+  const deadline = startedAt + SAVE_ACCOUNTS_LOCK_WAIT_MS
+  let attempts = 0
   while (Date.now() <= deadline) {
+    attempts++
     const lock = await acquireRefreshFileLock({
       name: 'save',
       ttlMs: SAVE_ACCOUNTS_LOCK_TTL_MS,
@@ -794,11 +874,38 @@ async function acquireSaveAccountsLock(path: string) {
 
     const remainingMs = deadline - Date.now()
     if (remainingMs <= 0) break
-    await sleep(Math.min(SAVE_ACCOUNTS_LOCK_RETRY_MS, remainingMs))
+    // Jitter the poll so a burst of same-process acquirers does not resynchronize
+    // into lockstep retries against the same instant.
+    await sleep(
+      Math.min(
+        SAVE_ACCOUNTS_LOCK_RETRY_MS + jitterMs(SAVE_ACCOUNTS_LOCK_RETRY_MS),
+        remainingMs,
+      ),
+    )
   }
 
+  // Report attempts and the average gap between them, because they distinguish
+  // two failures that look identical from the outside and need opposite fixes.
+  //
+  // This loop polls on a WALL-CLOCK deadline while its own progress is scheduled
+  // by the event loop. Every session in this host process shares that loop, so
+  // when they are streaming, a scheduled retry lands hundreds of ms late. The
+  // wait then expires having barely tried, whether or not the lock was ever
+  // busy. Measured: ~48 concurrent writers on a responsive loop peak under 0.9s
+  // and never time out, while 12 writers on a saturated one fail routinely.
+  //
+  // So a gap near the retry interval means real contention: the loop was
+  // responsive and other writers genuinely held the lock. A gap far above it
+  // means starvation, and the lock may well have been free most of the window.
+  // Do not claim a holder here — the timeout alone is not evidence of one.
+  const elapsedMs = Date.now() - startedAt
+  const averageGapMs = Math.round(elapsedMs / Math.max(1, attempts))
   throw new Error(
-    `Timed out acquiring account store lock for ${path}; refusing to overwrite newer account data`,
+    `Timed out after ${elapsedMs}ms waiting for the account store lock on ${path} ` +
+      `(${attempts} attempts, ~${averageGapMs}ms apart; retry interval is ` +
+      `${SAVE_ACCOUNTS_LOCK_RETRY_MS}ms). A gap near the retry interval means ` +
+      `lock contention; a much larger one means this process's event loop was ` +
+      `saturated and the wait expired without getting scheduled.`,
   )
 }
 
@@ -1642,19 +1749,57 @@ export class FallbackAccountManager {
       }
     }
 
-    if (changed) await this.save(storage)
+    // Selection bookkeeping only: refreshAccount() has already persisted any
+    // rotated tokens itself, so what remains here is recorded refresh/quota
+    // errors and lastUsed merges. Losing it delays a backoff stamp; failing the
+    // caller would abort a request that has not been sent yet, which is worse.
+    if (changed) {
+      try {
+        await this.save(storage)
+      } catch (error) {
+        logA.warn('fallback selection bookkeeping not persisted', {
+          pid: process.pid,
+          error: formatErrorMessage(error),
+        })
+      }
+    }
     return usable
   }
 
+  /**
+   * Stamp `lastUsed` on a served account.
+   *
+   * This runs on the request path after a response is already in hand, and
+   * `lastUsed` is telemetry: nothing reads it to make a routing, quota, or
+   * killswitch decision. The WHOLE operation is therefore best-effort, read
+   * included — loadAccounts deliberately rethrows anything that is not ENOENT so
+   * corruption surfaces to callers that must act on it, and a store lock shared
+   * by every session in the host process can legitimately time out under a burst
+   * of concurrent turns. Neither may reach this caller: it would discard a
+   * successful, already-billed provider response to record a timestamp. Losing
+   * the stamp costs nothing a later turn cannot redo.
+   *
+   * Contrast refreshAccount, whose save persists rotated tokens and MUST
+   * propagate: dropping it silently would strand a refresh and invalidate the
+   * account's credentials.
+   */
   async markUsed(account: FallbackAccount) {
-    const storage = await this.load()
-    if (!storage) return
-    const stored = storage.accounts.find(
-      (candidate) => candidate.id === account.id,
-    )
-    if (!stored) return
-    stored.lastUsed = this.now()
-    await this.save(storage)
+    try {
+      const storage = await this.load()
+      if (!storage) return
+      const stored = storage.accounts.find(
+        (candidate) => candidate.id === account.id,
+      )
+      if (!stored) return
+      stored.lastUsed = this.now()
+      await this.save(storage, [stored.id])
+    } catch (error) {
+      logA.warn('lastUsed stamp not persisted', {
+        pid: process.pid,
+        accountId: account.id,
+        error: formatErrorMessage(error),
+      })
+    }
   }
 
   accountPassesQuotaPolicy(

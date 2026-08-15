@@ -2977,6 +2977,7 @@ describe('integration: active fallback routing', () => {
       const firstAssignment =
         firstState.stickyAssignments?.[hashSidebarSessionId('sticky-session')]
       expect(firstAssignment?.accountId).toBe('fallback-2')
+      expect(firstAssignment?.wireAccountId).toBe('acc-fallback-2')
 
       const changed = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       changed.fallbacks[0].quota = stickyQuota(100, Date.now())
@@ -3005,6 +3006,10 @@ describe('integration: active fallback routing', () => {
         finalState.stickyAssignments?.[hashSidebarSessionId('cold-session')]
           ?.accountId,
       ).toBe('fallback-1')
+      expect(
+        finalState.stickyAssignments?.[hashSidebarSessionId('cold-session')]
+          ?.wireAccountId,
+      ).toBe('acc-fallback-1')
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -4851,6 +4856,79 @@ describe('integration: active fallback routing', () => {
           ?.usedPercent,
       ).toBe(63)
     } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('returns a served fallback response without waiting on the lastUsed stamp', async () => {
+    // The stamp runs after the provider response is in hand and records a
+    // timestamp no routing, quota, or killswitch decision reads. Awaiting it puts
+    // a contended store write between the provider's answer and the caller;
+    // measured at seconds on a busy host. Hold the store lock so any await would
+    // block for the full acquire window, then assert the response still returns
+    // promptly.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            label: 'Work Alt',
+            enabled: true,
+            access: 'work-alt-token',
+            refresh: 'work-alt-refresh',
+            expires: Date.now() + 3600_000 * 24,
+            accountId: 'chatgpt-work-alt',
+          },
+        ],
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        routing: { mode: 'fallback-first' },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    let held: { release: () => Promise<void> } | null = null
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      // Block the state-file lock the stamp needs, for longer than this test
+      // could tolerate waiting.
+      held = await acquireRefreshFileLock({
+        name: 'save',
+        ttlMs: 60_000,
+        path: stateFile,
+        renew: true,
+      })
+      expect(held).not.toBeNull()
+
+      const startedAt = Date.now()
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      const elapsedMs = Date.now() - startedAt
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      // Well under the multi-second acquire window an awaited stamp would pay.
+      expect(elapsedMs).toBeLessThan(2_000)
+    } finally {
+      await held?.release()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
