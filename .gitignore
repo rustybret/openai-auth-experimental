@@ -44,3 +44,4 @@ temp/
 !.github/*
 .opencode/package-lock.json
 .opencode/package.json
+ucs.json
