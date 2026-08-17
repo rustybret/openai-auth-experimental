@@ -79,14 +79,58 @@ matches_any() {
   return 1
 }
 
-# regenerate_artifacts — rebuild `regenerate:` targets from the merged manifests.
-# Bun defaults --frozen-lockfile to true whenever CI is set, which would defeat
-# the whole point of regenerating, so the non-frozen form is explicit here.
-# Note: `--frozen-lockfile=false` is NOT valid (bun rejects a value for that
-# flag); `--no-frozen-lockfile` is the working spelling.
-regenerate_artifacts() {
-  echo "== regenerating lockfile from merged manifests =="
-  (cd "$ROOT" && bun install --no-frozen-lockfile)
+# ecosystem_for <basename> — map a regenerate target to its rebuild ecosystem.
+# Dispatch keys on the MATCHED FILE'S BASENAME, not on the glob that matched it,
+# so one manifest rule can cover several ecosystems in a polyglot fork.
+# An unrecognized basename is a hard error: guessing a rebuild command would
+# stage an artifact that was never actually regenerated.
+ecosystem_for() {
+  case "$1" in
+    bun.lock | bun.lockb) printf 'bun' ;;
+    Cargo.lock) printf 'cargo' ;;
+    *) return 1 ;;
+  esac
+}
+
+# regenerate_targets <path>... — rebuild every regenerate target from the merged
+# manifests. Validates the full target set BEFORE running anything, so an
+# unknown target aborts while the conflict is still intact for manual review
+# rather than half-way through a partial regeneration.
+regenerate_targets() {
+  local target base eco
+  local ecosystems=""
+
+  for target in "$@"; do
+    base="$(basename "$target")"
+    if ! eco="$(ecosystem_for "$base")"; then
+      echo "error: no rebuild command is known for regenerate target: $target" >&2
+      echo "       add a dispatch entry to ecosystem_for(), or drop the rule and" >&2
+      echo "       resolve this file manually. Refusing to guess." >&2
+      exit 1
+    fi
+    case " $ecosystems " in
+      *" $eco "*) ;;                          # already queued
+      *) ecosystems="$ecosystems $eco" ;;
+    esac
+  done
+
+  for eco in $ecosystems; do
+    case "$eco" in
+      bun)
+        # `bun install --frozen-lockfile=false` is NOT valid — bun exits 1 with
+        # "the argument does not take a value" and leaves the lockfile
+        # unregenerated. `--no-frozen-lockfile` is the working spelling and is
+        # stated explicitly so an inherited frozen default can never suppress
+        # the regeneration this verb exists to perform.
+        echo "== regenerating bun lockfile from merged manifests =="
+        (cd "$ROOT" && bun install --no-frozen-lockfile)
+        ;;
+      cargo)
+        echo "== regenerating Cargo lockfile from merged manifests =="
+        (cd "$ROOT" && cargo metadata --format-version 1 >/dev/null)
+        ;;
+    esac
+  done
 }
 
 # --- 1. fetch ------------------------------------------------------------------
@@ -113,20 +157,19 @@ elif git -C "$ROOT" merge "$REMOTE/$BRANCH" -m "chore(sync): merge upstream $BRA
   if [[ "$PARENT_COUNT" -lt 2 ]]; then
     echo "Fast-forward merge; no fork-side manifest deltas to reconcile."
   else
-    NEEDS_REGEN=0
+    REGEN_TOUCHED=()
     while IFS= read -r changed_file; do
       [[ -z "$changed_file" ]] && continue
       if matches_any "$changed_file" ${REGENERATE[@]+"${REGENERATE[@]}"}; then
-        NEEDS_REGEN=1
-        break
+        REGEN_TOUCHED+=("$changed_file")
       fi
     done < <(git -C "$ROOT" diff --name-only "$PRE_MERGE_HEAD" HEAD)
 
-    if [[ "$NEEDS_REGEN" == "1" ]]; then
-      regenerate_artifacts
-      if [[ -n "$(git -C "$ROOT" status --porcelain -- ${REGENERATE[@]+"${REGENERATE[@]}"})" ]]; then
+    if [[ "${#REGEN_TOUCHED[@]}" -gt 0 ]]; then
+      regenerate_targets "${REGEN_TOUCHED[@]}"
+      if [[ -n "$(git -C "$ROOT" status --porcelain -- "${REGEN_TOUCHED[@]}")" ]]; then
         echo "Lockfile drifted after regeneration; amending into the merge commit."
-        git -C "$ROOT" add -- ${REGENERATE[@]+"${REGENERATE[@]}"}
+        git -C "$ROOT" add -- "${REGEN_TOUCHED[@]}"
         git -C "$ROOT" commit --amend --no-edit
       else
         echo "Regenerated artifacts already consistent with the merge."
@@ -179,7 +222,7 @@ else
   fi
 
   if [[ "${#REGEN_PENDING[@]}" -gt 0 ]]; then
-    regenerate_artifacts
+    regenerate_targets "${REGEN_PENDING[@]}"
     git -C "$ROOT" add -- "${REGEN_PENDING[@]}"
   fi
 

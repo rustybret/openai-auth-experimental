@@ -31,6 +31,23 @@ describe('fork-sync exclusion manifest', () => {
     }
   })
 
+  it('documents the verb generically so the spec text matches other forks', () => {
+    // The three-verb spec text is single-source across polyglot forks, so the
+    // header must describe ecosystem rebuild + basename dispatch rather than
+    // hardcoding this repo's `bun install`.
+    // Leading comment block only - stop at the first actual rule line.
+    const lines = manifest.split('\n')
+    const firstRule = lines.findIndex(
+      (line) => line.trim().length > 0 && !line.trimStart().startsWith('#'),
+    )
+    const header = lines
+      .slice(0, firstRule === -1 ? lines.length : firstRule)
+      .join('\n')
+    expect(header).toMatch(/basename/i)
+    expect(header).toMatch(/ecosystem/i)
+    expect(header).not.toMatch(/bun install/i)
+  })
+
   it('routes bun.lock through regenerate, never take-theirs', () => {
     const rules = manifest
       .split('\n')
@@ -70,11 +87,28 @@ describe('fork-sync.sh', () => {
   })
 
   it('regenerates the lockfile with a bun flag spelling that actually parses', () => {
-    // `bun install --frozen-lockfile=false` is rejected by bun ("does not take
-    // a value"). `--no-frozen-lockfile` is the working spelling, and it must be
-    // explicit because bun defaults to frozen whenever CI is set.
+    // `bun install --frozen-lockfile=false` exits 1 ("the argument does not
+    // take a value") and leaves the lockfile unregenerated, so the cross-fork
+    // spec's literal command must never be copied in verbatim.
     expect(scriptCode).toContain('bun install --no-frozen-lockfile')
     expect(scriptCode).not.toContain('--frozen-lockfile=false')
+  })
+
+  it('dispatches regeneration on basename, per the cross-fork standard', () => {
+    expect(scriptCode).toContain('ecosystem_for')
+    expect(scriptCode).toMatch(/bun\.lock \| bun\.lockb\)/)
+    expect(scriptCode).toMatch(/Cargo\.lock\)/)
+    expect(scriptCode).toContain('basename')
+  })
+
+  it('hard-errors on an unknown regenerate target instead of guessing', () => {
+    expect(scriptCode).toMatch(/no rebuild command is known for regenerate/)
+    // The guess-refusal must abort, not warn and continue.
+    const ecoBlock = scriptCode.slice(
+      scriptCode.indexOf('regenerate_targets()'),
+      scriptCode.indexOf('# --- 1. fetch'),
+    )
+    expect(ecoBlock).toContain('exit 1')
   })
 
   it('stays merge-only: never rebases or force-pushes', () => {

@@ -2,15 +2,21 @@
 # Format: <action>: <glob>
 #
 # keep-deleted: files removed in this fork that upstream might re-introduce
-# take-theirs: regenerable files where upstream's version is always preferred
-# regenerate:  take upstream's copy, then rebuild it from the merged manifests
-#              and stage the result INSIDE the merge commit
+# take-theirs: pure checkout — upstream's version is always preferred as-is
+# regenerate:  checkout upstream's version, run the rebuild command for THAT
+#              FILE'S ecosystem, then stage the result INTO the merge commit
+#              (never a follow-up commit)
+#
+# `regenerate` dispatches on the matched file's BASENAME, not on the glob that
+# matched it, so one rule can cover several ecosystems in a polyglot fork. An
+# unrecognized basename is a hard error: the sync refuses to guess a rebuild
+# command and leaves the conflict intact for manual review.
 
 # Arcus packaging outputs and transient local directories
 keep-deleted: dist-arcus/*
 
-# Lockfile. `take-theirs` alone is wrong here: upstream's bun.lock does not
+# Lockfile. `take-theirs` alone is wrong here: upstream's lockfile does not
 # describe this fork's devDependency set (@earendil-works/*, lefthook, our
-# pinned @opencode-ai/plugin), so it must be regenerated against the merged
+# pinned @opencode-ai/plugin), so it must be rebuilt against the merged
 # package.json rather than adopted verbatim.
 regenerate: bun.lock
