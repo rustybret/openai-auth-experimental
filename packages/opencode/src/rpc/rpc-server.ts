@@ -1,10 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { unlink } from 'node:fs/promises'
-import {
-  createServer,
-  type IncomingMessage,
-  type ServerResponse,
-} from 'node:http'
+import { createServer, type IncomingMessage } from 'node:http'
 import { join } from 'node:path'
 import { createLogger } from '../logger'
 import type { drainNotifications } from './notifications'
