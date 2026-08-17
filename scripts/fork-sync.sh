@@ -6,8 +6,9 @@
 #   1. fetch upstream and origin
 #   2. merge upstream/<branch> into current branch (default: local/fork)
 #   3. auto-resolve standing conflict classes from scripts/fork-sync-exclusions
-#   4. verify build passes
-#   5. push to origin (unless FORK_SYNC_NO_PUSH=1)
+#   4. reconcile regenerated artifacts (lockfiles) into the merge commit
+#   5. verify build passes
+#   6. push to origin (unless FORK_SYNC_NO_PUSH=1)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,16 +36,58 @@ fi
 # --- parse the exclusion manifest ---------------------------------------------
 KEEP_DELETED=()
 TAKE_THEIRS=()
+REGENERATE=()
+
+# trim <string> — strip surrounding whitespace. Manifest values are used both as
+# match patterns AND as literal git pathspecs, so they must be normalized here
+# at parse time: a stray leading space silently turns `bun.lock` into a pathspec
+# for a file named " bun.lock", which matches nothing and fails open.
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%%#*}"                          # strip comments
-  line="${line#"${line%%[![:space:]]*}"}"     # trim leading whitespace
+  line="$(trim "$line")"
   [[ -z "$line" ]] && continue
   case "$line" in
-    keep-deleted:*) KEEP_DELETED+=("${line#keep-deleted:}") ;;
-    take-theirs:*)  TAKE_THEIRS+=("${line#take-theirs:}") ;;
+    keep-deleted:*) KEEP_DELETED+=("$(trim "${line#keep-deleted:}")") ;;
+    take-theirs:*)  TAKE_THEIRS+=("$(trim "${line#take-theirs:}")") ;;
+    regenerate:*)   REGENERATE+=("$(trim "${line#regenerate:}")") ;;
     *) echo "warning: unrecognized manifest line: $line" >&2 ;;
   esac
 done < "$EXCLUSIONS"
+
+# matches_any <path> <glob>... — true when <path> matches any supplied glob.
+# Callers must expand arrays with the ${ARR[@]+"${ARR[@]}"} guard so an empty
+# manifest class does not trip `set -u`.
+matches_any() {
+  local file="$1"
+  shift
+  local g
+  for g in "$@"; do
+    [[ -z "$g" ]] && continue
+    # Intentional glob match on the right-hand side, not a literal compare.
+    # shellcheck disable=SC2053
+    if [[ "$file" == $g ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# regenerate_artifacts — rebuild `regenerate:` targets from the merged manifests.
+# Bun defaults --frozen-lockfile to true whenever CI is set, which would defeat
+# the whole point of regenerating, so the non-frozen form is explicit here.
+# Note: `--frozen-lockfile=false` is NOT valid (bun rejects a value for that
+# flag); `--no-frozen-lockfile` is the working spelling.
+regenerate_artifacts() {
+  echo "== regenerating lockfile from merged manifests =="
+  (cd "$ROOT" && bun install --no-frozen-lockfile)
+}
 
 # --- 1. fetch ------------------------------------------------------------------
 echo "== fetch $REMOTE and origin =="
@@ -56,42 +99,91 @@ echo "== merge $REMOTE/$BRANCH into $LOCAL_BRANCH =="
 MERGE_BASE="$(git -C "$ROOT" merge-base HEAD "$REMOTE/$BRANCH")"
 UPSTREAM_HEAD="$(git -C "$ROOT" rev-parse "$REMOTE/$BRANCH")"
 
+PRE_MERGE_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
+
 if [[ "$MERGE_BASE" == "$UPSTREAM_HEAD" ]]; then
   echo "Already up to date with $REMOTE/$BRANCH."
-else
-  if git -C "$ROOT" merge "$REMOTE/$BRANCH" -m "chore(sync): merge upstream $BRANCH into $LOCAL_BRANCH" --no-edit; then
-    echo "Clean merge completed."
-  else
-    echo "Resolving conflicts via exclusion manifest..."
-    # Check unmerged files against exclusions
-    for conflict_file in $(git -C "$ROOT" diff --name-only --diff-filter=U); do
-      for g in "${KEEP_DELETED[@]}"; do
-        g="${g#"${g%%[![:space:]]*}"}"
-        if [[ "$conflict_file" == $g ]]; then
-          git -C "$ROOT" rm -f "$conflict_file" || true
-          break
-        fi
-      done
-      for g in "${TAKE_THEIRS[@]}"; do
-        g="${g#"${g%%[![:space:]]*}"}"
-        if [[ "$conflict_file" == $g ]]; then
-          git -C "$ROOT" checkout --theirs "$conflict_file"
-          git -C "$ROOT" add "$conflict_file"
-          break
-        fi
-      done
-    done
+elif git -C "$ROOT" merge "$REMOTE/$BRANCH" -m "chore(sync): merge upstream $BRANCH into $LOCAL_BRANCH" --no-edit; then
+  echo "Clean merge completed."
 
-    # Check if remaining conflicts exist
-    REMAINING="$(git -C "$ROOT" diff --name-only --diff-filter=U)"
-    if [[ -n "$REMAINING" ]]; then
-      echo "error: unhandled merge conflicts in:" >&2
-      echo "$REMAINING" >&2
-      exit 1
+  # Clean-merge safety: git can merge a lockfile textually without conflict and
+  # still leave it inconsistent with the merged package.json set. Reconcile and
+  # fold the result back into the merge commit so the commit is never broken.
+  PARENT_COUNT="$(git -C "$ROOT" rev-list --parents -n 1 HEAD | awk '{print NF-1}')"
+  if [[ "$PARENT_COUNT" -lt 2 ]]; then
+    echo "Fast-forward merge; no fork-side manifest deltas to reconcile."
+  else
+    NEEDS_REGEN=0
+    while IFS= read -r changed_file; do
+      [[ -z "$changed_file" ]] && continue
+      if matches_any "$changed_file" ${REGENERATE[@]+"${REGENERATE[@]}"}; then
+        NEEDS_REGEN=1
+        break
+      fi
+    done < <(git -C "$ROOT" diff --name-only "$PRE_MERGE_HEAD" HEAD)
+
+    if [[ "$NEEDS_REGEN" == "1" ]]; then
+      regenerate_artifacts
+      if [[ -n "$(git -C "$ROOT" status --porcelain -- ${REGENERATE[@]+"${REGENERATE[@]}"})" ]]; then
+        echo "Lockfile drifted after regeneration; amending into the merge commit."
+        git -C "$ROOT" add -- ${REGENERATE[@]+"${REGENERATE[@]}"}
+        git -C "$ROOT" commit --amend --no-edit
+      else
+        echo "Regenerated artifacts already consistent with the merge."
+      fi
+    fi
+  fi
+else
+  echo "Resolving conflicts via exclusion manifest..."
+  REGEN_PENDING=()
+
+  while IFS= read -r conflict_file; do
+    [[ -z "$conflict_file" ]] && continue
+
+    if matches_any "$conflict_file" ${KEEP_DELETED[@]+"${KEEP_DELETED[@]}"}; then
+      git -C "$ROOT" rm -f "$conflict_file" || true
+      continue
     fi
 
-    git -C "$ROOT" commit --no-edit
+    if matches_any "$conflict_file" ${TAKE_THEIRS[@]+"${TAKE_THEIRS[@]}"}; then
+      git -C "$ROOT" checkout --theirs -- "$conflict_file"
+      git -C "$ROOT" add -- "$conflict_file"
+      continue
+    fi
+
+    if matches_any "$conflict_file" ${REGENERATE[@]+"${REGENERATE[@]}"}; then
+      # Take upstream as the base, but do NOT stage yet: the regeneration must
+      # run against the fully resolved manifest set, so it is deferred until
+      # every other conflict class has been settled below.
+      git -C "$ROOT" checkout --theirs -- "$conflict_file"
+      REGEN_PENDING+=("$conflict_file")
+      continue
+    fi
+  done < <(git -C "$ROOT" diff --name-only --diff-filter=U)
+
+  # Any conflict left unmerged that is not a deferred regenerate target is a
+  # genuine unhandled conflict — fail before spending an install on it.
+  REMAINING=""
+  while IFS= read -r unmerged_file; do
+    [[ -z "$unmerged_file" ]] && continue
+    if matches_any "$unmerged_file" ${REGEN_PENDING[@]+"${REGEN_PENDING[@]}"}; then
+      continue
+    fi
+    REMAINING+="$unmerged_file"$'\n'
+  done < <(git -C "$ROOT" diff --name-only --diff-filter=U)
+
+  if [[ -n "${REMAINING//[$'\n'[:space:]]/}" ]]; then
+    echo "error: unhandled merge conflicts in:" >&2
+    printf '%s' "$REMAINING" >&2
+    exit 1
   fi
+
+  if [[ "${#REGEN_PENDING[@]}" -gt 0 ]]; then
+    regenerate_artifacts
+    git -C "$ROOT" add -- "${REGEN_PENDING[@]}"
+  fi
+
+  git -C "$ROOT" commit --no-edit
 fi
 
 # --- 3. verify build -----------------------------------------------------------
@@ -100,6 +192,7 @@ cd "$ROOT"
 bun run build
 
 # --- 4. push -------------------------------------------------------------------
+
 if [[ "$NO_PUSH" == "1" ]]; then
   echo "FORK_SYNC_NO_PUSH=1; skipping push to origin."
 else

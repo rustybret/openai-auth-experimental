@@ -36,7 +36,11 @@ tmp/
 temp/
 /.omo/run-continuation
 .omo/mailbox-trace.jsonl
+.omo/mailbox-outbox.jsonl
 .omo/omo.jsonc
+# uc-studio harness state (the .omo equivalent after the OmO fork rename)
+.ucs/mailbox-trace.jsonl
+.ucs/mailbox-outbox.jsonl
 /coordination_notes
 **.*.md
 !**.*.md
