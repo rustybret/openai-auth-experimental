@@ -1,6 +1,10 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { unlink } from 'node:fs/promises'
-import { createServer, type IncomingMessage } from 'node:http'
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http'
 import { join } from 'node:path'
 import { createLogger } from '../logger'
 import type { drainNotifications } from './notifications'
@@ -83,7 +87,7 @@ export async function startRpcServer(
   server.requestTimeout = receiptTimeoutMs
   server.headersTimeout = receiptTimeoutMs
 
-  async function dispatch(req: any, res: any) {
+  async function dispatch(req: IncomingMessage, res: ServerResponse) {
     const json = (status: number, value: unknown) => {
       // Guard against writing to a socket that was destroyed (e.g. when
       // readBody rejected after req.destroy() on an oversized body).
