@@ -1,23 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { getAccountStoragePath } from './account-paths'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
-
-export const ACCOUNT_FILE_NAME = 'openai-auth.json'
-export const ACCOUNT_STATE_FILE_NAME = 'openai-auth-state.json'
-
-function getConfigDir() {
-  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
-    return process.env.OPENCODE_CONFIG_DIR.trim()
-  }
-  return join(
-    process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
-    'opencode',
-  )
-}
 
 // A concurrent contender renaming the freshly-created eviction-marker directory
 // away surfaces the vanished parent differently per platform: ENOENT on Linux,
@@ -26,21 +13,6 @@ function getConfigDir() {
 export function isLostMarkerRaceError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | null)?.code
   return code === 'ENOENT' || code === 'EINVAL' || code === 'ENOTDIR'
-}
-
-export function getAccountStoragePath() {
-  return (
-    process.env.OPENCODE_OPENAI_AUTH_FILE?.trim() ||
-    join(getConfigDir(), ACCOUNT_FILE_NAME)
-  )
-}
-
-export function getAccountStatePath(configPath = getAccountStoragePath()) {
-  const explicit = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
-  if (explicit) return explicit
-  return configPath.endsWith(ACCOUNT_FILE_NAME)
-    ? join(dirname(configPath), ACCOUNT_STATE_FILE_NAME)
-    : `${configPath}.state.json`
 }
 
 export async function acquireRefreshFileLock(options: {

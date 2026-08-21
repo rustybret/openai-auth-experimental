@@ -2,15 +2,28 @@ import { getSettings } from './config'
 import {
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
+  isSafeResetAccountKey,
   type KillswitchConfig,
   mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
 } from './core/accounts'
+import type { FallbackAccount } from './core/accounts.ts'
 import type { CacheKeepManager, CacheKeepWindow } from './core/cachekeep'
 import { beginAccountLogin, upsertAccount } from './core/oauth'
+import { whamUsageFn } from './core/provider'
 import type { QuotaManager } from './core/quota-manager'
 import type { RefreshAllQuotaResult } from './core/refresh-all-quota'
+import {
+  evaluateResetPrecondition,
+  listResetCredits,
+  ResetCreditError,
+  ResetRedemptionError,
+  type RunResetCreditResult,
+  resetWindowIsExhausted,
+  runResetCreditRedemption,
+  selectCreditToSpend,
+} from './core/reset-credits'
 import { createLogger, setLogLevel } from './logger'
 import type {
   ApplyRequest,
@@ -18,6 +31,7 @@ import type {
   CommandModalName,
   OpenDialogPayload,
 } from './rpc/protocol'
+import { isRecord } from './util/record.ts'
 
 // ---------------------------------------------------------------------------
 // Command name constants
@@ -30,6 +44,7 @@ export const OPENAI_KILLSWITCH_COMMAND_NAME = 'openai-killswitch'
 export const OPENAI_DUMP_COMMAND_NAME = 'openai-dump'
 export const OPENAI_LOGGING_COMMAND_NAME = 'openai-logging'
 export const OPENAI_CACHEKEEP_COMMAND_NAME = 'openai-cachekeep'
+export const OPENAI_RESET_COMMAND_NAME = 'openai-reset'
 
 export const MODAL_COMMANDS: CommandModalName[] = [
   'openai-quota',
@@ -39,6 +54,7 @@ export const MODAL_COMMANDS: CommandModalName[] = [
   'openai-dump',
   'openai-logging',
   'openai-cachekeep',
+  'openai-reset',
 ]
 
 // ---------------------------------------------------------------------------
@@ -84,6 +100,20 @@ export interface CommandContext {
   clearStickyRouting?: (sessionId: string) => Promise<boolean>
   /** Resolves the current session's usable sticky account, if one exists. */
   getStickyRouting?: (sessionId: string) => Promise<string | undefined>
+  resolveResetTarget?: (accountKey: string) => Promise<ResetTargetIdentity>
+  fetchImpl?: typeof fetch
+  now?: () => number
+  randomUUID?: () => string
+  refreshResetTargetQuota?: (
+    accountKey: string,
+  ) => Promise<RefreshAllQuotaResult>
+}
+
+export interface ResetTargetIdentity {
+  accountKey: string
+  label: string
+  accessToken: string
+  chatgptAccountId?: string
 }
 
 const log = createLogger('commands')
@@ -171,6 +201,28 @@ async function executeQuotaCommand(
   return { command: 'openai-quota', text: lines.join('\n'), knobs: {} }
 }
 
+/**
+ * Project a stored account down to the fields a dialog may see.
+ *
+ * Stored accounts carry live credentials (`access`, `refresh`, `apiKey`). Knobs
+ * are returned across the loopback RPC boundary and JSON-serialized to the TUI,
+ * so handing back raw account objects would publish those secrets to every RPC
+ * client and into anything that logs an apply result. The dialogs only ever need
+ * identity here — the account list is rendered from `text`, and the TUI reads
+ * nothing from these entries but their count.
+ *
+ * Build the result field by field. A destructuring omit (`...rest`) would
+ * silently republish any secret added to the account types later.
+ */
+function accountKnob(account: FallbackAccount) {
+  return {
+    id: account.id,
+    type: account.type ?? 'oauth',
+    enabled: account.enabled,
+    label: account.label,
+  }
+}
+
 async function executeAccountCommand(
   args: string,
   ctx: CommandContext,
@@ -207,7 +259,7 @@ async function executeAccountCommand(
     return {
       command: 'openai-account',
       text: lines.join('\n'),
-      knobs: { accounts },
+      knobs: { accounts: accounts.map(accountKnob) },
     }
   }
 
@@ -229,7 +281,7 @@ async function executeAccountCommand(
       return {
         command: 'openai-account',
         text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts: next.accounts },
+        knobs: { accounts: next.accounts.map(accountKnob) },
       }
     }
 
@@ -239,7 +291,7 @@ async function executeAccountCommand(
     return {
       command: 'openai-account',
       text: `## Account Removed\n\nRemoved account \`${targetId}\`.`,
-      knobs: { accounts: next.accounts },
+      knobs: { accounts: next.accounts.map(accountKnob) },
     }
   }
 
@@ -265,7 +317,7 @@ async function executeAccountCommand(
       return {
         command: 'openai-account',
         text: '## Invalid Order\n\nBoth account IDs must exist.',
-        knobs: { accounts: next.accounts },
+        knobs: { accounts: next.accounts.map(accountKnob) },
       }
     }
     log.info('accounts reordered', { a: tokens[1], b: tokens[2] })
@@ -273,7 +325,7 @@ async function executeAccountCommand(
     return {
       command: 'openai-account',
       text: `## Accounts Reordered\n\nSwapped positions of \`${tokens[1]}\` and \`${tokens[2]}\`.`,
-      knobs: { accounts: next.accounts },
+      knobs: { accounts: next.accounts.map(accountKnob) },
     }
   }
 
@@ -371,7 +423,7 @@ async function executeAccountCommand(
   return {
     command: 'openai-account',
     text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
-    knobs: { accounts },
+    knobs: { accounts: accounts.map(accountKnob) },
   }
 }
 
@@ -1015,11 +1067,639 @@ async function executeCachekeepCommand(
   }
 }
 
+type ResetPreviewRow = {
+  accountKey: string
+  label: string
+  chatgptAccountId?: string
+  usedPercent?: number
+  resetTime?: string
+  availableCount?: number
+  applicableAvailableCount?: number
+  eligible: boolean
+  reason?: string
+  selectedCreditId?: string
+  selectedCreditExpiresAt?: string
+}
+
+type ResetCommandContext = CommandContext &
+  Required<
+    Pick<
+      CommandContext,
+      | 'resolveResetTarget'
+      | 'fetchImpl'
+      | 'now'
+      | 'randomUUID'
+      | 'refreshResetTargetQuota'
+    >
+  >
+
+function resetUsedPercent(snapshot: {
+  primary?: { usedPercent: number }
+  secondary?: { usedPercent: number }
+}): number | undefined {
+  const values = [
+    snapshot.primary?.usedPercent,
+    snapshot.secondary?.usedPercent,
+  ].filter((value): value is number => value !== undefined)
+  return values.length > 0 ? Math.max(...values) : undefined
+}
+
+function resetWindowTime(
+  snapshot: {
+    primary?: { usedPercent: number; resetsAt?: string }
+    secondary?: { usedPercent: number; resetsAt?: string }
+  },
+  now: number,
+): string | undefined {
+  const windows = [snapshot.primary, snapshot.secondary].filter(
+    (window): window is { usedPercent: number; resetsAt?: string } =>
+      window !== undefined,
+  )
+  const liveExhausted = windows.filter((window) =>
+    resetWindowIsExhausted(window, now),
+  )
+  return (liveExhausted.length > 0 ? liveExhausted : windows).sort(
+    (left, right) => right.usedPercent - left.usedPercent,
+  )[0]?.resetsAt
+}
+
+function resetSnapshotIsHealthy(
+  snapshot:
+    | {
+        primary?: { usedPercent: number; resetsAt?: string }
+        secondary?: { usedPercent: number; resetsAt?: string }
+      }
+    | undefined,
+  now: number,
+): boolean {
+  if (!snapshot) return false
+  const windows = [snapshot.primary, snapshot.secondary].filter(
+    (window): window is { usedPercent: number; resetsAt?: string } =>
+      window !== undefined,
+  )
+  if (windows.length === 0) return false
+  return windows.every((window) => !resetWindowIsExhausted(window, now))
+}
+
+function decodeResetArg(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return undefined
+  }
+}
+
+async function buildResetPreviewRow(
+  accountKey: string,
+  ctx: ResetCommandContext,
+): Promise<ResetPreviewRow> {
+  try {
+    const target = await ctx.resolveResetTarget(accountKey)
+    const wireAccountId =
+      target.accountKey === 'main' ? undefined : target.chatgptAccountId
+    const [quota, credits] = await Promise.all([
+      whamUsageFn({
+        accessToken: target.accessToken,
+        fetchImpl: ctx.fetchImpl,
+        now: ctx.now,
+        accountId: target.chatgptAccountId,
+      }),
+      listResetCredits(ctx.fetchImpl, target.accessToken, wireAccountId),
+    ])
+    const selectedCredit = selectCreditToSpend(credits.credits)
+    const availableCount =
+      credits.availableCount ?? quota.resetCreditsAvailable ?? 0
+    const applicableAvailableCount = quota.resetCreditsApplicable ?? 0
+    const precondition = evaluateResetPrecondition(
+      quota,
+      ctx.quotaManager.isRateLimited(accountKey),
+      applicableAvailableCount,
+      ctx.now(),
+    )
+    let reason: string | undefined
+    if (!target.chatgptAccountId) {
+      reason = 'stable ChatGPT account identity unavailable'
+    } else if (!precondition.ok) {
+      reason = precondition.reason
+    } else if (!selectedCredit) {
+      reason = 'no eligible credit'
+    }
+    return {
+      accountKey: target.accountKey,
+      label: target.label,
+      chatgptAccountId: target.chatgptAccountId,
+      usedPercent: resetUsedPercent(quota),
+      resetTime: resetWindowTime(quota, ctx.now()),
+      availableCount,
+      applicableAvailableCount,
+      eligible: reason === undefined,
+      reason,
+      selectedCreditId: selectedCredit?.id,
+      selectedCreditExpiresAt: selectedCredit?.expiresAt,
+    }
+  } catch (error) {
+    log.warn('reset preview row failed', {
+      accountKey,
+      error: (error as Error)?.message ?? String(error),
+    })
+    return {
+      accountKey,
+      label: accountKey === 'main' ? 'Main account' : accountKey,
+      eligible: false,
+      reason: (error as Error)?.message ?? String(error),
+    }
+  }
+}
+
+function renderResetAccountList(rows: readonly ResetPreviewRow[]): string {
+  const lines = [
+    '## Reset credits',
+    '',
+    'Select an account to fetch a fresh confirmation preview:',
+    '',
+  ]
+  for (const row of rows) {
+    const usage =
+      row.usedPercent === undefined
+        ? 'quota unavailable'
+        : `${row.usedPercent}% used`
+    const credits =
+      row.availableCount === undefined
+        ? 'credits unavailable'
+        : `${row.applicableAvailableCount ?? 0}/${row.availableCount} applicable/available`
+    const status = row.eligible
+      ? `eligible · credit ${row.selectedCreditId} expires ${row.selectedCreditExpiresAt}`
+      : row.reason
+    lines.push(
+      `- **${row.label}** (\`${row.accountKey}\`) — ${usage}; ${credits}; ${status}`,
+    )
+  }
+  lines.push('')
+  lines.push('Command: `/openai-reset select <encodedAccountKey>`')
+  return lines.join('\n')
+}
+
+function renderResetConfirm(row: ResetPreviewRow): string {
+  const lines = [
+    '## Confirm reset credit',
+    '',
+    `Account: **${row.label}** (\`${row.accountKey}\`)`,
+    `Current quota: **${row.usedPercent ?? 'unknown'}% used**`,
+    `Credit: **Spend 1 of ${row.applicableAvailableCount ?? 0}**`,
+    `Credit expires: **${row.selectedCreditExpiresAt ?? 'unavailable'}**`,
+    `Quota resets: **${row.resetTime ?? 'unavailable'}**`,
+    '',
+  ]
+  if (row.eligible && row.chatgptAccountId) {
+    lines.push(
+      `Confirm: \`/openai-reset confirm ${encodeURIComponent(row.accountKey)} ${encodeURIComponent(row.chatgptAccountId)}\``,
+    )
+  } else {
+    lines.push(`Cannot reset: **${row.reason ?? 'not eligible'}**`)
+  }
+  return lines.join('\n')
+}
+
+function resetResultPayload(
+  accountKey: string,
+  code: string,
+  text: string,
+  knobs: Record<string, unknown> = {},
+): OpenDialogPayload {
+  return {
+    command: OPENAI_RESET_COMMAND_NAME,
+    text,
+    knobs: { stage: 'result', accountKey, code, ...knobs },
+  }
+}
+
+function resetErrorPayload(
+  accountKey: string,
+  error: unknown,
+  boundChatgptAccountId?: string,
+): OpenDialogPayload {
+  if (error instanceof ResetRedemptionError) {
+    const messages: Record<string, string> = {
+      identity_mismatch:
+        'The account identity changed before redemption. Reopen the reset account list.',
+      invalid_account_key:
+        'The selected account key is reserved. Reopen the reset account list.',
+      cooldown_active:
+        'This account just reset — re-checking quota. Wait for the cooldown before another redemption.',
+      expired_unreconciled:
+        'The previous attempt outcome is unknown — retry replays the same identifiers, or wait until quota reflects the earlier attempt.',
+      retry_without_inflight:
+        'There is no active reset redemption to retry. Reopen the account list.',
+      not_exhausted:
+        'No credit was spent: the fresh account state is not exhausted.',
+      no_applicable_credits:
+        'No credit was spent: no applicable credits are available.',
+      no_eligible_credit:
+        'No credit was spent: no eligible credit was returned.',
+    }
+    return resetResultPayload(
+      accountKey,
+      error.kind,
+      `## Reset credit\n\n${messages[error.kind]}\n\nCode: \`${error.kind}\``,
+      {
+        cooldownUntil: error.cooldownUntil,
+        ...(error.kind === 'expired_unreconciled'
+          ? {
+              chatgptAccountId: boundChatgptAccountId,
+              retryGuidance:
+                'Retry replays the same request and credit identifiers from the previous attempt.',
+            }
+          : {}),
+      },
+    )
+  }
+  const identityCode = (error as { code?: unknown })?.code
+  if (
+    identityCode === 'unknown_account' ||
+    identityCode === 'disabled_account' ||
+    identityCode === 'non_oauth_account' ||
+    identityCode === 'token_unavailable'
+  ) {
+    const messages = {
+      unknown_account:
+        'Account unavailable: the selected account no longer exists. Reopen the reset account list.',
+      disabled_account:
+        'Account unavailable: the selected account is disabled. Reopen the reset account list.',
+      non_oauth_account:
+        'Account unavailable: the selected account is not authenticated with OAuth. Reopen the reset account list.',
+      token_unavailable:
+        'Authentication problem: the selected account token is unavailable. Reauthenticate the account before retrying.',
+    } as const
+    return resetResultPayload(
+      accountKey,
+      identityCode,
+      `## Reset credit\n\n${messages[identityCode]}\n\nCode: \`${identityCode}\``,
+    )
+  }
+  if (error instanceof ResetCreditError) {
+    return resetResultPayload(
+      accountKey,
+      error.kind,
+      `## Reset credit\n\nNo redemption was attempted: reset credit availability could not be loaded.\n\nCode: \`${error.kind}\``,
+    )
+  }
+  log.warn('reset command failed before a known result', {
+    accountKey,
+    error: (error as Error)?.message ?? String(error),
+  })
+  return resetResultPayload(
+    accountKey,
+    'error',
+    '## Reset credit\n\nThe reset request failed before a known result: internal command failure — see plugin log.',
+  )
+}
+
+export async function renderResetCoordinatorResult(
+  result: RunResetCreditResult,
+  ctx: ResetCommandContext,
+  boundChatgptAccountId?: string,
+): Promise<OpenDialogPayload> {
+  const { accountKey } = result.target
+  const code = result.outcome.kind
+  if (result.finalizeStateWriteFailed) {
+    return resetResultPayload(
+      accountKey,
+      code,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe server outcome recorded as \`${code}\`, but the state write failed. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
+      {
+        stateWriteFailed: true,
+        retryGuidance: result.retrySafety,
+        chatgptAccountId: boundChatgptAccountId,
+      },
+    )
+  }
+  if (code === 'reset' || code === 'already_redeemed') {
+    let refresh: RefreshAllQuotaResult = {
+      account: accountKey,
+      ok: false,
+      error: 'targeted quota refresh did not complete',
+    }
+    try {
+      refresh = await ctx.refreshResetTargetQuota(accountKey)
+    } catch (error) {
+      refresh.error = (error as Error)?.message ?? String(error)
+    }
+    const refreshFailed = !refresh.ok && refresh.error !== undefined
+    if (refreshFailed) {
+      log.warn('reset quota re-check failed', {
+        accountKey,
+        error: refresh.error,
+      })
+    }
+    const entry =
+      accountKey === 'main'
+        ? ctx.quotaManager.getMain()
+        : ctx.quotaManager.getFallback(accountKey)
+    const verifiedFresh =
+      refresh.ok && resetSnapshotIsHealthy(entry?.quota, ctx.now())
+    const remainingCredits = entry?.quota.resetCreditsApplicable
+    const verification = verifiedFresh
+      ? 'Post-verification: **window fresh**.'
+      : `Post-verification: **window not yet refreshed** (server code \`${code}\`).`
+    const refreshDiagnostic = refreshFailed
+      ? '\n\nquota re-check failed — see log.'
+      : ''
+    return resetResultPayload(
+      accountKey,
+      code,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nCode: \`${code}\`\n\n${verification}${refreshDiagnostic}${remainingCredits === undefined ? '' : `\n\nRemaining applicable credits: **${remainingCredits}**`}`,
+      {
+        verifiedFresh,
+        afterUsedPercent: resetUsedPercent(entry?.quota ?? {}),
+        remainingCredits,
+      },
+    )
+  }
+  if (code === 'ambiguous_local') {
+    return resetResultPayload(
+      accountKey,
+      code,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nCode: \`${code}\`\n\n${result.retrySafety}`,
+      { retryGuidance: result.retrySafety },
+    )
+  }
+  if (code === 'ambiguous' || code === 'http_error') {
+    const retryCommand = boundChatgptAccountId
+      ? `/openai-reset retry ${encodeURIComponent(accountKey)} ${encodeURIComponent(boundChatgptAccountId)}`
+      : '/openai-reset'
+    return resetResultPayload(
+      accountKey,
+      code,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with \`${retryCommand}\`. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
+      {
+        retryGuidance: result.retrySafety,
+        chatgptAccountId: boundChatgptAccountId,
+      },
+    )
+  }
+  const meanings: Record<string, string> = {
+    nothing_to_reset:
+      'The server found no exhausted quota window to reset. No reset was confirmed. A new attempt starts fresh and must pass the current preconditions.',
+    no_credit:
+      'The server found no usable reset credit. No reset was confirmed. A new attempt starts fresh and must pass the current preconditions.',
+  }
+  return resetResultPayload(
+    accountKey,
+    code,
+    `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nCode: \`${code}\`\n\n${meanings[code] ?? 'The server returned a no-op result. No reset was confirmed.'}`,
+  )
+}
+
+async function executeResetCommand(
+  args: string,
+  ctx: CommandContext,
+): Promise<OpenDialogPayload> {
+  const missingDeps = [
+    ctx.resolveResetTarget ? undefined : 'resolveResetTarget',
+    ctx.fetchImpl ? undefined : 'fetchImpl',
+    ctx.now ? undefined : 'now',
+    ctx.randomUUID ? undefined : 'randomUUID',
+    ctx.refreshResetTargetQuota ? undefined : 'refreshResetTargetQuota',
+  ].filter((name): name is string => name !== undefined)
+  if (missingDeps.length > 0) {
+    log.warn('reset command dependencies unwired', { missingDeps })
+    return {
+      command: OPENAI_RESET_COMMAND_NAME,
+      text: '## Reset credit\n\nUnavailable: reset command runtime dependencies are not wired.',
+      knobs: {},
+    }
+  }
+  const resetCtx = ctx as ResetCommandContext
+
+  const tokens = args.trim().split(/\s+/).filter(Boolean)
+  const action = tokens[0]
+  if (!action || action === 'refresh') {
+    const storage = await ctx.loadAccounts(ctx.accountStoragePath)
+    const accountKeys = [
+      'main',
+      ...(storage?.accounts ?? [])
+        .filter(
+          (account) => account.enabled !== false && account.type === 'oauth',
+        )
+        .map((account) => account.id),
+    ]
+    log.debug('reset accounts stage requested', { accountKeys })
+    const accounts = await Promise.all(
+      accountKeys.map((accountKey) =>
+        buildResetPreviewRow(accountKey, resetCtx),
+      ),
+    )
+    log.debug('reset accounts stage built', {
+      rows: accounts.map((row) => ({
+        accountKey: row.accountKey,
+        eligible: row.eligible,
+        reason: row.reason,
+        usedPercent: row.usedPercent,
+        availableCount: row.availableCount,
+        applicableAvailableCount: row.applicableAvailableCount,
+      })),
+    })
+    return {
+      command: OPENAI_RESET_COMMAND_NAME,
+      text: renderResetAccountList(accounts),
+      knobs: { stage: 'accounts', accounts },
+    }
+  }
+
+  if (action === 'select') {
+    const accountKey = decodeResetArg(tokens[1])
+    if (
+      !accountKey ||
+      !isSafeResetAccountKey(accountKey) ||
+      tokens.length !== 2
+    ) {
+      return resetResultPayload(
+        '',
+        'invalid_command',
+        'Usage: `/openai-reset select <encodedAccountKey>`',
+      )
+    }
+    const preview = await buildResetPreviewRow(accountKey, resetCtx)
+    if (!preview.eligible) {
+      return resetResultPayload(
+        accountKey,
+        'not_eligible',
+        renderResetConfirm(preview),
+      )
+    }
+    return {
+      command: OPENAI_RESET_COMMAND_NAME,
+      text: renderResetConfirm(preview),
+      knobs: { stage: 'confirm', preview },
+    }
+  }
+
+  if (action === 'confirm' || action === 'retry') {
+    const accountKey = decodeResetArg(tokens[1])
+    const expectedChatgptAccountId = decodeResetArg(tokens[2])
+    if (
+      !accountKey ||
+      !isSafeResetAccountKey(accountKey) ||
+      !expectedChatgptAccountId ||
+      tokens.length !== 3
+    ) {
+      return resetResultPayload(
+        accountKey ?? '',
+        'invalid_command',
+        `Usage: \`/openai-reset ${action} <encodedAccountKey> <encodedChatgptAccountId>\``,
+      )
+    }
+    log.info('reset redemption decision', { accountKey, action })
+    log.debug('reset redemption identity binding', {
+      accountKey,
+      expectedChatgptAccountId,
+    })
+    try {
+      const result = await runResetCreditRedemption(
+        {
+          configPath: ctx.accountStoragePath,
+          mutateAccountsFn: mutateAccounts,
+          loadAccountsFn: ctx.loadAccounts,
+          now: resetCtx.now,
+          randomUUID: resetCtx.randomUUID,
+          fetchImpl: resetCtx.fetchImpl,
+          resolveTarget: resetCtx.resolveResetTarget,
+          fetchUsage: (target) =>
+            whamUsageFn({
+              accessToken: target.accessToken,
+              fetchImpl: resetCtx.fetchImpl,
+              now: resetCtx.now,
+              accountId: target.chatgptAccountId,
+            }),
+          hasActiveRateLimitMark: (key) => ctx.quotaManager.isRateLimited(key),
+        },
+        {
+          accountKey,
+          expectedChatgptAccountId,
+          retry: action === 'retry',
+        },
+      )
+      log.info('reset redemption outcome', {
+        accountKey,
+        code: result.outcome.kind,
+      })
+      return renderResetCoordinatorResult(
+        result,
+        resetCtx,
+        expectedChatgptAccountId,
+      )
+    } catch (error) {
+      const payload = resetErrorPayload(
+        accountKey,
+        error,
+        expectedChatgptAccountId,
+      )
+      log.info('reset redemption outcome', {
+        accountKey,
+        code: payload.knobs.code,
+      })
+      return payload
+    }
+  }
+
+  return resetResultPayload(
+    '',
+    'invalid_command',
+    'Usage: `/openai-reset` | `/openai-reset select <encodedAccountKey>` | `/openai-reset confirm <encodedAccountKey> <encodedChatgptAccountId>` | `/openai-reset retry <encodedAccountKey> <encodedChatgptAccountId>` | `/openai-reset refresh`',
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
+/**
+ * Knob keys that must never cross the RPC boundary.
+ *
+ * These are the credential fields on the stored account types plus the generic
+ * secret names. `authHeader` is included because an API-key account can carry a
+ * full `Authorization` value in it.
+ */
+const CREDENTIAL_KNOB_KEYS = new Set([
+  'access',
+  'refresh',
+  'apikey',
+  'authheader',
+  'password',
+  'secret',
+])
+
+function isCredentialKnobKey(key: string) {
+  const normalized = key.toLowerCase().replace(/[-_]/g, '')
+  if (CREDENTIAL_KNOB_KEYS.has(normalized)) return true
+  // No legitimate knob ends in "token"; a stored access/refresh token reaching a
+  // knob under any name is a leak regardless of what it is called.
+  return normalized.endsWith('token')
+}
+
+/**
+ * Strip credential-shaped fields from a dialog payload's knobs.
+ *
+ * Knobs are returned across the loopback RPC and JSON-serialized to the TUI, so
+ * a knob is a published surface. Individual commands project their own knobs
+ * deliberately (see accountKnob), but this is the boundary backstop: a future
+ * command that returns a stored object directly cannot leak credentials even if
+ * the projection is forgotten, because nothing credential-shaped survives here.
+ *
+ * Scrub rather than throw. A rejected dialog is a visible outage for a live
+ * command, while a scrubbed one keeps working with the leak removed; the warning
+ * is what gets the projection fixed. Recurses into nested objects and arrays,
+ * since the account list arrives as an array of records.
+ */
+// Exported for direct testing: no command currently returns an unprojected knob,
+// so a test driven through buildDialogPayload would pass whether or not the
+// scrub runs. Testing the mechanism itself is what actually has teeth.
+export function scrubKnobs(
+  value: unknown,
+  path: string,
+  found: string[],
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) =>
+      scrubKnobs(entry, `${path}[${index}]`, found),
+    )
+  }
+  if (!isRecord(value)) return value
+  const result: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isCredentialKnobKey(key)) {
+      found.push(`${path}.${key}`)
+      continue
+    }
+    result[key] = scrubKnobs(entry, `${path}.${key}`, found)
+  }
+  return result
+}
+
 export async function buildDialogPayload(
+  command: CommandModalName,
+  args: string,
+  ctx: CommandContext,
+): Promise<OpenDialogPayload> {
+  const payload = await buildDialogPayloadUnchecked(command, args, ctx)
+  const found: string[] = []
+  const knobs = scrubKnobs(payload.knobs, 'knobs', found) as Record<
+    string,
+    unknown
+  >
+  if (found.length > 0) {
+    // Names only — never the values, which are the credentials themselves.
+    log.warn('credential-shaped knob stripped before RPC', {
+      command,
+      fields: found,
+    })
+    return { ...payload, knobs }
+  }
+  return payload
+}
+
+async function buildDialogPayloadUnchecked(
   command: CommandModalName,
   args: string,
   ctx: CommandContext,
@@ -1039,6 +1719,8 @@ export async function buildDialogPayload(
       return executeLoggingCommand(args, ctx)
     case 'openai-cachekeep':
       return executeCachekeepCommand(args, ctx)
+    case 'openai-reset':
+      return executeResetCommand(args, ctx)
     default:
       throw new Error(`unhandled command: ${command}`)
   }

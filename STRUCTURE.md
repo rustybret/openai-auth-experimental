@@ -14,6 +14,7 @@
 │   │   │   ├── util/              # Small dependency-free helpers
 │   │   │   ├── index.ts           # CodexAuthPlugin entry
 │   │   │   ├── cli.ts             # `openai-auth` binary
+│   │   │   ├── codex-http.ts      # HTTP fallback sanitization for WebSocket downgrades
 │   │   │   ├── commands.ts        # /openai-* dialog builders
 │   │   │   ├── config.ts          # Settings resolution (env > file > default)
 │   │   │   ├── logger.ts          # Leveled, redacting, rotating logger
@@ -55,6 +56,7 @@
 │   ├── dev.ts                     # Build + symlink into .opencode/plugins/, run tsc --watch
 │   ├── dev-clean.ts               # Remove the dev symlink
 │   ├── analyze-cache-cliffs.mjs   # Cache cliff analyzer for dumped sessions
+│   ├── measure-store-contention.mjs # Account-store lock contention benchmark under load
 │   ├── release.sh                 # Tag-driven release driver
 │   ├── wait-release.sh            # Poll for the GitHub release to appear
 │   └── version-sync.mjs           # Sync package versions
@@ -71,19 +73,22 @@
 
 **`packages/opencode/src/core/`:**
 - Purpose: Generic, provider-agnostic core. Owns the multi-account store, file locks, retry/backoff math, quota cache/refresh orchestration, OAuth flow primitives, cache keep-warm, and atomic-write helpers. The Codex-specific bits (`codexRefreshFn`, `whamUsageFn`, JWT/account-id extraction) are injected via the `provider.ts` seam or live in `oauth.ts` so the layer can stay provider-agnostic.
-- Contains: `accounts.ts`, `atomic-write.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`.
+- Contains: `accounts.ts`, `atomic-write.ts`, `background-quota-refresh.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`, `reset-credits.ts`, `sticky-routing.ts`.
 - Key files:
   - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache, backoff, and mid-stream rate limit marking
+  - `packages/opencode/src/core/background-quota-refresh.ts` — `BackgroundQuotaRefresh` (periodic jittered poller for idle account quota with cross-process lease lock)
+  - `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification
+  - `packages/opencode/src/core/reset-credits.ts` — reset-credit listing, eligibility checks, persisted claims, and consumption
   - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
   - `packages/opencode/src/core/backoff.ts` — refresh/quota backoff math + `hashRefreshToken`
-  - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock
+  - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock with separated acquire window and lock TTL
   - `packages/opencode/src/core/provider.ts` — Codex-specific injection seam (`codexRefreshFn`, `whamUsageFn`)
 
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between the auth loader and the TUI sidebar.
-- Contains: `rpc-server.ts` (bearer-token HTTP server, 1 MiB body cap), `port-file.ts` (`port-<pid>.json` write + discovery), `rpc-client.ts` (TUI-side client with 2s timeout), `rpc-dir.ts` (`XDG_STATE_HOME/cortexkit/openai-auth/rpc/<sha256(projectDir)>/`), `notifications.ts` (queue + per-session TUI-connected tracking), `protocol.ts` (wire types).
+- Contains: `rpc-server.ts` (bearer-token HTTP server, 1 MiB body cap), `port-file.ts` (`port-<pid>.json` write + discovery), `rpc-client.ts` (TUI-side client with 2s timeout), `rpc-dir.ts` (`XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<sha256(projectDir)>/` with startup sweeps for dead port files and empty project directories), `notifications.ts` (queue + per-session TUI-connected tracking), `protocol.ts` (wire types).
 - Key files: `packages/opencode/src/rpc/rpc-server.ts`, `packages/opencode/src/rpc/rpc-client.ts`, `packages/opencode/src/rpc/notifications.ts`.
 
 **`packages/opencode/src/tests/`:**
@@ -113,8 +118,8 @@
 
 **`scripts/`:**
 - Purpose: Release + local dev tooling.
-- Contains: `dev.ts` (build + symlink into `.opencode/plugins/` + tsc --watch), `dev-clean.ts` (remove the symlink), `analyze-cache-cliffs.mjs` (cache cliff analyzer for dumped sessions), `release.sh` (tag-driven release driver), `wait-release.sh` (poll for the GitHub release), `version-sync.mjs` (sync package versions).
-- Key files: `scripts/dev.ts`, `scripts/release.sh`, `scripts/analyze-cache-cliffs.mjs`.
+- Contains: `dev.ts` (build + symlink into `.opencode/plugins/` + tsc --watch), `dev-clean.ts` (remove the symlink), `analyze-cache-cliffs.mjs` (cache cliff analyzer for dumped sessions), `measure-store-contention.mjs` (account-store lock contention benchmark under load / correlated arrival), `release.sh` (tag-driven release driver), `wait-release.sh` (poll for the GitHub release), `version-sync.mjs` (sync package versions).
+- Key files: `scripts/dev.ts`, `scripts/release.sh`, `scripts/analyze-cache-cliffs.mjs`, `scripts/measure-store-contention.mjs`.
 
 ## Key File Locations
 
@@ -137,11 +142,15 @@
 - `packages/opencode/src/core/accounts.ts` — multi-account store, `FallbackAccountManager`.
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
 - `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
+- `packages/opencode/src/core/background-quota-refresh.ts` — periodic background quota refresher with jittered interval, freshness gate, and cross-process lease lock.
+- `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification.
 - `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, subagent warm caps, and main-only sustain that bypasses idle pruning but not memory/LRU caps.
+- `packages/opencode/src/core/reset-credits.ts` — reset-credit listing, eligibility checks, persisted redemption claims, bounded consume requests, and terminal-outcome finalization.
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
 - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock.
+- `packages/opencode/src/codex-http.ts` — HTTP fallback sanitization for WebSocket downgrades.
 - `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool.
 - `packages/opencode/src/ws.ts` — low-level WS connect/stream.
 - `packages/opencode/src/WEBSOCKET.md` — developer reference for WebSocket flow, lifetime, and retry strategies.
@@ -155,12 +164,15 @@
 
 **Tests:**
 - `packages/opencode/src/tests/` — co-located bun tests (`*.test.ts`).
+- `packages/opencode/src/tests/reset-credits.test.ts` — reset-credit listing and consumption, redemption preconditions, and atomic persisted redemption state.
+- `packages/opencode/src/tests/background-quota-refresh.test.ts` — background quota poller tests, lease renewal, and snapshot timestamp merging.
+- `packages/opencode/src/tests/sticky-routing.test.ts` — sticky-balanced selection, sustainable spend weighting, and sticky break decisions.
 - `packages/opencode/bunfig.toml` — bun test config.
 - Run: `bun run test` (root) → `cd packages/opencode && bun run test`.
 
 ## Naming Conventions
 
-**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
+**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `codex-http.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
 Example: `packages/opencode/src/core/cachekeep.ts`, `packages/opencode/src/rpc/rpc-server.ts`.
 
 **Directories:** lowercase-kebab. Subdirectories group by layer (`core/`, `rpc/`, `tests/`, `tui/`, `util/`).
@@ -172,7 +184,7 @@ Example: `packages/opencode/src/tests/accounts-store.test.ts` tests `packages/op
 **Types/classes:** PascalCase (`CodexAuthPlugin`, `FallbackAccountManager`, `QuotaManager`, `CacheKeepManager`, `OpenAIWebSocketPool`, `ResponseStreamError`).
 Example: `packages/opencode/src/core/cachekeep.ts` exports `CacheKeepManager`.
 
-**Command name constants:** SCREAMING_SNAKE_CASE prefixed with `OPENAI_` (`OPENAI_QUOTA_COMMAND_NAME`, `OPENAI_ACCOUNT_COMMAND_NAME`, `OPENAI_ROUTING_COMMAND_NAME`, `OPENAI_KILLSWITCH_COMMAND_NAME`, `OPENAI_DUMP_COMMAND_NAME`, `OPENAI_LOGGING_COMMAND_NAME`, `OPENAI_CACHEKEEP_COMMAND_NAME`).
+**Command name constants:** SCREAMING_SNAKE_CASE prefixed with `OPENAI_` (`OPENAI_QUOTA_COMMAND_NAME`, `OPENAI_ACCOUNT_COMMAND_NAME`, `OPENAI_ROUTING_COMMAND_NAME`, `OPENAI_KILLSWITCH_COMMAND_NAME`, `OPENAI_DUMP_COMMAND_NAME`, `OPENAI_LOGGING_COMMAND_NAME`, `OPENAI_CACHEKEEP_COMMAND_NAME`, `OPENAI_RESET_COMMAND_NAME`).
 Example: `packages/opencode/src/commands.ts`.
 
 **Environment variables:** SCREAMING_SNAKE_CASE with the `CORTEXKIT_OPENAI_AUTH_*` and `OPENCODE_OPENAI_AUTH_*` prefixes (negative-prefixed `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` for the default-on cache fix).
