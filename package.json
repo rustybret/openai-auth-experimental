@@ -6,21 +6,21 @@
     "packages/*"
   ],
   "scripts": {
-    "fork-sync": "bash scripts/fork-sync.sh",
-    "package:arcus": "bash scripts/pack-arcus.sh",
     "build": "cd packages/opencode && bun run build && cd ../pi && bun run build",
+    "build:arcus": "bun run build && bash scripts/pack-arcus.sh",
+    "package:arcus": "bash scripts/pack-arcus.sh",
+    "publish:arcus": "bash scripts/publish-arcus-artifact.sh",
+    "fork-sync": "bash scripts/fork-sync.sh",
+    "sync:fork": "bash scripts/fork-sync.sh",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "analyze:cache": "bun scripts/analyze-cache-cliffs.mjs",
-    "test": "cd packages/opencode && bun run test && cd ../pi && bun run test",
+    "test": "bun test",
     "typecheck": "cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck",
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",
-    "lint": "biome lint .",
-    "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
-    "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
-    "prepublishOnly": "bun run build"
+    "lint": "biome lint ."
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

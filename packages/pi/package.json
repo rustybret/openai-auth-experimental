@@ -33,8 +33,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",
-    "types": "tsc",
-    "prepublishOnly": "bun run build"
+    "types": "tsc"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.10",
