@@ -369,6 +369,97 @@ describe('request dumps', () => {
     })
   })
 
+  async function readMetas(dumpDir: string) {
+    const names = (await readdir(dumpDir)).filter((name) =>
+      name.endsWith('.meta.json'),
+    )
+    return await Promise.all(
+      names.map(async (name) =>
+        JSON.parse(await readFile(join(dumpDir, name), 'utf8')),
+      ),
+    )
+  }
+
+  test('recovers a diff baseline from disk after a restart', async () => {
+    // The in-memory baseline dies with the process, so before this the first
+    // dump after a restart reported no diff at all — on exactly the request the
+    // diff exists to explain, since a restart is when the prompt cache is most
+    // likely to break. resetDumpStateForTest() stands in for the restart.
+    await withDumpEnv(async (dumpDir) => {
+      const body = (turns: number) =>
+        JSON.stringify({
+          model: 'gpt-5.6-sol',
+          input: Array.from({ length: turns }, (_unused, i) => ({
+            role: 'user',
+            content: `turn ${i}`,
+          })),
+        })
+
+      await dumpCodexRequest({
+        sessionID: 'ses_restart_baseline',
+        transport: 'http',
+        phase: 'http',
+        bodyText: body(1),
+      })
+
+      resetDumpStateForTest()
+
+      await dumpCodexRequest({
+        sessionID: 'ses_restart_baseline',
+        transport: 'http',
+        phase: 'http',
+        bodyText: body(2),
+      })
+
+      // Selected by content, not by sort position: two dumps written in the
+      // same millisecond sort alphabetically by session rather than
+      // chronologically, so indexing into the sorted list silently reads the
+      // wrong dump and passes vacuously.
+      const metas = await readMetas(dumpDir)
+      expect(metas.length).toBe(2)
+      const afterRestart = metas.find((meta) => meta.diff !== null)
+      expect(afterRestart).toBeDefined()
+      expect(afterRestart.baselineSource).toBe('disk')
+      expect(afterRestart.diff).not.toBeNull()
+      expect(afterRestart.diff.changed).toBe(true)
+      // Non-vacuous: an append must be reported as a change starting inside the
+      // body rather than at byte zero, which is what a wrong baseline yields.
+      expect(afterRestart.diff.firstByte).toBeGreaterThan(0)
+    })
+  })
+
+  test('does not borrow a diff baseline from a different session', async () => {
+    // The recovery scans a shared dump directory, so it must key on the session
+    // and transport rather than picking up whatever body was written last.
+    await withDumpEnv(async (dumpDir) => {
+      await dumpCodexRequest({
+        sessionID: 'ses_baseline_owner',
+        transport: 'http',
+        phase: 'http',
+        bodyText: JSON.stringify({ input: ['owner'] }),
+      })
+
+      resetDumpStateForTest()
+
+      await dumpCodexRequest({
+        sessionID: 'ses_baseline_other',
+        transport: 'http',
+        phase: 'http',
+        bodyText: JSON.stringify({ input: ['other'] }),
+      })
+
+      // Both dumps are asserted, so neither a borrowed baseline nor a missing
+      // dump can pass. Selected by session rather than sort position for the
+      // same-millisecond reason noted above.
+      const metas = await readMetas(dumpDir)
+      expect(metas.length).toBe(2)
+      for (const meta of metas) {
+        expect(meta.baselineSource).toBeUndefined()
+        expect(meta.diff).toBeNull()
+      }
+    })
+  })
+
   test('preserves non-secret JSON dump body bytes', async () => {
     await withDumpEnv(async (dumpDir) => {
       const bodyText = '{\n  "model": "gpt-5.5-fast",\n  "input": []\n}\n'
