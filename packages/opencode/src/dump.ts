@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getSettings } from './config'
 import { createLogger, redact } from './logger'
@@ -11,7 +11,8 @@ export const DUMP_SESSION_HEADER = 'x-cortexkit-openai-auth-dump-session'
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
 type DumpTransport = 'http' | 'websocket'
-type DumpPhase = 'http' | 'prewarm' | 'main'
+const DUMP_PHASES = ['http', 'prewarm', 'main'] as const
+type DumpPhase = (typeof DUMP_PHASES)[number]
 
 let nextDumpId = 0
 
@@ -106,6 +107,58 @@ function rememberPreviousBody(key: string, bodyText: string) {
     }
   }
   previousBodies.set(key, bodyText)
+}
+
+/**
+ * Keys whose disk baseline has already been looked up this process.
+ *
+ * Separate from `previousBodies` so a key with no prior dump on disk is not
+ * re-scanned on every request — a miss must be remembered as firmly as a hit.
+ */
+const diskBaselineChecked = new Set<string>()
+
+/**
+ * Recover a diff baseline from the dump directory on the first dump of a key.
+ *
+ * `previousBodies` dies with the process, so without this the first request
+ * after a restart reports no diff at all. That is the request the diff matters
+ * most for: a restart is exactly when the prompt cache is most likely to break,
+ * and "no baseline" is indistinguishable from "nothing changed" in the metadata.
+ *
+ * The baseline is read back from the dumps themselves rather than persisted
+ * separately. The previous body is already on disk as a `.body.json`, so
+ * recovering it needs no new state, and clearing the dump directory correctly
+ * clears the baseline with it — a baseline that outlived its dump would diff
+ * against a body the operator can no longer open.
+ *
+ * Best-effort by construction: any failure yields no baseline, which is exactly
+ * today's behaviour.
+ */
+async function recoverBaselineFromDisk(
+  dumpDir: string,
+  sessionID: string,
+  transport: DumpTransport,
+): Promise<string | undefined> {
+  const segment = fileSegment(sessionID)
+  // Match the full filename tail rather than a substring: a session id that
+  // itself ends in the transport name would otherwise collide with a different
+  // session's dumps.
+  const suffixes = DUMP_PHASES.map(
+    (phase) => `-${segment}-${transport}-${phase}.body.json`,
+  )
+  try {
+    const entries = await readdir(dumpDir)
+    // Filenames are ISO-timestamp-then-counter prefixed, so lexicographic order
+    // is chronological.
+    const newest = entries
+      .filter((name) => suffixes.some((suffix) => name.endsWith(suffix)))
+      .sort()
+      .pop()
+    if (!newest) return undefined
+    return await readFile(join(dumpDir, newest), 'utf8')
+  } catch {
+    return undefined
+  }
 }
 
 function headersToRecord(headers: DumpHeaders | undefined) {
@@ -212,7 +265,13 @@ export async function dumpCodexRequest(input: {
 
   nextDumpId++
   const sessionID = input.sessionID?.trim() || 'session-unknown'
-  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${String(nextDumpId).padStart(5, '0')}-${fileSegment(sessionID)}-${input.transport}-${input.phase}`
+  // The pid is part of the name because the counter alone does not make it
+  // unique. Every process starts the counter at zero, and the default dump
+  // directory is a fixed path, so two processes dumping the same session in the
+  // same millisecond would otherwise write the same filename and one would
+  // silently overwrite the other — a lost artifact in the tool used to explain
+  // lost cache hits. A restart is the same collision with one process.
+  const id = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}-${String(nextDumpId).padStart(5, '0')}-${fileSegment(sessionID)}-${input.transport}-${input.phase}`
   const prefix = join(settings.dumpDir, id)
   const files = {
     body: `${prefix}.body.json`,
@@ -220,7 +279,19 @@ export async function dumpCodexRequest(input: {
     request: `${prefix}.request.json`,
   }
   const previousKey = `${input.transport}:${sessionID}`
-  const previousBodyText = previousBodies.get(previousKey)
+  let previousBodyText = previousBodies.get(previousKey)
+  let baselineSource: 'memory' | 'disk' | undefined = previousBodyText
+    ? 'memory'
+    : undefined
+  if (previousBodyText === undefined && !diskBaselineChecked.has(previousKey)) {
+    diskBaselineChecked.add(previousKey)
+    previousBodyText = await recoverBaselineFromDisk(
+      settings.dumpDir,
+      sessionID,
+      input.transport,
+    )
+    if (previousBodyText !== undefined) baselineSource = 'disk'
+  }
 
   try {
     await mkdir(settings.dumpDir, { recursive: true, mode: 0o700 })
@@ -237,7 +308,12 @@ export async function dumpCodexRequest(input: {
       error: input.error,
       bodyBytes: input.bodyText.length,
       bodyHash: hashText(input.bodyText),
-      diff: diffSummary(previousBodyText, input.bodyText),
+      // Diffed on the redacted text, which is what lands in the `.body.json`
+      // beside this metadata. Byte offsets therefore index the file an operator
+      // can actually open, and a disk-recovered baseline (also redacted)
+      // compares like with like instead of reporting redaction as a change.
+      diff: diffSummary(previousBodyText, bodyForDump),
+      baselineSource,
       body: bodySummary(input.bodyText),
       files,
     }
@@ -268,7 +344,7 @@ export async function dumpCodexRequest(input: {
       body: files.body,
       meta: files.metadata,
     })
-    rememberPreviousBody(previousKey, input.bodyText)
+    rememberPreviousBody(previousKey, bodyForDump)
   } catch (error) {
     // Dumping is diagnostic-only. Never write failures to stderr: OpenCode surfaces plugin stderr
     // directly in the TUI, which would make an optional debug feature noisy for users.
@@ -286,6 +362,14 @@ export async function dumpDiagnostic(event: Record<string, unknown>) {
 }
 
 export function resetDumpStateForTest() {
-  nextDumpId = 0
+  // Deliberately does NOT rewind nextDumpId. This stands in for a fresh
+  // process, and a real one differs from its predecessor by pid, which is in
+  // the filename. Rewinding the counter instead makes two dumps collide on a
+  // filename whenever they land in the same millisecond — a collision a real
+  // restart cannot produce, which would silently overwrite the very artifact a
+  // restart test is inspecting.
   previousBodies.clear()
+  // A fresh process has not yet looked on disk for any key, so leaving this
+  // populated would suppress the cold-start recovery a restart should trigger.
+  diskBaselineChecked.clear()
 }

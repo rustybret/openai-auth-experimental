@@ -7,8 +7,20 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
-import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/api/openai-codex-responses'
-
+// Imported from `/compat` rather than the deep `/api/openai-codex-responses`
+// path. Pi's extension loader rewrites pi-ai specifiers so extensions share its
+// SDK instance, and its alias table has entries only for the bare root,
+// `/compat`, `/oauth`, and `/providers/all`. A deep path prefix-matches the root
+// entry, so the remainder is appended to that alias target — a single file —
+// producing `dist/compat.js/api/openai-codex-responses` and failing the whole
+// extension load. The deep import is valid under the package's own exports map,
+// so this only breaks under pi's loader.
+//
+// `/compat` is the specifier that works in both places: it is aliased
+// explicitly by the loader, and it resolves to the same file under plain Node.
+// The bare root does NOT work outside pi — it resolves to `dist/index.js`,
+// which does not export `streamSimple`.
+import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/compat'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { RawWebSocket } from './raw-ws-node.ts'

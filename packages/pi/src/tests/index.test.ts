@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
 
@@ -8,6 +10,44 @@ type RegisteredProvider = {
 }
 
 describe('Pi OpenAI auth extension', () => {
+  it("imports pi-ai only through specifiers pi's extension loader can alias", () => {
+    // Pi rewrites pi-ai specifiers so extensions share its SDK instance, and its
+    // alias table covers only these four. A specifier outside the table still
+    // prefix-matches the bare root, so the remainder is appended to that alias
+    // target — a single file — and the whole extension fails to load. A deep
+    // path like `pi-ai/api/openai-codex-responses` is valid under the package's
+    // own exports map, so nothing but pi's loader rejects it and neither
+    // typecheck nor build catches it.
+    //
+    // The bare root is deliberately NOT accepted here: under pi it aliases to
+    // compat.js, but outside pi it resolves to dist/index.js, which does not
+    // export the streaming API this extension needs.
+    const aliasable = new Set([
+      '@earendil-works/pi-ai/compat',
+      '@earendil-works/pi-ai/oauth',
+      '@earendil-works/pi-ai/providers/all',
+    ])
+    const source = readFileSync(join(import.meta.dir, '..', 'index.ts'), 'utf8')
+    const specifiers = [
+      ...new Set(
+        [...source.matchAll(/from\s+'(@earendil-works\/[^']+)'/g)].map(
+          (match) => match[1] as string,
+        ),
+      ),
+    ]
+
+    // Non-vacuous: the extension must actually import from pi-ai, or an empty
+    // set would satisfy the check below without proving anything.
+    expect(specifiers.length).toBeGreaterThan(0)
+
+    const unaliasable = specifiers.filter(
+      (specifier) =>
+        specifier.startsWith('@earendil-works/pi-ai/') &&
+        !aliasable.has(specifier),
+    )
+    expect(unaliasable).toEqual([])
+  })
+
   it('registers the OpenAI Codex provider and its supported models', () => {
     const registrations: Array<{
       id: string
