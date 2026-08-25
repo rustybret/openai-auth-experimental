@@ -2756,6 +2756,18 @@ describe('integration: active fallback routing', () => {
     return captured
   }
 
+  /**
+   * True for the turn's own request to the provider.
+   *
+   * The loader also issues authorized background traffic — wham/usage quota
+   * refreshes and OAuth token exchanges — which is unawaited, so a recorder that
+   * captures every fetch races it. Filtering by destination keeps an assertion
+   * about routing an assertion about routing.
+   */
+  function isResponsesSend(url: unknown) {
+    return String(url).includes('/responses')
+  }
+
   function headerValue(init: unknown, name: string) {
     const headers = (init as { headers?: HeadersInit } | undefined)?.headers
     if (!headers) return ''
@@ -5874,11 +5886,18 @@ describe('integration: active fallback routing', () => {
     seedStorage({ access: undefined, expires: Date.now() - 60_000 })
     const seen: Array<{ authorization: string; accountId: string | null }> = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
-      seen.push({
-        authorization: headerValue(init, 'authorization'),
-        accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
-      })
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      // Record the turn's own send only. Configuring a fallback starts the
+      // loader's background quota refresh, whose wham/usage call is authorized
+      // and unawaited, so recording every authorized fetch makes this assertion
+      // a race: the quota call lands before it on an idle machine and after it
+      // under suite load.
+      if (isResponsesSend(url)) {
+        seen.push({
+          authorization: headerValue(init, 'authorization'),
+          accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
+        })
+      }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
 
