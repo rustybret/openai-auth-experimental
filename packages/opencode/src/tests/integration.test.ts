@@ -2205,8 +2205,17 @@ describe('integration: WS quota push', () => {
     )
 
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    // The quota endpoint is deliberately unavailable: this test seeds reset
+    // credits into the sidebar and asserts a WS quota push preserves them. The
+    // loader's init quota refresh answers from this same stub, and a successful
+    // empty body there publishes a snapshot carrying no credits, which erases
+    // the seeded value before the assertion reads it.
+    globalThis.fetch = (async (url: unknown) =>
+      isResponsesSend(url)
+        ? new Response('{}', { status: 200 })
+        : new Response('{}', {
+            status: 500,
+          })) as unknown as typeof globalThis.fetch
     let hooks: Hooks | undefined
     let releaseFirstEvent: (() => void) | undefined
     let quotaFrameSent: (() => void) | undefined
