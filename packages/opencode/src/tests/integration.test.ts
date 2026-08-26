@@ -1173,9 +1173,12 @@ describe('integration: killswitch enforcement', () => {
       sawA = resolve
     })
     const seenAuth: string[] = []
-    globalThis.fetch = (async (_url: unknown, request?: unknown) => {
+    globalThis.fetch = (async (url: unknown, request?: unknown) => {
       const auth = headerValue(request, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('access-A')) {
         sawA?.()
         return new Promise<Response>((resolve) => {
@@ -1285,7 +1288,10 @@ describe('integration: killswitch enforcement', () => {
         })
       }
       const authorization = headerValue(request, 'authorization')
-      seenAuth.push(authorization)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(authorization)
       return quotaResponse(authorization.includes('access-B') ? 95 : 10)
     }) as unknown as typeof globalThis.fetch
 
@@ -4376,10 +4382,15 @@ describe('integration: active fallback routing', () => {
       if (String(url).includes('/oauth/token')) {
         throw new Error('refresh unavailable')
       }
-      seen.push({
-        authorization: headerValue(init, 'authorization'),
-        accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
-      })
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) {
+        seen.push({
+          authorization: headerValue(init, 'authorization'),
+          accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
+        })
+      }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
 
@@ -5768,7 +5779,10 @@ describe('integration: active fallback routing', () => {
         throw new Error('refresh unavailable')
       }
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-access-token')) {
         throw new Error('ECONNRESET')
       }
@@ -5805,9 +5819,12 @@ describe('integration: active fallback routing', () => {
     seedStorage({ access: 'fallback-access-token' })
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       throw new DOMException('request aborted', 'AbortError')
     }) as unknown as typeof globalThis.fetch
 
@@ -6083,9 +6100,12 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     // Main (main-stale-token) is rate-limited → reactive fallback to fallback-1.
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       return new Response('{}', {
         status: auth.includes('main-stale-token') ? 429 : 200,
       })
@@ -6144,9 +6164,12 @@ describe('integration: active fallback routing', () => {
 
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-access-token')) {
         return new Response('{}', {
           status: 429,
@@ -6347,9 +6370,12 @@ describe('integration: active fallback routing', () => {
 
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-throw-token')) throw new Error('ECONNRESET')
       if (auth.includes('fallback-never-token')) {
         return new Response('should not be called', { status: 200 })
