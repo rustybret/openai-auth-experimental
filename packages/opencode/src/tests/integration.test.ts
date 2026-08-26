@@ -1179,6 +1179,14 @@ describe('integration: killswitch enforcement', () => {
       // unawaited quota refresh at init, so recording every authorized fetch
       // makes this assertion race it.
       if (isResponsesSend(url)) seenAuth.push(auth)
+      // Serve quota only to the turn's own send. This stub answers every URL,
+      // and the loader's init quota refresh calls wham/usage before the test's
+      // first request — so without this the refresh seeds the 95%-used quota
+      // below, the killswitch acts on it, and the request under test is blocked
+      // before the identity logic this test is about ever runs.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 200 })
+      }
       if (auth.includes('access-A')) {
         sawA?.()
         return new Promise<Response>((resolve) => {
