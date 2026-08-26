@@ -1300,6 +1300,16 @@ describe('integration: killswitch enforcement', () => {
       // unawaited quota refresh at init, so recording every authorized fetch
       // makes this assertion race it.
       if (isResponsesSend(url)) seenAuth.push(authorization)
+      // Make the quota endpoint unavailable: this test is about which
+      // identity's quota wins, not about quota reporting. The loader refreshes
+      // quota at init,
+      // and a SUCCESSFUL response there is worse than an error — an empty body
+      // publishes an "unknown" snapshot that overwrites the exhausted quota this
+      // test establishes, and unknown fails open, so the request under test
+      // reaches the wire instead of being blocked.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       return quotaResponse(authorization.includes('access-B') ? 95 : 10)
     }) as unknown as typeof globalThis.fetch
 
