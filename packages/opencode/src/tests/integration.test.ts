@@ -1173,9 +1173,20 @@ describe('integration: killswitch enforcement', () => {
       sawA = resolve
     })
     const seenAuth: string[] = []
-    globalThis.fetch = (async (_url: unknown, request?: unknown) => {
+    globalThis.fetch = (async (url: unknown, request?: unknown) => {
       const auth = headerValue(request, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
+      // Serve quota only to the turn's own send. This stub answers every URL,
+      // and the loader's init quota refresh calls wham/usage before the test's
+      // first request — so without this the refresh seeds the 95%-used quota
+      // below, the killswitch acts on it, and the request under test is blocked
+      // before the identity logic this test is about ever runs.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 200 })
+      }
       if (auth.includes('access-A')) {
         sawA?.()
         return new Promise<Response>((resolve) => {
@@ -1285,7 +1296,20 @@ describe('integration: killswitch enforcement', () => {
         })
       }
       const authorization = headerValue(request, 'authorization')
-      seenAuth.push(authorization)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(authorization)
+      // Make the quota endpoint unavailable: this test is about which
+      // identity's quota wins, not about quota reporting. The loader refreshes
+      // quota at init,
+      // and a SUCCESSFUL response there is worse than an error — an empty body
+      // publishes an "unknown" snapshot that overwrites the exhausted quota this
+      // test establishes, and unknown fails open, so the request under test
+      // reaches the wire instead of being blocked.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       return quotaResponse(authorization.includes('access-B') ? 95 : 10)
     }) as unknown as typeof globalThis.fetch
 
@@ -2181,8 +2205,17 @@ describe('integration: WS quota push', () => {
     )
 
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    // The quota endpoint is deliberately unavailable: this test seeds reset
+    // credits into the sidebar and asserts a WS quota push preserves them. The
+    // loader's init quota refresh answers from this same stub, and a successful
+    // empty body there publishes a snapshot carrying no credits, which erases
+    // the seeded value before the assertion reads it.
+    globalThis.fetch = (async (url: unknown) =>
+      isResponsesSend(url)
+        ? new Response('{}', { status: 200 })
+        : new Response('{}', {
+            status: 500,
+          })) as unknown as typeof globalThis.fetch
     let hooks: Hooks | undefined
     let releaseFirstEvent: (() => void) | undefined
     let quotaFrameSent: (() => void) | undefined
@@ -3607,6 +3640,13 @@ describe('integration: active fallback routing', () => {
           seenAuth.push(headerValue(init, 'authorization'))
         }
       }
+      // Fail quota requests: sticky placement weighs each account's known
+      // quota, and answering the loader's startup refresh with an empty success
+      // publishes an unknown reading that changes which account this test's
+      // second request is placed on.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
 
@@ -3655,8 +3695,12 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      // Fail quota requests rather than answering them: this test drives an
+      // account to exhaustion through its own sends, and a successful empty
+      // body from the loader's startup refresh publishes an unknown snapshot
+      // over that state.
       if (!String(url).includes('responses'))
-        return new Response('{}', { status: 200 })
+        return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       if (auth.includes('fallback-2-token')) {
@@ -3877,8 +3921,15 @@ describe('integration: active fallback routing', () => {
     seedStickyBalancedAccounts()
     const prompts: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    // Fail quota requests: the loader's startup quota refresh answers from this
+    // stub too, and a successful empty body publishes an unknown snapshot that
+    // disturbs the state this test establishes through its own sends.
+    globalThis.fetch = (async (url: unknown) =>
+      isResponsesSend(url)
+        ? new Response('{}', { status: 200 })
+        : new Response('{}', {
+            status: 500,
+          })) as unknown as typeof globalThis.fetch
 
     let hooks: Hooks | undefined
     try {
@@ -3923,8 +3974,15 @@ describe('integration: active fallback routing', () => {
   it('sticky-balanced does not pin sessionless or non-replayable requests', async () => {
     seedStickyBalancedAccounts()
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    // Fail quota requests: the loader's startup quota refresh answers from this
+    // stub too, and a successful empty body publishes an unknown snapshot that
+    // disturbs the state this test establishes through its own sends.
+    globalThis.fetch = (async (url: unknown) =>
+      isResponsesSend(url)
+        ? new Response('{}', { status: 200 })
+        : new Response('{}', {
+            status: 500,
+          })) as unknown as typeof globalThis.fetch
 
     let hooks: Hooks | undefined
     try {
@@ -4376,10 +4434,15 @@ describe('integration: active fallback routing', () => {
       if (String(url).includes('/oauth/token')) {
         throw new Error('refresh unavailable')
       }
-      seen.push({
-        authorization: headerValue(init, 'authorization'),
-        accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
-      })
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) {
+        seen.push({
+          authorization: headerValue(init, 'authorization'),
+          accountId: headerValue(init, 'ChatGPT-Account-Id') || null,
+        })
+      }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
 
@@ -4876,7 +4939,13 @@ describe('integration: active fallback routing', () => {
     )
 
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, _init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, _init?: unknown) => {
+      // Fail quota requests: this test asserts which account the served quota is
+      // attributed to, and the loader's startup quota refresh would answer from
+      // this same stub and attribute a second reading of its own.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       return new Response('{}', {
         status: 200,
         headers: {
@@ -5768,7 +5837,10 @@ describe('integration: active fallback routing', () => {
         throw new Error('refresh unavailable')
       }
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-access-token')) {
         throw new Error('ECONNRESET')
       }
@@ -5805,9 +5877,12 @@ describe('integration: active fallback routing', () => {
     seedStorage({ access: 'fallback-access-token' })
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       throw new DOMException('request aborted', 'AbortError')
     }) as unknown as typeof globalThis.fetch
 
@@ -6083,9 +6158,12 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     // Main (main-stale-token) is rate-limited → reactive fallback to fallback-1.
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       return new Response('{}', {
         status: auth.includes('main-stale-token') ? 429 : 200,
       })
@@ -6144,9 +6222,12 @@ describe('integration: active fallback routing', () => {
 
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-access-token')) {
         return new Response('{}', {
           status: 429,
@@ -6347,9 +6428,12 @@ describe('integration: active fallback routing', () => {
 
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
       const auth = headerValue(init, 'authorization')
-      seenAuth.push(auth)
+      // Record the turn's own send only: the loader also issues an authorized,
+      // unawaited quota refresh at init, so recording every authorized fetch
+      // makes this assertion race it.
+      if (isResponsesSend(url)) seenAuth.push(auth)
       if (auth.includes('fallback-throw-token')) throw new Error('ECONNRESET')
       if (auth.includes('fallback-never-token')) {
         return new Response('should not be called', { status: 200 })
@@ -6689,8 +6773,12 @@ describe('integration: active fallback routing', () => {
     let hooks: Hooks | undefined
     Date.now = () => now
     try {
-      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-        if (init) warmRequests.push(init)
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        // Record only the keep-warm request this test is about — the replay the
+        // plugin sends to keep a prompt cache alive. The loader's startup quota
+        // refresh also passes through this stub, and capturing that would make
+        // the assertion below race it.
+        if (init && isResponsesSend(url)) warmRequests.push(init)
         return new Response('{}', { status: 200 })
       }) as typeof globalThis.fetch
       await withFakeWebSocket(
@@ -6919,7 +7007,13 @@ describe('integration: active fallback routing', () => {
       'x-codex-secondary-window-minutes': '10080',
       'x-codex-secondary-reset-at': String(farFuture),
     }
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      // Fail quota requests: this test asserts a window disappears from cache
+      // once the account stops sending it, and the loader's startup quota
+      // refresh would answer from this stub and republish the window.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       return new Response('{}', {
         status: 200,
         headers: { 'content-type': 'application/json', ...responseHeaders },
@@ -7084,7 +7178,16 @@ describe('integration: active fallback routing', () => {
     // is empty (all-killed) and the main path's killswitch block fires.
     let fetchCalls = 0
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      // Count and answer only the sends this test makes. The loader starts its
+      // own quota refresh during initialization, unawaited, so counting it makes
+      // the call-count assertions below race it. Answering it with the
+      // below-floor headers would be worse: this test establishes quota for one
+      // account at a time by sending to each in turn, and that refresh would
+      // establish it for an account out of sequence.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       fetchCalls++
       return new Response('{}', {
         status: 200,
@@ -7214,6 +7317,14 @@ describe('integration: active fallback routing', () => {
             },
           })
         }
+      }
+      // Fail quota requests: this test decides which account to stop using from
+      // the quota headers on individual sends, and a successful empty body from
+      // the loader's startup refresh would overwrite that with an "unknown"
+      // reading. Sends still get a 200, because this branch also serves the
+      // accounts the test intends to leave healthy.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
       }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
