@@ -7137,7 +7137,16 @@ describe('integration: active fallback routing', () => {
     // is empty (all-killed) and the main path's killswitch block fires.
     let fetchCalls = 0
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      // Count and answer only the sends this test makes. The loader starts its
+      // own quota refresh during initialization, unawaited, so counting it makes
+      // the call-count assertions below race it. Answering it with the
+      // below-floor headers would be worse: this test establishes quota for one
+      // account at a time by sending to each in turn, and that refresh would
+      // establish it for an account out of sequence.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
+      }
       fetchCalls++
       return new Response('{}', {
         status: 200,
@@ -7267,6 +7276,14 @@ describe('integration: active fallback routing', () => {
             },
           })
         }
+      }
+      // Fail quota requests: this test decides which account to stop using from
+      // the quota headers on individual sends, and a successful empty body from
+      // the loader's startup refresh would overwrite that with an "unknown"
+      // reading. Sends still get a 200, because this branch also serves the
+      // accounts the test intends to leave healthy.
+      if (!isResponsesSend(url)) {
+        return new Response('{}', { status: 500 })
       }
       return new Response('{}', { status: 200 })
     }) as unknown as typeof globalThis.fetch
