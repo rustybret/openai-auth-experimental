@@ -11,6 +11,16 @@ import type { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
 
 const log = createLogger('quota')
+
+/**
+ * True when a thrown provider error carries HTTP 401.
+ *
+ * Reads `.status` rather than matching the message, so it cannot be fooled by
+ * an unrelated error whose text happens to contain the number.
+ */
+function isUnauthorized(error: unknown) {
+  return (error as { status?: unknown } | null)?.status === 401
+}
 type QuotaLogger = Pick<typeof log, 'debug' | 'warn'>
 
 export interface RefreshAllQuotaDeps {
@@ -261,26 +271,73 @@ export async function refreshAllQuota(
         let refreshed: OAuthAccount
         try {
           refreshed = await deps.fallbackManager.refreshAccount(acct, storage)
-        } catch {
+        } catch (refreshError) {
+          // Continue with the existing token — a transient refresh blip should
+          // not stop a quota poll that the current token may still satisfy —
+          // but never silently. Swallowing this made a server-invalidated
+          // account look like a quota-endpoint problem for days: the only
+          // symptom was `wham usage check failed: 401`, which names the wrong
+          // component, and nothing recorded that the refresh itself had failed.
+          log.warn('fallback token refresh failed during quota poll', {
+            pid: process.pid,
+            accountId: acct.id,
+            error: errorMessage(refreshError),
+          })
           refreshed = acct
         }
 
-        if (!refreshed.access) {
+        // Expiry, not presence. An expired token is still a non-empty string,
+        // so a presence check sends a token that cannot work and surfaces the
+        // rejection as a quota-endpoint failure. The main-account path above
+        // already tests expiry.
+        if (!refreshed.access || (refreshed.expires ?? 0) < deps.now()) {
           recordOutcome({
             account: acct.id,
             ok: false,
-            error: 'no access token',
+            error: 'no usable access token',
           })
           continue
         }
 
-        const snap = await whamFn({
-          accessToken: refreshed.access,
-          fetchImpl: deps.fetchImpl,
-          now: deps.now,
-          accountId: refreshed.accountId,
-          accountKey: acct.id,
-        })
+        let snap: Awaited<ReturnType<typeof whamFn>>
+        try {
+          snap = await whamFn({
+            accessToken: refreshed.access,
+            fetchImpl: deps.fetchImpl,
+            now: deps.now,
+            accountId: refreshed.accountId,
+            accountKey: acct.id,
+          })
+        } catch (quotaError) {
+          // A 401 here says the server has rejected this token, which local
+          // expiry cannot know: the refresh gate above consults expiry only, so
+          // a token the provider invalidated early stays in use until it
+          // happens to age into the pre-expiry window. That gap was measured in
+          // days. Treat the rejection as the refresh trigger it is, once.
+          if (!isUnauthorized(quotaError)) throw quotaError
+          log.warn('quota endpoint rejected the token; forcing a refresh', {
+            pid: process.pid,
+            accountId: acct.id,
+          })
+          refreshed = await deps.fallbackManager.refreshAccount(acct, storage, {
+            force: true,
+          })
+          if (!refreshed.access) {
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: 'no usable access token after forced refresh',
+            })
+            continue
+          }
+          snap = await whamFn({
+            accessToken: refreshed.access,
+            fetchImpl: deps.fetchImpl,
+            now: deps.now,
+            accountId: refreshed.accountId,
+            accountKey: acct.id,
+          })
+        }
         deps.quotaManager.setFallback(
           acct.id,
           {
