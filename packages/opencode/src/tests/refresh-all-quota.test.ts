@@ -337,6 +337,57 @@ describe('refreshAllQuota', () => {
     expect(deps.writeSidebarState).toHaveBeenCalled()
   })
 
+  test('a fallback wham 401 forces a refresh and retries once', async () => {
+    // A 401 from the quota endpoint means the server has rejected the token.
+    // Local expiry cannot know that, so without this the account keeps using
+    // the dead token until it happens to age into the pre-expiry window.
+    const whamCalls: string[] = []
+    const whamFn = mock(async (input: { accessToken: string }) => {
+      whamCalls.push(input.accessToken)
+      if (input.accessToken === 'access-fb2') {
+        throw Object.assign(new Error('wham usage check failed: 401'), {
+          status: 401,
+        })
+      }
+      return makeQuotaSnapshot(10)
+    })
+    // Only a FORCED refresh rotates the token. The ordinary pre-expiry refresh
+    // must leave it alone, or the 401 this test depends on never happens.
+    const refreshAccount = mock(
+      async (
+        acct: { id: string },
+        _storage: unknown,
+        options?: { force?: boolean },
+      ) =>
+        acct.id === 'fb-2' && options?.force
+          ? { ...acct, access: 'access-fb2-rotated' }
+          : acct,
+    )
+
+    const deps = makeDeps({ whamFn })
+    deps.fallbackManager.refreshAccount =
+      refreshAccount as unknown as typeof deps.fallbackManager.refreshAccount
+    const results = await refreshAllQuota(deps)
+
+    // The rotated token is tried, so a server-side invalidation self-heals on
+    // the first poll rather than after hours of local validity.
+    expect(whamCalls).toEqual([
+      'access-main',
+      'access-fb1',
+      'access-fb2',
+      'access-fb2-rotated',
+    ])
+    expect(refreshAccount).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'fb-2' }),
+      expect.anything(),
+      { force: true },
+    )
+    expect(results[2]).toEqual({ account: 'fb-2', ok: true })
+    expect(
+      deps.quotaManager.getFallback('fb-2')?.quota?.primary?.usedPercent,
+    ).toBe(10)
+  })
+
   test('one fallback wham throws 401 → that account ok:false, others succeed', async () => {
     const whamCalls: string[] = []
     const whamFn = mock(async (input: { accessToken: string }) => {
@@ -367,7 +418,15 @@ describe('refreshAllQuota', () => {
     ).toBe(10)
     expect(deps.quotaManager.getFallback('fb-2')).toBeNull()
 
-    expect(whamCalls).toEqual(['access-main', 'access-fb1', 'access-fb2'])
+    // Four calls, not three: the 401 forces a refresh and retries once. The
+    // stub returns the same token, so the retry fails the same way and the
+    // account still reports the 401 — which is the point of this test.
+    expect(whamCalls).toEqual([
+      'access-main',
+      'access-fb1',
+      'access-fb2',
+      'access-fb2',
+    ])
   })
 
   test('logs each account outcome without exposing credentials', async () => {
