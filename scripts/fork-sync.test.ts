@@ -115,4 +115,19 @@ describe('fork-sync.sh', () => {
     expect(scriptCode).not.toMatch(/git\s+(-C\s+"\$ROOT"\s+)?rebase\b/)
     expect(scriptCode).not.toMatch(/push\s+.*(--force|-f)\b/)
   })
+
+  it('fast-forwards to origin when origin is ahead before merging upstream', () => {
+    expect(scriptCode).toContain('merge --ff-only "origin/$LOCAL_BRANCH"')
+    expect(scriptCode).toContain(
+      'merge-base --is-ancestor HEAD "origin/$LOCAL_BRANCH"',
+    )
+
+    const fetchIdx = script.indexOf('# --- 1. fetch')
+    const ffIdx = script.indexOf('# --- 1b. fast-forward to origin if ahead')
+    const mergeIdx = script.indexOf('# --- 2. merge')
+
+    expect(fetchIdx).toBeGreaterThan(-1)
+    expect(ffIdx).toBeGreaterThan(fetchIdx)
+    expect(mergeIdx).toBeGreaterThan(ffIdx)
+  })
 })
