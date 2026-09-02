@@ -7,6 +7,7 @@ import type {
   FallbackAccount,
   OAuthQuotaSnapshot,
 } from '../core/accounts'
+import { hashRefreshToken } from '../core/backoff.ts'
 import { QuotaManager } from '../core/quota-manager'
 import {
   type RefreshAllQuotaDeps,
@@ -335,6 +336,68 @@ describe('refreshAllQuota', () => {
     expect(fb2?.quota?.primary?.usedPercent).toBe(30)
 
     expect(deps.writeSidebarState).toHaveBeenCalled()
+  })
+
+  test('an armed refresh backoff skips the account and reports the real reason', async () => {
+    // A non-transient refresh failure (401) arms a long backoff. Retrying
+    // cannot succeed until the operator re-adds the account, and the surfaced
+    // error must name the token refresh rather than the quota endpoint.
+    const whamCalls: string[] = []
+    const whamFn = mock(async (input: { accessToken: string }) => {
+      whamCalls.push(input.accessToken)
+      return makeQuotaSnapshot(10)
+    })
+    const refreshedIds: string[] = []
+    const refreshAccount = mock(async (acct: { id: string }) => {
+      refreshedIds.push(acct.id)
+      return acct
+    })
+
+    // Seed the armed backoff on the account before the deps snapshot it.
+    const accounts: FallbackAccount[] = [
+      {
+        id: 'fb-1',
+        type: 'oauth',
+        access: 'access-fb1',
+        refresh: 'refresh-fb1',
+        expires: Date.now() + 3600_000,
+        enabled: true,
+        accountId: 'chatgpt-fb1',
+      },
+      {
+        id: 'fb-2',
+        type: 'oauth',
+        access: 'access-fb2',
+        refresh: 'refresh-fb2',
+        expires: Date.now() + 3600_000,
+        enabled: true,
+        accountId: 'chatgpt-fb2',
+        lastRefreshError: {
+          message: 'Token refresh failed: 401',
+          checkedAt: Date.now(),
+          nextRetryAt: Date.now() + 24 * 3600_000,
+          // Bound to this refresh token on purpose: the backoff must not block
+          // an account the operator has since re-added with a new token.
+          tokenHash: hashRefreshToken('refresh-fb2'),
+        },
+      },
+    ]
+    const deps = makeDeps({ whamFn, accounts })
+    deps.fallbackManager.refreshAccount =
+      refreshAccount as unknown as typeof deps.fallbackManager.refreshAccount
+
+    const results = await refreshAllQuota(deps)
+
+    const fb2 = results.find((r) => r.account === 'fb-2')
+    expect(fb2?.ok).toBe(false)
+    expect(fb2?.error).toContain('401')
+    // Neither refreshed nor probed: both would be wasted work against a token
+    // the provider has already rejected.
+    expect(refreshedIds).not.toContain('fb-2')
+    expect(whamCalls).not.toContain('access-fb2')
+    // Non-vacuous: the healthy sibling must still be polled, or an empty run
+    // would satisfy the assertions above.
+    expect(whamCalls).toContain('access-fb1')
   })
 
   test('a fallback wham 401 forces a refresh and retries once', async () => {

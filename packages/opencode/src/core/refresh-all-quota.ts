@@ -7,6 +7,7 @@ import type {
   loadAccounts,
   OAuthAccount,
 } from './accounts'
+import { formatRefreshBackoffMessage, refreshBackoffActive } from './backoff.ts'
 import type { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
 
@@ -265,6 +266,34 @@ export async function refreshAllQuota(
           )
         ) {
           recordOutcome({ account: acct.id, ok: true })
+          continue
+        }
+
+        // A recent NON-TRANSIENT refresh failure (a 401 means the provider has
+        // invalidated this token) arms a long backoff. The request path already
+        // honours it; this poll did not, so an account the plugin had already
+        // diagnosed as dead kept being retried — hundreds of times in the
+        // report behind this. Retrying cannot succeed until the operator
+        // re-adds the account, so skip it and surface the RECORDED reason.
+        // That also fixes the misdirection: the symptom used to be
+        // `wham usage check failed: 401`, which blames the quota endpoint for a
+        // token-refresh failure.
+        const armedRefreshError = (acct as OAuthAccount).lastRefreshError
+        if (
+          refreshBackoffActive(
+            armedRefreshError,
+            (acct as OAuthAccount).refresh,
+            deps.now(),
+          )
+        ) {
+          recordOutcome({
+            account: acct.id,
+            ok: false,
+            error: formatRefreshBackoffMessage(
+              armedRefreshError as NonNullable<typeof armedRefreshError>,
+              deps.now(),
+            ),
+          })
           continue
         }
 
