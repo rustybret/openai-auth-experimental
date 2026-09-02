@@ -89,6 +89,16 @@ export interface RefreshAllQuotaResult {
   account: string
   ok: boolean
   error?: string
+  /**
+   * The account cannot recover on its own: the provider has rejected its
+   * credentials, so no amount of retrying will help until the operator re-adds
+   * it.
+   *
+   * Carried as a flag rather than left for the caller to infer from `error`,
+   * because sniffing an error string for a user-facing decision breaks the
+   * moment the wording changes.
+   */
+  permanent?: boolean
 }
 
 export async function refreshAllQuota(
@@ -293,6 +303,7 @@ export async function refreshAllQuota(
               armedRefreshError as NonNullable<typeof armedRefreshError>,
               deps.now(),
             ),
+            permanent: true,
           })
           continue
         }

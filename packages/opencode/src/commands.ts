@@ -137,11 +137,39 @@ function routingDescription(mode: RoutingMode) {
 // Per-command execution functions
 // ---------------------------------------------------------------------------
 
+// Three missed polls at the 5-minute cadence. Below this, a stamp is just the
+// normal gap between refreshes and saying so would put an age on every line
+// permanently, which trains the reader to ignore it.
+const QUOTA_STALE_AFTER_MS = 15 * 60 * 1000
+
+/**
+ * Render how old a quota reading is, or nothing while it is current.
+ *
+ * Keyed on the reading's OWN timestamp rather than the poll's. A poll can
+ * succeed while leaving an account untouched — that is exactly what happens
+ * once an account's refresh backoff is armed and the poll skips it — so the
+ * poll's clock would report freshness the numbers do not have. That gap is what
+ * let one account's bars sit unchanged for 31 hours while the surface looked
+ * healthy.
+ */
+function quotaAge(checkedAt: number | undefined, now: number): string {
+  if (typeof checkedAt !== 'number' || !Number.isFinite(checkedAt)) {
+    return ' (age unknown)'
+  }
+  const ageMs = now - checkedAt
+  if (ageMs < QUOTA_STALE_AFTER_MS) return ''
+  const hours = Math.floor(ageMs / 3600_000)
+  if (hours >= 24) return ` (${Math.floor(hours / 24)}d old)`
+  if (hours >= 1) return ` (${hours}h old)`
+  return ` (${Math.floor(ageMs / 60_000)}m old)`
+}
+
 async function executeQuotaCommand(
   ctx: CommandContext,
 ): Promise<OpenDialogPayload> {
   const refreshResults = await ctx.refreshAllQuota?.()
   const mainEntry = ctx.quotaManager.getMain()
+  const now = Date.now()
   const lines: string[] = ['## OpenAI Quota', '']
 
   if (mainEntry?.quota) {
@@ -155,7 +183,7 @@ async function executeQuotaCommand(
           '█'.repeat(Math.max(0, Math.min(Math.round(pct / 10), 10))) +
           '░'.repeat(Math.max(0, 10 - Math.min(Math.round(pct / 10), 10)))
         lines.push(
-          `- ${key}: ${bar} ${pct}% used (${Math.round(w.remainingPercent)}% remaining)`,
+          `- ${key}: ${bar} ${pct}% used (${Math.round(w.remainingPercent)}% remaining)${quotaAge(w.checkedAt ?? mainEntry.checkedAt, now)}`,
         )
       }
     }
@@ -179,7 +207,7 @@ async function executeQuotaCommand(
         if (w) {
           const pct = Math.round(w.usedPercent)
           lines.push(
-            `  - ${key}: ${pct}% used (${Math.round(w.remainingPercent)}% remaining)`,
+            `  - ${key}: ${pct}% used (${Math.round(w.remainingPercent)}% remaining)${quotaAge(w.checkedAt ?? entry.checkedAt, now)}`,
           )
         }
       }
@@ -194,7 +222,21 @@ async function executeQuotaCommand(
     if (failures.length > 0) {
       lines.push('')
       for (const f of failures) {
-        lines.push(`- ${f.account}: fetch failed — Refresh to retry`)
+        // Two different messages, because they need two different actions.
+        // Every failure used to read "fetch failed — Refresh to retry", which
+        // made a token the provider had permanently rejected look like a
+        // momentary blip and recommended a remedy that cannot work: refreshing
+        // never revives such a token, so an operator following that advice
+        // waits indefinitely instead of re-adding the account.
+        //
+        // The raw error stays hidden on purpose — it names internal endpoints
+        // and helps nobody here. What the operator needs is which of the two
+        // situations they are in.
+        lines.push(
+          f.permanent
+            ? `- ${f.account}: sign-in no longer accepted — remove and add this account again`
+            : `- ${f.account}: fetch failed — Refresh to retry`,
+        )
       }
     }
   }

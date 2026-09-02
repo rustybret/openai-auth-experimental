@@ -1688,8 +1688,94 @@ describe('commands', () => {
     expect(payload.text).toContain('10% used')
     expect(payload.text).toContain('50% used')
 
+    // A recoverable failure keeps the short retry line, and the raw error stays
+    // hidden — it names internal endpoints and helps nobody here.
     expect(payload.text).toContain('- fb-2: fetch failed — Refresh to retry')
     expect(payload.text).not.toContain('wham usage check failed: 401')
+  })
+
+  test('stale quota is labelled by its own age, not the poll timestamp', async () => {
+    // A poll can succeed while leaving an account untouched — which is exactly
+    // what happens once an account's refresh backoff is armed and the poll
+    // skips it. Keying the age on the poll would then report freshness the
+    // numbers do not have.
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [] },
+    })
+    const threeHoursAgo = Date.now() - 3 * 3600_000
+    const staleSnapshot = makeQuotaSnapshot(40)
+    if (staleSnapshot.primary) staleSnapshot.primary.checkedAt = threeHoursAgo
+    if (staleSnapshot.secondary)
+      staleSnapshot.secondary.checkedAt = threeHoursAgo
+
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+      refreshAllQuota: async () => {
+        // Fresh main, stale fallback, and the poll itself reports success for
+        // both — the shape that made a 31-hour-old bar look current.
+        qm.setMain('access-main', {
+          quota: makeQuotaSnapshot(10),
+          refreshAfter: Date.now() + 5 * 60 * 1000,
+          checkedAt: Date.now(),
+        })
+        qm.setFallback('fb-stale', {
+          quota: staleSnapshot,
+          refreshAfter: Date.now() + 5 * 60 * 1000,
+          checkedAt: threeHoursAgo,
+        })
+        return [
+          { account: 'main', ok: true },
+          { account: 'fb-stale', ok: true },
+        ]
+      },
+    }
+
+    const payload = await buildDialogPayload('openai-quota', '', ctx)
+
+    expect(payload.text).toContain('3h old')
+    // Non-vacuous: the fresh account must NOT be labelled, or a blanket label
+    // would satisfy the assertion above while telling the reader nothing.
+    const mainLine = payload.text
+      .split('\n')
+      .find((line) => line.includes('10% used'))
+    expect(mainLine).toBeDefined()
+    expect(mainLine).not.toContain('old')
+  })
+
+  test('a permanently rejected account is told to re-add, not to retry', async () => {
+    // Refreshing cannot revive a token the provider has rejected, so the retry
+    // line sends the operator into an indefinite wait while the account stays
+    // dead. The message has to name the one action that works: re-adding it.
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [] },
+    })
+
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+      refreshAllQuota: async () => [
+        { account: 'main', ok: true },
+        {
+          account: 'fb-2',
+          ok: false,
+          error: 'Token refresh failed: 401; next retry in 24h',
+          permanent: true,
+        },
+      ],
+    }
+
+    const payload = await buildDialogPayload('openai-quota', '', ctx)
+
+    expect(payload.text).toContain('remove and add this account again')
+    // The useless advice must be gone for this account, and the raw error must
+    // still not reach the operator.
+    expect(payload.text).not.toContain('- fb-2: fetch failed')
+    expect(payload.text).not.toContain('Token refresh failed: 401')
   })
 
   test('refreshAllQuota undefined → falls back to cached display', async () => {
