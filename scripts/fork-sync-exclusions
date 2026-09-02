@@ -15,6 +15,14 @@
 # Arcus packaging outputs and transient local directories
 keep-deleted: dist-arcus/*
 
+# Upstream GitHub workflows, issue templates, and publish scripts replaced by uc-studio/Arcus packaging
+keep-deleted: .github/workflows/*
+keep-deleted: .github/ISSUE_TEMPLATE/*
+keep-deleted: .github/dependabot.yml
+keep-deleted: scripts/release.sh
+keep-deleted: scripts/version-sync.mjs
+keep-deleted: scripts/wait-release.sh
+
 # Lockfile. `take-theirs` alone is wrong here: upstream's lockfile does not
 # describe this fork's devDependency set (@earendil-works/*, lefthook, our
 # pinned @opencode-ai/plugin), so it must be rebuilt against the merged
