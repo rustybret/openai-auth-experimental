@@ -6,6 +6,7 @@
     "packages/*"
   ],
   "scripts": {
+    "setup": "bash setup.sh",
     "build": "cd packages/opencode && bun run build && cd ../pi && bun run build",
     "build:arcus": "bun run build && bash scripts/pack-arcus.sh",
     "package:arcus": "bash scripts/pack-arcus.sh",
@@ -14,6 +15,7 @@
     "validate:arcus": "bash scripts/validate-arcus.sh",
     "publish:arcus": "bash scripts/publish-arcus.sh",
     "migrate:arcus": "bash scripts/migrate-arcus.sh",
+    "pipeline:arcus": "bash scripts/arcus-pipeline.sh",
     "fork-sync": "bash scripts/fork-sync.sh",
     "sync:fork": "bash scripts/fork-sync.sh",
     "dev": "bun scripts/dev.ts",

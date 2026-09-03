@@ -40,6 +40,7 @@ git clone https://github.com/rustybret/openai-auth-experimental.git
 cd openai-auth-experimental
 git checkout local/fork
 bun install
+./setup.sh      # hydrates git submodules (sparse-checkout Arcus scripts)
 bun run build   # output: packages/opencode/dist/index.js
 ```
 
@@ -307,10 +308,11 @@ packages/opencode  OpenCode plugin
 scripts            Release and dev tooling
 ```
 
-Install dependencies:
+Install dependencies and bootstrap submodules:
 
 ```bash
 bun install
+./setup.sh
 ```
 
 Run checks:
