@@ -1241,7 +1241,6 @@ async function buildResetPreviewRow(
     const precondition = evaluateResetPrecondition(
       quota,
       ctx.quotaManager.isRateLimited(accountKey),
-      applicableAvailableCount,
       ctx.now(),
     )
     let reason: string | undefined
@@ -1313,11 +1312,17 @@ function renderResetConfirm(row: ResetPreviewRow): string {
     '',
     `Account: **${row.label}** (\`${row.accountKey}\`)`,
     `Current quota: **${row.usedPercent ?? 'unknown'}% used**`,
-    `Credit: **Spend 1 of ${row.applicableAvailableCount ?? 0}**`,
+    `Credit: **Spend 1 of ${row.availableCount ?? 0}**`,
     `Credit expires: **${row.selectedCreditExpiresAt ?? 'unavailable'}**`,
     `Quota resets: **${row.resetTime ?? 'unavailable'}**`,
     '',
   ]
+  if ((row.availableCount ?? 0) > 0 && row.applicableAvailableCount === 0) {
+    lines.push(
+      'The server does not currently count this credit as applicable; redemption may return a no-op, and a no-op does not spend the credit.',
+    )
+    lines.push('')
+  }
   if (row.eligible && row.chatgptAccountId) {
     lines.push(
       `Confirm: \`/openai-reset confirm ${encodeURIComponent(row.accountKey)} ${encodeURIComponent(row.chatgptAccountId)}\``,
@@ -1360,8 +1365,6 @@ function resetErrorPayload(
         'There is no active reset redemption to retry. Reopen the account list.',
       not_exhausted:
         'No credit was spent: the fresh account state is not exhausted.',
-      no_applicable_credits:
-        'No credit was spent: no applicable credits are available.',
       no_eligible_credit:
         'No credit was spent: no eligible credit was returned.',
     }

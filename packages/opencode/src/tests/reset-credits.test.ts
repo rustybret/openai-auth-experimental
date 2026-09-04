@@ -448,20 +448,20 @@ describe('reset redemption precondition', () => {
 
   it('accepts an exhausted live window with an applicable credit', () => {
     expect(
-      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, 1, now),
+      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, now),
     ).toEqual({ ok: true })
   })
 
   it('refuses healthy quota', () => {
     expect(
-      evaluateResetPrecondition({ primary: quotaWindow(20) }, false, 1, now),
+      evaluateResetPrecondition({ primary: quotaWindow(20) }, false, now),
     ).toEqual({ ok: false, reason: 'not exhausted' })
   })
 
-  it('refuses exhausted quota without applicable credits', () => {
+  it('accepts exhausted quota when the server reports no applicable credits', () => {
     expect(
-      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, 0, now),
-    ).toEqual({ ok: false, reason: 'no applicable credits' })
+      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, now),
+    ).toEqual({ ok: true })
   })
 
   it('treats a 100%-used expired window as stale rather than exhausted', () => {
@@ -471,7 +471,6 @@ describe('reset redemption precondition', () => {
           primary: quotaWindow(100, '2026-07-17T11:59:59.999Z'),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: false, reason: 'not exhausted' })
@@ -485,7 +484,6 @@ describe('reset redemption precondition', () => {
           secondary: quotaWindow(100),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
@@ -499,7 +497,6 @@ describe('reset redemption precondition', () => {
           secondary: quotaWindow(100, '2026-07-17T11:59:59.999Z'),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: false, reason: 'not exhausted' })
@@ -510,7 +507,6 @@ describe('reset redemption precondition', () => {
       evaluateResetPrecondition(
         { primary: quotaWindow(100, undefined) },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
@@ -518,18 +514,13 @@ describe('reset redemption precondition', () => {
       evaluateResetPrecondition(
         { primary: quotaWindow(100, 'not-a-date') },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
   })
 
   it('lets a live rate-limit mark satisfy only exhaustion', () => {
-    expect(evaluateResetPrecondition({}, true, 1, now)).toEqual({ ok: true })
-    expect(evaluateResetPrecondition({}, true, 0, now)).toEqual({
-      ok: false,
-      reason: 'no applicable credits',
-    })
+    expect(evaluateResetPrecondition({}, true, now)).toEqual({ ok: true })
   })
 })
 

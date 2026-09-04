@@ -154,7 +154,7 @@ function resetCreditResponse(
   accountId: string,
   fixture: ResetWireFixture,
 ): Response {
-  const count = fixture.applicableCount[accountId] ?? 0
+  const count = fixture.availableCount[accountId] ?? 0
   const credits = Array.from({ length: count }, (_, index) => ({
     id: `credit-${accountId}-${index + 1}`,
     status: 'available',
@@ -2362,12 +2362,12 @@ describe('commands', () => {
       })
       expect(rows.find((row) => row.accountKey === 'no-credits')).toMatchObject(
         {
-          eligible: false,
-          reason: 'no applicable credits',
+          reason: undefined,
+          eligible: true,
         },
       )
       expect(payload.text).toContain('not exhausted')
-      expect(payload.text).toContain('no applicable credits')
+      expect(payload.text).toContain('eligible')
     })
 
     test('exhausted main preview is eligible when usage reports three applicable credits', async () => {
@@ -2388,6 +2388,29 @@ describe('commands', () => {
           availableCount: 3,
           applicableAvailableCount: 3,
           eligible: true,
+        }),
+      )
+    })
+
+    test('exhausted preview remains eligible when the server reports no applicable credits', async () => {
+      await saveResetAccounts([])
+      const fixture = resetFixture({
+        usedPercent: { 'chatgpt-main': 100 },
+        applicableCount: { 'chatgpt-main': 0 },
+        availableCount: { 'chatgpt-main': 1 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload('openai-reset', '', ctx)
+      const rows = payload.knobs.accounts as Array<Record<string, unknown>>
+
+      expect(rows).toContainEqual(
+        expect.objectContaining({
+          accountKey: 'main',
+          availableCount: 1,
+          applicableAvailableCount: 0,
+          eligible: true,
+          selectedCreditId: 'credit-chatgpt-main-1',
         }),
       )
     })
@@ -2462,11 +2485,39 @@ describe('commands', () => {
       })
       expect(payload.text).toContain('Encoded fallback')
       expect(payload.text).toContain('100%')
-      expect(payload.text).toContain('Spend 1 of 2')
+      expect(payload.text).toContain('Spend 1 of 4')
       expect(payload.text).toContain('2026-08-01T00:00:00.000Z')
       expect(payload.text).toContain('2026-07-18T00:00:00.000Z')
       expect(JSON.stringify(payload.knobs)).not.toContain('fallback/a b-token')
       expect(JSON.stringify(payload.knobs)).not.toContain('access')
+    })
+
+    test('confirmation discloses when the server excludes an otherwise available credit', async () => {
+      await saveResetAccounts([])
+      const fixture = resetFixture({
+        usedPercent: { 'chatgpt-main': 100 },
+        applicableCount: { 'chatgpt-main': 0 },
+        availableCount: { 'chatgpt-main': 1 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const disclosed = await buildDialogPayload(
+        'openai-reset',
+        'select main',
+        ctx,
+      )
+      const disclosure =
+        'The server does not currently count this credit as applicable; redemption may return a no-op, and a no-op does not spend the credit.'
+      expect(disclosed.text).toContain(disclosure)
+      expect(disclosed.text).toContain('Spend 1 of 1')
+
+      fixture.applicableCount['chatgpt-main'] = 1
+      const undisclosed = await buildDialogPayload(
+        'openai-reset',
+        'select main',
+        ctx,
+      )
+      expect(undisclosed.text).not.toContain(disclosure)
     })
 
     test('select returns an informational result instead of confirmation for an ineligible account', async () => {

@@ -278,12 +278,12 @@ function openResetDialog(
       const preview = state.knobs.preview as ResetPreviewKnob | undefined
       const accountKey = preview?.accountKey
       const chatgptAccountId = preview?.chatgptAccountId
-      const applicableCount = preview?.applicableAvailableCount ?? 0
+      const availableCount = preview?.availableCount ?? 0
       const DialogConfirm = api.ui.DialogConfirm
       api.ui.dialog.replace(() => (
         <DialogConfirm
           title='Reset quota window'
-          message={`${state.text}\n\nThis SPENDS 1 of ${applicableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
+          message={`${state.text}\n\nThis SPENDS 1 of ${availableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
           onConfirm={() => {
             if (!accountKey || !chatgptAccountId) return
             applyAndRender(

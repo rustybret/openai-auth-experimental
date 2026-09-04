@@ -54,7 +54,7 @@ export type ResetPrecondition =
   | { ok: true }
   | {
       ok: false
-      reason: 'not exhausted' | 'no applicable credits'
+      reason: 'not exhausted'
     }
 
 export interface ResetStateDeps {
@@ -92,7 +92,6 @@ export type ResetRedemptionErrorKind =
   | 'expired_unreconciled'
   | 'retry_without_inflight'
   | 'not_exhausted'
-  | 'no_applicable_credits'
   | 'no_eligible_credit'
 
 export class ResetRedemptionError extends Error {
@@ -464,7 +463,6 @@ export function resetWindowIsExhausted(
 export function evaluateResetPrecondition(
   quota: OAuthQuotaSnapshot,
   hasActiveRateLimitMark: boolean,
-  applicableAvailableCount: number,
   now: number,
 ): ResetPrecondition {
   const exhausted =
@@ -472,9 +470,6 @@ export function evaluateResetPrecondition(
     resetWindowIsExhausted(quota.primary, now) ||
     resetWindowIsExhausted(quota.secondary, now)
   if (!exhausted) return { ok: false, reason: 'not exhausted' }
-  if (applicableAvailableCount <= 0) {
-    return { ok: false, reason: 'no applicable credits' }
-  }
   return { ok: true }
 }
 
@@ -742,16 +737,10 @@ export async function runResetCreditRedemption(
     const precondition = evaluateResetPrecondition(
       quota,
       deps.hasActiveRateLimitMark(input.accountKey),
-      quota.resetCreditsApplicable ?? 0,
       deps.now(),
     )
     if (!precondition.ok) {
-      throw new ResetRedemptionError(
-        precondition.reason === 'not exhausted'
-          ? 'not_exhausted'
-          : 'no_applicable_credits',
-        precondition.reason,
-      )
+      throw new ResetRedemptionError('not_exhausted', precondition.reason)
     }
     if (!selectCreditToSpend(credits.credits)) {
       throw new ResetRedemptionError(
