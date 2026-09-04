@@ -571,15 +571,24 @@ export function selectCreditToSpend(
   credits: readonly ResetCredit[],
 ): ResetCredit | undefined {
   return [...credits]
-    .filter(
-      (credit) =>
-        credit.status === 'available' &&
-        credit.isSupportedByPlan &&
-        credit.resetType === 'codex_rate_limits',
-    )
+    .filter(isResetCreditEligible)
     .sort(
       (left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt),
     )[0]
+}
+
+export function isResetCreditEligible(credit: ResetCredit): boolean {
+  return (
+    credit.status === 'available' &&
+    credit.isSupportedByPlan &&
+    credit.resetType === 'codex_rate_limits'
+  )
+}
+
+export function countEligibleResetCredits(
+  credits: readonly ResetCredit[],
+): number {
+  return credits.filter(isResetCreditEligible).length
 }
 
 function isTerminalConsumeKind(value: unknown): value is ResetConsumeKind {

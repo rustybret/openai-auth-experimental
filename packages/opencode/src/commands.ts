@@ -16,6 +16,7 @@ import { whamUsageFn } from './core/provider'
 import type { QuotaManager } from './core/quota-manager'
 import type { RefreshAllQuotaResult } from './core/refresh-all-quota'
 import {
+  countEligibleResetCredits,
   evaluateResetPrecondition,
   listResetCredits,
   ResetCreditError,
@@ -1235,9 +1236,12 @@ async function buildResetPreviewRow(
       listResetCredits(ctx.fetchImpl, target.accessToken, wireAccountId),
     ])
     const selectedCredit = selectCreditToSpend(credits.credits)
+    const eligibleCreditCount = countEligibleResetCredits(credits.credits)
     const availableCount =
-      credits.availableCount ?? quota.resetCreditsAvailable ?? 0
-    const applicableAvailableCount = quota.resetCreditsApplicable ?? 0
+      credits.availableCount ??
+      quota.resetCreditsAvailable ??
+      (eligibleCreditCount > 0 ? eligibleCreditCount : undefined)
+    const applicableAvailableCount = quota.resetCreditsApplicable
     const precondition = evaluateResetPrecondition(
       quota,
       ctx.quotaManager.isRateLimited(accountKey),
@@ -1293,7 +1297,7 @@ function renderResetAccountList(rows: readonly ResetPreviewRow[]): string {
     const credits =
       row.availableCount === undefined
         ? 'credits unavailable'
-        : `${row.applicableAvailableCount ?? 0}/${row.availableCount} applicable/available`
+        : `${row.applicableAvailableCount === undefined ? '?' : row.applicableAvailableCount}/${row.availableCount} applicable/available`
     const status = row.eligible
       ? `eligible · credit ${row.selectedCreditId} expires ${row.selectedCreditExpiresAt}`
       : row.reason
@@ -1312,7 +1316,7 @@ function renderResetConfirm(row: ResetPreviewRow): string {
     '',
     `Account: **${row.label}** (\`${row.accountKey}\`)`,
     `Current quota: **${row.usedPercent ?? 'unknown'}% used**`,
-    `Credit: **Spend 1 of ${row.availableCount ?? 0}**`,
+    `Credit: **Spend 1 of ${row.availableCount ?? 'unknown'}**`,
     `Credit expires: **${row.selectedCreditExpiresAt ?? 'unavailable'}**`,
     `Quota resets: **${row.resetTime ?? 'unavailable'}**`,
     '',

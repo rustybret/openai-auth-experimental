@@ -458,12 +458,6 @@ describe('reset redemption precondition', () => {
     ).toEqual({ ok: false, reason: 'not exhausted' })
   })
 
-  it('accepts exhausted quota when the server reports no applicable credits', () => {
-    expect(
-      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, now),
-    ).toEqual({ ok: true })
-  })
-
   it('treats a 100%-used expired window as stale rather than exhausted', () => {
     expect(
       evaluateResetPrecondition(

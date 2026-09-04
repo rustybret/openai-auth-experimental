@@ -2415,6 +2415,93 @@ describe('commands', () => {
       )
     })
 
+    test('omitted applicable count stays unknown in the account preview', async () => {
+      await saveResetAccounts([])
+      const { ctx } = await makeResetCommandHarness(
+        configPath,
+        now,
+        resetFixture(),
+      )
+      ctx.fetchImpl = fetchStub(async (input) => {
+        if (input.toString().endsWith('/wham/usage')) {
+          return Response.json({
+            rate_limit: {
+              primary_window: {
+                used_percent: 100,
+                reset_at: '2026-07-18T00:00:00.000Z',
+              },
+            },
+            rate_limit_reset_credits: { available_count: 1 },
+          })
+        }
+        return Response.json({
+          credits: [
+            {
+              id: 'credit-omitted-applicable',
+              status: 'available',
+              expires_at: '2026-08-01T00:00:00.000Z',
+              reset_type: 'codex_rate_limits',
+              is_supported_by_plan: true,
+            },
+          ],
+        })
+      })
+
+      const payload = await buildDialogPayload('openai-reset', '', ctx)
+      const rows = payload.knobs.accounts as Array<Record<string, unknown>>
+
+      expect(rows).toContainEqual(
+        expect.objectContaining({
+          accountKey: 'main',
+          availableCount: 1,
+          applicableAvailableCount: undefined,
+          eligible: true,
+        }),
+      )
+      expect(payload.text).toContain('?/1 applicable/available')
+      expect(payload.text).not.toContain('does not currently count')
+    })
+
+    test('omitted credit counts fall back to the eligible credit total', async () => {
+      await saveResetAccounts([])
+      const { ctx } = await makeResetCommandHarness(
+        configPath,
+        now,
+        resetFixture(),
+      )
+      ctx.fetchImpl = fetchStub(async (input) => {
+        if (input.toString().endsWith('/wham/usage')) {
+          return Response.json({
+            rate_limit: {
+              primary_window: {
+                used_percent: 100,
+                reset_at: '2026-07-18T00:00:00.000Z',
+              },
+            },
+          })
+        }
+        return Response.json({
+          credits: [
+            {
+              id: 'credit-omitted-counts',
+              status: 'available',
+              expires_at: '2026-08-01T00:00:00.000Z',
+              reset_type: 'codex_rate_limits',
+              is_supported_by_plan: true,
+            },
+          ],
+        })
+      })
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'select main',
+        ctx,
+      )
+
+      expect(payload.text).toContain('Spend 1 of 1')
+    })
+
     test('account preview keeps per-account failures visible and requires a stable identity for action', async () => {
       await saveResetAccounts([
         makeAccount('broken', {
