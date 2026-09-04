@@ -144,19 +144,28 @@ const ALLOWED_MODELS = new Set([
 // -luna/-sol/-terra variants work. Its -fast/-pro synthetics inherit the same
 // api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
 // keeping the working variants (api.id gpt-5.6-luna, etc.).
-const DISALLOWED_MODELS = new Set(['gpt-5.6'])
-// Exact models currently marked `use_responses_lite` in Codex's catalog.
+// Same shape for gpt-6: the backend rejects the bare id ("not supported when
+// using Codex with a ChatGPT account") and serves only the named gpt-6-astra
+// variant, so any -fast/-pro synthetics inheriting api.id "gpt-6" drop with it.
+const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
+// Exact models currently marked `use_responses_lite` in Codex's catalog. Read
+// from the backend's own model list rather than assumed:
+//   GET /backend-api/codex/models?client_version=<v>
+// reports `use_responses_lite` per model, and gpt-6-astra is marked true.
 const RESPONSES_LITE_MODELS = new Set([
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
+  'gpt-6-astra',
 ])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-5.6 requires Codex client >= 0.144.0 (older versions 400 with "requires a
-// newer version of Codex"). 0.144.0 also works for gpt-5.4/5.5, so the bump is
-// safe across the whole model range.
-const CODEX_VERSION = '0.144.0'
+// gpt-6-astra requires Codex client >= 0.153.0; below that the backend 400s with
+// "requires a newer version of Codex". Measured against the live backend: 0.152.0
+// is refused and 0.153.0 is accepted. Verified non-regressive for every model we
+// surface (gpt-5.3-codex-spark, 5.4, 5.4-mini, 5.5, and the three 5.6 variants),
+// so one version serves the whole range.
+const CODEX_VERSION = '0.153.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
@@ -1028,7 +1037,10 @@ export async function CodexAuthPlugin(
               if (model.options.reasoningMode === 'pro') return false
               if (ALLOWED_MODELS.has(model.api.id)) return true
               if (DISALLOWED_MODELS.has(model.api.id)) return false
-              const match = model.api.id.match(/^gpt-(\d+\.\d+)/)
+              // The minor is optional: a major-only id like gpt-6-astra carries
+              // no decimal, and requiring one silently dropped it from the
+              // catalogue even though the backend serves it.
+              const match = model.api.id.match(/^gpt-(\d+(?:\.\d+)?)/)
               const version = match?.[1]
               return version ? parseFloat(version) > 5.4 : false
             })
@@ -1047,9 +1059,17 @@ export async function CodexAuthPlugin(
                       input: 272_000,
                       output: 128_000,
                     }
-                  : // gpt-5.6 (luna/sol/terra) real context window is 372k on
-                    // the Codex backend, not the 1.05M models.dev reports.
-                    model.id.includes('gpt-5.6')
+                  : // Capped to keep a turn inside the cheap pricing tier, not
+                    // because the backend cannot take more. OpenAI charges 2x
+                    // input and 1.5x output ON THE WHOLE REQUEST once it
+                    // exceeds 272k input tokens, so `input` stays below that
+                    // line and `context` is that cap plus the output reserve.
+                    // The backend itself accepts far more — measured 2026-09-04,
+                    // gpt-5.6-sol took 861,550 input tokens and gpt-6-astra
+                    // 876,934 — so raising these is a cost decision, never a
+                    // capability one. gpt-6-astra carries the same 272k tier.
+                    model.id.includes('gpt-5.6') ||
+                      model.id.includes('gpt-6-astra')
                     ? {
                         context: 372_000,
                         input: 244_000,

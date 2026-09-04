@@ -96,6 +96,16 @@ async function surfacedModels() {
         reasoningMode: 'pro',
       }),
       'gpt-5.6-terra': model('gpt-5.6-terra', 'gpt-5.6-terra'),
+      // gpt-6: the bare id is refused by the backend the way gpt-5.6 is, and
+      // its synthetics inherit that api.id, so all three drop.
+      'gpt-6': model('gpt-6', 'gpt-6'),
+      'gpt-6-fast': model('gpt-6-fast', 'gpt-6'),
+      // gpt-6-astra is major-only — no decimal in the id — which the version
+      // gate must still admit.
+      'gpt-6-astra': model('gpt-6-astra', 'gpt-6-astra'),
+      'gpt-6-astra-pro': model('gpt-6-astra-pro', 'gpt-6-astra', {
+        reasoningMode: 'pro',
+      }),
     },
   }
 
@@ -365,6 +375,37 @@ describe('provider.models filter', () => {
     const models = await surfacedModels()
     expect(models['gpt-5.6-luna-pro']).toBeUndefined()
     expect(models['gpt-5.6-sol-pro']).toBeUndefined()
+  })
+
+  it('surfaces gpt-6-astra, whose id carries no minor version', async () => {
+    // The version gate parses the number after "gpt-". Requiring a decimal there
+    // matched every model that existed when it was written and silently dropped
+    // the first major-only id, even though the backend serves it.
+    const models = await surfacedModels()
+    expect(models['gpt-6-astra']).toBeDefined()
+  })
+
+  it('keeps gpt-6-astra inside the cheap pricing tier', async () => {
+    // The cap is a cost decision, not a capability one: the backend accepted
+    // 876,934 input tokens from this model when measured, but OpenAI charges 2x
+    // input and 1.5x output on the whole request once it passes 272k input
+    // tokens, so `input` has to stay under that line.
+    const models = await surfacedModels()
+    const limit = models['gpt-6-astra']?.limit
+    expect(limit?.input).toBeLessThan(272_000)
+    expect(limit).toEqual({
+      context: 372_000,
+      input: 244_000,
+      output: 128_000,
+    })
+  })
+
+  it('drops the bare gpt-6 and its synthetics', async () => {
+    // Refused by the backend as "not supported when using Codex with a ChatGPT
+    // account", exactly like the bare gpt-5.6.
+    const models = await surfacedModels()
+    expect(models['gpt-6']).toBeUndefined()
+    expect(models['gpt-6-fast']).toBeUndefined()
   })
 
   it('keeps allow-listed models and drops pre-5.4 models', async () => {
