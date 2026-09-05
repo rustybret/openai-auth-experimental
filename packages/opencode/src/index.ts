@@ -1059,23 +1059,42 @@ export async function CodexAuthPlugin(
                       input: 272_000,
                       output: 128_000,
                     }
-                  : // Capped to keep a turn inside the cheap pricing tier, not
-                    // because the backend cannot take more. OpenAI charges 2x
-                    // input and 1.5x output ON THE WHOLE REQUEST once it
-                    // exceeds 272k input tokens, so `input` stays below that
-                    // line and `context` is that cap plus the output reserve.
-                    // The backend itself accepts far more — measured 2026-09-04,
-                    // gpt-5.6-sol took 861,550 input tokens and gpt-6-astra
-                    // 876,934 — so raising these is a cost decision, never a
-                    // capability one. gpt-6-astra carries the same 272k tier.
-                    model.id.includes('gpt-5.6') ||
-                      model.id.includes('gpt-6-astra')
+                  : // gpt-6-astra pays no long-context surcharge on the Codex
+                    // backend, so it keeps the full window that backend
+                    // advertises. OpenAI's rate card: "GPT-6 Astra usage in
+                    // Codex does not incur additional long-context multipliers
+                    // above 272K input tokens." The exemption is per-surface —
+                    // the same model billed through the platform API does pay it
+                    // — and this plugin only ever talks to Codex.
+                    // 872k is the Codex backend's own reported
+                    // max_context_window, from
+                    // GET /backend-api/codex/models?client_version=<v>. The
+                    // configured window follows that reported number rather than
+                    // the hard ceiling probing found just above it (876,934
+                    // input tokens were accepted on 2026-09-04). Input and
+                    // output draw on one shared budget, so `input` is that
+                    // window minus the 128k output reserve.
+                    model.id.includes('gpt-6-astra')
                     ? {
-                        context: 372_000,
-                        input: 244_000,
+                        context: 872_000,
+                        input: 744_000,
                         output: 128_000,
                       }
-                    : model.limit,
+                    : // The 5.6 family is NOT exempt: above 272k input tokens it
+                      // costs 2x input and 1.5x output ON THE WHOLE REQUEST, so
+                      // `input` is held under that line at 244k and `context` is
+                      // that cap plus the 128k output reserve. This is a cost
+                      // decision, never a capability one — gpt-5.6-sol accepted
+                      // 861,550 input tokens when measured — so do not "correct"
+                      // these numbers upward to that ceiling without re-reading
+                      // the rate card first.
+                      model.id.includes('gpt-5.6')
+                      ? {
+                          context: 372_000,
+                          input: 244_000,
+                          output: 128_000,
+                        }
+                      : model.limit,
               },
             ]),
         )

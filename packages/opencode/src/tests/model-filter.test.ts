@@ -385,15 +385,27 @@ describe('provider.models filter', () => {
     expect(models['gpt-6-astra']).toBeDefined()
   })
 
-  it('keeps gpt-6-astra inside the cheap pricing tier', async () => {
-    // The cap is a cost decision, not a capability one: the backend accepted
-    // 876,934 input tokens from this model when measured, but OpenAI charges 2x
-    // input and 1.5x output on the whole request once it passes 272k input
-    // tokens, so `input` has to stay under that line.
+  it('gives gpt-6-astra its full window, exempt from the long-context surcharge', async () => {
+    // OpenAI's rate card exempts gpt-6-astra from the >272k long-context
+    // multiplier on the Codex backend, which is the only backend this plugin
+    // talks to. Holding it at the 5.6 family's 244k input cap would give up
+    // roughly two thirds of its window to avoid a charge never levied here.
     const models = await surfacedModels()
-    const limit = models['gpt-6-astra']?.limit
-    expect(limit?.input).toBeLessThan(272_000)
-    expect(limit).toEqual({
+    expect(models['gpt-6-astra']?.limit).toEqual({
+      context: 872_000,
+      input: 744_000,
+      output: 128_000,
+    })
+  })
+
+  it('keeps the 5.6 family under the long-context surcharge line', async () => {
+    // The exemption covers gpt-6-astra only: the 5.6 family still costs 2x input
+    // and 1.5x output on the whole request above 272k input tokens, so its 244k
+    // input cap stays even though the Codex backend accepted 861,550 input
+    // tokens from gpt-5.6-sol when measured.
+    const models = await surfacedModels()
+    expect(models['gpt-5.6-sol']?.limit?.input).toBeLessThan(272_000)
+    expect(models['gpt-5.6-luna']?.limit).toEqual({
       context: 372_000,
       input: 244_000,
       output: 128_000,
@@ -413,15 +425,6 @@ describe('provider.models filter', () => {
     expect(models['gpt-5.4']).toBeDefined()
     expect(models['gpt-5.5']).toBeDefined()
     expect(models['gpt-4.1']).toBeUndefined()
-  })
-
-  it('assigns gpt-5.6 variants the real 372k context window', async () => {
-    const models = await surfacedModels()
-    expect(models['gpt-5.6-luna']?.limit).toEqual({
-      context: 372_000,
-      input: 244_000,
-      output: 128_000,
-    })
   })
 
   it('keeps the gpt-5.5 400k downshift', async () => {

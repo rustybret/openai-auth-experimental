@@ -56,6 +56,7 @@
 │   ├── dev.ts                     # Build + symlink into .opencode/plugins/, run tsc --watch
 │   ├── dev-clean.ts               # Remove the dev symlink
 │   ├── analyze-cache-cliffs.mjs   # Cache cliff analyzer for dumped sessions
+│   ├── find-order-dependent-tests.mjs # Scanner for order-dependent tests
 │   ├── measure-store-contention.mjs # Account-store lock contention benchmark under load
 │   ├── release.sh                 # Tag-driven release driver
 │   ├── wait-release.sh            # Poll for the GitHub release to appear
@@ -73,9 +74,10 @@
 
 **`packages/opencode/src/core/`:**
 - Purpose: Generic, provider-agnostic core. Owns the multi-account store, file locks, retry/backoff math, quota cache/refresh orchestration, OAuth flow primitives, cache keep-warm, and atomic-write helpers. The Codex-specific bits (`codexRefreshFn`, `whamUsageFn`, JWT/account-id extraction) are injected via the `provider.ts` seam or live in `oauth.ts` so the layer can stay provider-agnostic.
-- Contains: `accounts.ts`, `atomic-write.ts`, `background-quota-refresh.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`, `reset-credits.ts`, `sticky-routing.ts`.
+- Contains: `account-paths.ts`, `accounts.ts`, `atomic-write.ts`, `background-quota-refresh.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`, `reset-credits.ts`, `sticky-routing.ts`.
 - Key files:
-  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
+  - `packages/opencode/src/core/account-paths.ts` — state-path derivation from config paths (`deriveStatePath`) and collision detection (`accountPathsCollide`)
+  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write with load-drop preservation), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache, backoff, and mid-stream rate limit marking
   - `packages/opencode/src/core/background-quota-refresh.ts` — `BackgroundQuotaRefresh` (periodic jittered poller for idle account quota with cross-process lease lock)
   - `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification
@@ -83,7 +85,7 @@
   - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
   - `packages/opencode/src/core/backoff.ts` — refresh/quota backoff math + `hashRefreshToken`
-  - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock with separated acquire window and lock TTL
+  - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock with separated acquire window, lock TTL, and generation-fenced renewal/release
   - `packages/opencode/src/core/provider.ts` — Codex-specific injection seam (`codexRefreshFn`, `whamUsageFn`)
 
 **`packages/opencode/src/rpc/`:**
@@ -118,8 +120,8 @@
 
 **`scripts/`:**
 - Purpose: Release + local dev tooling.
-- Contains: `dev.ts` (build + symlink into `.opencode/plugins/` + tsc --watch), `dev-clean.ts` (remove the symlink), `analyze-cache-cliffs.mjs` (cache cliff analyzer for dumped sessions), `measure-store-contention.mjs` (account-store lock contention benchmark under load / correlated arrival), `release.sh` (tag-driven release driver), `wait-release.sh` (poll for the GitHub release), `version-sync.mjs` (sync package versions).
-- Key files: `scripts/dev.ts`, `scripts/release.sh`, `scripts/analyze-cache-cliffs.mjs`, `scripts/measure-store-contention.mjs`.
+- Contains: `dev.ts` (build + symlink into `.opencode/plugins/` + tsc --watch), `dev-clean.ts` (remove the symlink), `analyze-cache-cliffs.mjs` (cache cliff analyzer for dumped sessions), `find-order-dependent-tests.mjs` (scanner for order-dependent tests), `measure-store-contention.mjs` (account-store lock contention benchmark under load / correlated arrival), `release.sh` (tag-driven release driver), `wait-release.sh` (poll for the GitHub release), `version-sync.mjs` (sync package versions).
+- Key files: `scripts/dev.ts`, `scripts/release.sh`, `scripts/analyze-cache-cliffs.mjs`, `scripts/find-order-dependent-tests.mjs`, `scripts/measure-store-contention.mjs`.
 
 ## Key File Locations
 
@@ -140,6 +142,7 @@
 
 **Core Logic:**
 - `packages/opencode/src/core/accounts.ts` — multi-account store, `FallbackAccountManager`.
+- `packages/opencode/src/core/account-paths.ts` — state-path derivation from config paths and collision detection.
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
 - `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
 - `packages/opencode/src/core/background-quota-refresh.ts` — periodic background quota refresher with jittered interval, freshness gate, and cross-process lease lock.
@@ -149,7 +152,7 @@
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
-- `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock.
+- `packages/opencode/src/core/refresh-file-lock.ts` — generation-fenced single-writer eviction-marker lock.
 - `packages/opencode/src/codex-http.ts` — HTTP fallback sanitization for WebSocket downgrades.
 - `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool.
 - `packages/opencode/src/ws.ts` — low-level WS connect/stream.
@@ -192,7 +195,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **RPC methods:** lowercase, dash-separated (`pending-notifications`, `apply`). JSON-RPC-shaped bodies.
 
-**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+\.\d+)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the suffix-less `gpt-5.6` and its synthetic fast/pro variants while accepting `-luna`, `-sol`, and `-terra` variants).
+**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y` or major versions like `gpt-X`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+(?:\.\d+)?)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the bare `gpt-5.6` and `gpt-6` while accepting `gpt-6-astra` and `-luna`, `-sol`, and `-terra` variants).
 
 ## Where to Add New Code
 
