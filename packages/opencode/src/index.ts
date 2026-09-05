@@ -1060,28 +1060,39 @@ export async function CodexAuthPlugin(
                       output: 128_000,
                     }
                   : // gpt-6-astra pays no long-context surcharge on the Codex
-                    // backend, so it keeps the full window that backend
-                    // advertises. OpenAI's rate card: "GPT-6 Astra usage in
+                    // backend, so it keeps the full window that backend reports.
+                    // Per OpenAI's enterprise rate card, read 2026-09-05 at
+                    // help.openai.com/en/articles/20001415 — section "GPT-6 Astra
+                    // — Codex long-context exception": "GPT-6 Astra usage in
                     // Codex does not incur additional long-context multipliers
-                    // above 272K input tokens." The exemption is per-surface —
+                    // above 272K input tokens." The exemption is per-surface:
                     // the same model billed through the platform API does pay it
-                    // — and this plugin only ever talks to Codex.
+                    // (developers.openai.com/api/docs/models/gpt-6-astra).
+                    //
+                    // That makes this correct for the DEFAULT endpoint. A
+                    // `codexApiEndpoint` override pointed at a relay or a
+                    // differently-billed surface inherits this window without
+                    // inheriting the exemption, which is the operator's to
+                    // re-check.
+                    //
                     // 872k is the Codex backend's own reported
                     // max_context_window, from
                     // GET /backend-api/codex/models?client_version=<v>. The
                     // configured window follows that reported number rather than
                     // the hard ceiling probing found just above it (876,934
-                    // input tokens were accepted on 2026-09-04). Input and
-                    // output draw on one shared budget, so `input` is that
-                    // window minus the 128k output reserve.
+                    // input tokens accepted on 2026-09-04), since the reported
+                    // number is the one the backend maintains. Input and output
+                    // draw on one shared budget, so `input` is that window minus
+                    // the 128k output reserve.
                     model.id.includes('gpt-6-astra')
                     ? {
                         context: 872_000,
                         input: 744_000,
                         output: 128_000,
                       }
-                    : // The 5.6 family is NOT exempt: above 272k input tokens it
-                      // costs 2x input and 1.5x output ON THE WHOLE REQUEST, so
+                    : // The 5.6 family is NOT exempt — same rate card, same date:
+                      // above 272k input tokens it costs 2x input and 1.5x
+                      // output ON THE WHOLE REQUEST, so
                       // `input` is held under that line at 244k and `context` is
                       // that cap plus the 128k output reserve. This is a cost
                       // decision, never a capability one — gpt-5.6-sol accepted

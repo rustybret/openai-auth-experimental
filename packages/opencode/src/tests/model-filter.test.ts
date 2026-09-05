@@ -385,11 +385,13 @@ describe('provider.models filter', () => {
     expect(models['gpt-6-astra']).toBeDefined()
   })
 
-  it('gives gpt-6-astra its full window, exempt from the long-context surcharge', async () => {
-    // OpenAI's rate card exempts gpt-6-astra from the >272k long-context
-    // multiplier on the Codex backend, which is the only backend this plugin
-    // talks to. Holding it at the 5.6 family's 244k input cap would give up
-    // roughly two thirds of its window to avoid a charge never levied here.
+  it('gives gpt-6-astra the full reported window, exempt from the surcharge', async () => {
+    // OpenAI's rate card (read 2026-09-05) exempts gpt-6-astra from the >272k
+    // long-context multiplier on the Codex backend, which is where the default
+    // endpoint points. Holding it at the 5.6 family's 244k input cap would give
+    // up roughly two thirds of its input allowance to avoid a charge not levied
+    // there. The window here is the backend's reported 872k, not the slightly
+    // higher ceiling probing found.
     const models = await surfacedModels()
     expect(models['gpt-6-astra']?.limit).toEqual({
       context: 872_000,
