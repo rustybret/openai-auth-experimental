@@ -397,6 +397,12 @@ interface CodexSessionMetadata {
   windowID: string
   turnStartedAt?: number
   input?: unknown[]
+  /**
+   * The `reasoning.effort` this session opened with. Held so a later change can
+   * be carried as a `configuration_update` item instead of as a different
+   * request-level value. See `applyMidConversationEffort`.
+   */
+  pinnedEffort?: string
 }
 
 interface PersistedCodexSessions {
@@ -601,6 +607,7 @@ function prepareCodexRequest(input: {
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
+  applyMidConversationEffort(parsed, input.metadata)
   if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
@@ -841,6 +848,58 @@ function stripResponsesLiteImageDetails(value: unknown) {
   if (value.type === 'input_image') delete value.detail
   for (const nested of Object.values(value))
     stripResponsesLiteImageDetails(nested)
+}
+
+// Only gpt-6-astra accepts `configuration_update`; measured against the backend,
+// gpt-5.6-sol answers 400 "The 'configuration_update' item type is not supported
+// with this model" for the identical body.
+const MID_CONVERSATION_EFFORT_MODELS = new Set(['gpt-6-astra'])
+
+/**
+ * Change reasoning effort mid-session without disturbing the replayed prefix.
+ *
+ * Sending a different request-level `reasoning.effort` works, and is what the
+ * host does on its own. The cost is that the effort is part of what the backend
+ * keys its prefix cache on, so raising effort on turn 20 asks it to re-read the
+ * whole conversation. Pinning the request-level value to whatever the session
+ * opened with, and carrying the change as a `configuration_update` item
+ * instead, leaves the prefix byte-identical.
+ *
+ * The item is re-asserted on every request rather than written into history:
+ * the host owns the history and will not replay an item this plugin injected,
+ * so an update recorded once would be gone by the next turn. Re-asserting also
+ * places it immediately before the final entry — the new user message — which
+ * is past the cached prefix, and makes two updates landing adjacent impossible.
+ * The API rejects adjacent updates.
+ *
+ * The response keeps reporting the request-level effort rather than the updated
+ * one, so usage records will show the pinned value. That is the documented
+ * behaviour, not a bug to chase.
+ */
+function applyMidConversationEffort(
+  parsed: Record<string, unknown>,
+  metadata: CodexSessionMetadata,
+) {
+  const model = typeof parsed.model === 'string' ? parsed.model : ''
+  if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return
+  const reasoning = isRecord(parsed.reasoning) ? parsed.reasoning : undefined
+  const effort =
+    typeof reasoning?.effort === 'string' ? reasoning.effort : undefined
+  if (!effort) return
+  if (metadata.pinnedEffort === undefined) {
+    metadata.pinnedEffort = effort
+    return
+  }
+  if (effort === metadata.pinnedEffort) return
+  const input = Array.isArray(parsed.input) ? parsed.input : undefined
+  // With nothing to sit in front of, an update would be the whole request; let
+  // the request-level value stand rather than send a bare instruction.
+  if (!input || input.length === 0) return
+  parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
+  input.splice(input.length - 1, 0, {
+    type: 'configuration_update',
+    reasoning: { effort },
+  })
 }
 
 // Responses Lite trades capabilities for Codex's compact request shape. It is
