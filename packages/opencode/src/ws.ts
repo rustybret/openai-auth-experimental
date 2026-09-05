@@ -13,6 +13,10 @@ import { ProxyEnv } from './util/proxy-env'
 import { isRecord } from './util/record'
 
 const logQ = createLogger('quota')
+// Transport lifecycle. Separate from the request dumper on purpose: a stream
+// failure the user sees as a hard error has to leave a record at the normal log
+// level, and dumps are off by default.
+const logT = createLogger('transport')
 
 export const PROTOCOL_HEADER = 'responses_websockets=2026-02-06'
 
@@ -319,12 +323,24 @@ export function streamResponsesWebSocket(
   // OpenCode acted on the frame yet?), not a visibility-based one.
   function invalidateTransport(error: ResponseStreamError) {
     if (emittedOutput) {
+      // Say why this is terminal. Without the suffix the message is identical
+      // to the retryable case, so a deliberate no-replay reads as a transport
+      // bug and sends the reader hunting for a fault that is not there.
+      const message = `${error.message} (not retried: output already emitted)`
+      logT.warn('stream failed after output; not retried', {
+        reason: error.message,
+        emittedOutput: true,
+      })
       fail(
-        new Error(error.message, { cause: error }),
-        new ResponseStreamError(error.message, { cause: error }),
+        new Error(message, { cause: error }),
+        new ResponseStreamError(message, { cause: error }),
       )
       return
     }
+    logT.warn('stream failed before output; retryable', {
+      reason: error.message,
+      emittedOutput: false,
+    })
     invalidate(error)
   }
 

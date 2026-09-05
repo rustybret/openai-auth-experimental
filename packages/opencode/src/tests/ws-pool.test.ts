@@ -2395,6 +2395,99 @@ type FakeWebSocketBehavior = {
   close?: () => void
 }
 
+describe('transport close provenance', () => {
+  test('a close after output says why it was not retried', async () => {
+    // The no-replay gate makes this terminal on purpose. Without the reason in
+    // the message it is indistinguishable from the retryable case, which reads
+    // as a transport bug and sends operators hunting a fault that is not there.
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'response.output_item.added',
+              item: { type: 'message', id: 'msg_1' },
+            }),
+          )
+          // Unframed TCP close: what the hand-rolled client synthesises as 1006.
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-close-after',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect((streamError as { message: string })?.message).toContain(
+          'not retried: output already emitted',
+        )
+        // Still terminal: a retryable error here would replay the turn and
+        // duplicate whatever was already streamed.
+        expect(streamError).not.toBeInstanceOf(ResponseStreamError)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('a close before any output stays retryable and unsuffixed', async () => {
+    await withFakeWebSocket(
+      ({ close }) => ({
+        send() {
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-close-before',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        // The suffix belongs only to the terminal case; carrying it here would
+        // claim a non-retry that did not happen.
+        expect((streamError as { message: string }).message).not.toContain(
+          'not retried',
+        )
+        websocketFetch.close()
+      },
+    )
+  })
+})
+
 async function withFakeWebSocket(
   behavior: (context: FakeWebSocketContext) => FakeWebSocketBehavior,
   run: () => Promise<void>,
