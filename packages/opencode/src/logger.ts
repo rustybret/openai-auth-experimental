@@ -56,6 +56,41 @@ const TOKEN_VALUE = /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+)\b/g
 export function redact(value: unknown): unknown {
   return redactInner(value, new WeakSet<object>())
 }
+
+/**
+ * Scrub credential-shaped strings without redacting by key name.
+ *
+ * For regions where a key names a piece of data rather than holding a secret —
+ * a JSON Schema property called `api_key` describes an argument, it does not
+ * carry one — replacing the node by name destroys the structure while removing
+ * nothing sensitive. A credential pasted into a description is still caught,
+ * because that is a string.
+ */
+export function redactStrings(value: unknown): unknown {
+  return redactStringsInner(value, new WeakSet<object>())
+}
+
+function redactStringsInner(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === 'string')
+    return value.replace(TOKEN_VALUE, '***REDACTED***')
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return '[Circular]'
+    seen.add(value)
+    const arr = value.map((v) => redactStringsInner(v, seen))
+    seen.delete(value)
+    return arr
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return '[Circular]'
+    seen.add(value)
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value))
+      out[k] = redactStringsInner(v, seen)
+    seen.delete(value)
+    return out
+  }
+  return value
+}
 function redactInner(value: unknown, seen: WeakSet<object>): unknown {
   if (typeof value === 'string')
     return value.replace(TOKEN_VALUE, '***REDACTED***')

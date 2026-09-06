@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
+import { getSettings } from '../config'
 // Snapshot the REAL oauth module exports at load time (before any mock.module
 // runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
 // it, so without restoring here the beginAccountLogin stub below would poison
@@ -1506,6 +1507,14 @@ describe('commands', () => {
     // After toggle: verify persistence in account storage
     const storage = await loadAccounts(configPath)
     expect(storage?.dump?.enabled).toBe(true)
+
+    // The dump gates read resolved settings, which are memoized per process.
+    // Persisting alone left every running process dumping nothing while the
+    // dialog reported the feature as on.
+    expect(getSettings().dump).toBe(true)
+
+    await buildDialogPayload('openai-dump', 'off', ctx)
+    expect(getSettings().dump).toBe(false)
   })
 
   // -----------------------------------------------------------------------

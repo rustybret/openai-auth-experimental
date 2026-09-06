@@ -379,9 +379,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             invalidate(entry)
           }
         },
-        onConnectionInvalid: () => {
+        onConnectionInvalid: (error) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
+          // A frame the socket refuses for its size will be refused again at
+          // the same size, so this session finishes over HTTP, which does not
+          // carry the same limit. Codex reaches the same destination after
+          // exhausting its WebSocket retries; going straight there skips
+          // resending a body already known to be too large.
+          if (OpenAIWebSocket.isOversizedFrame(error)) entry.fallback = true
           if (!entry.fallback) recordStreamFailure(entry)
           entry.continuation = undefined
           invalidate(entry)

@@ -88,6 +88,17 @@ export class RawWebSocket {
   removeEventListener(type: string, fn: Listener): void {
     this.listeners[type]?.delete(fn)
   }
+  /** Close code and reason from the peer's close frame, if one arrived. */
+  private peerClose: { code: number; reason: string } | undefined
+  private closeEmitted = false
+
+  /** Emit at most one close event, so the first reported code is the one kept. */
+  private emitClose(code: number, reason: string): void {
+    if (this.closeEmitted) return
+    this.closeEmitted = true
+    this.emit('close', { code, reason })
+  }
+
   private emit(type: string, event: unknown): void {
     for (const fn of [...(this.listeners[type] ?? [])]) {
       try {
@@ -171,7 +182,13 @@ export class RawWebSocket {
         if (this.emitRejectedUpgrade(true)) return
         this.readyState = 3
         void this.log('socket_close', { hadError })
-        this.emit('close', { code: 1006, reason: 'socket closed' })
+        // 1006 means "closed with no code" and is a last resort. The peer's own
+        // code says why it hung up, and callers act on it, so a parsed close
+        // frame wins even though the TCP close lands first.
+        this.emitClose(
+          this.peerClose?.code ?? 1006,
+          this.peerClose?.reason ?? 'socket closed',
+        )
       })
     } catch (e) {
       this.readyState = 3
@@ -291,12 +308,16 @@ export class RawWebSocket {
         reason = Buffer.from(payload.slice(2)).toString('utf-8')
       }
       this.readyState = 3
+      // Recorded before end(): that call can run the TCP close handler
+      // synchronously, and it reads this to avoid reporting a bare 1006.
+      this.peerClose = { code, reason }
       try {
         this.socket?.end()
       } catch {
         /* ignore */
       }
-      this.emit('close', { code, reason })
+      void this.log('close_frame', { code, reason })
+      this.emitClose(code, reason)
       return
     }
     // data frame: 0x1 text, 0x2 binary, 0x0 continuation

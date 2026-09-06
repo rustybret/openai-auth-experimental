@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getSettings } from './config'
-import { createLogger, redact } from './logger'
+import { createLogger, redact, redactStrings } from './logger'
+import { isRecord } from './util/record'
 
 const log = createLogger('dump')
 
@@ -191,10 +192,30 @@ function redactBodyForDump(bodyText: string) {
   const parsed = parseBody(bodyText)
   if (parsed === undefined) return bodyText
 
-  const redacted = redact(parsed)
+  const redacted = redactBodyValue(parsed)
   const redactedText = JSON.stringify(redacted)
   if (redactedText === undefined) return bodyText
   return JSON.stringify(parsed) === redactedText ? bodyText : redactedText
+}
+
+/**
+ * Tool definitions are declarations, not credentials: a parameter named
+ * `api_key` says what the tool accepts, and redacting that node by name leaves
+ * a schema that no longer parses — which also makes the dump unusable as a
+ * replayable capture. Strings inside them are still scrubbed, so a credential
+ * written into a description does not survive. Key order is preserved because
+ * the cache analyzer diffs these bodies against each other.
+ */
+function redactBodyValue(parsed: unknown): unknown {
+  if (!isRecord(parsed)) return redact(parsed)
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(parsed)) {
+    out[key] =
+      key === 'tools'
+        ? redactStrings(value)
+        : (redact({ [key]: value }) as Record<string, unknown>)[key]
+  }
+  return out
 }
 
 function toolType(tool: unknown) {

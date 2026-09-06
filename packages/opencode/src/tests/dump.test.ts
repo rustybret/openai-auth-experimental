@@ -541,6 +541,47 @@ describe('request dumps', () => {
     })
   })
 
+  test('keeps tool schemas intact while scrubbing credentials inside them', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const leaked = 'Bearer schema-description-token'
+      await dumpCodexRequest({
+        sessionID: 'ses_dump_schema',
+        transport: 'http',
+        phase: 'http',
+        bodyText: JSON.stringify({
+          tools: [
+            {
+              type: 'function',
+              name: 'call_api',
+              parameters: {
+                type: 'object',
+                properties: {
+                  // Names an argument the tool accepts; holds no secret.
+                  api_key: { type: 'string', description: 'the caller key' },
+                  auth_token: { type: 'string', description: leaked },
+                },
+              },
+            },
+          ],
+        }),
+      })
+
+      const bodyFile = requireFile(await readdir(dumpDir), '.body.json')
+      const body = await readFile(join(dumpDir, bodyFile), 'utf8')
+      const parsed = JSON.parse(body)
+      const properties = parsed.tools[0].parameters.properties
+
+      // The schema still parses as a schema rather than collapsing to a string.
+      expect(properties.api_key).toEqual({
+        type: 'string',
+        description: 'the caller key',
+      })
+      expect(properties.auth_token.type).toBe('string')
+      // A credential written into a description is still removed.
+      expect(body).not.toContain(leaked)
+    })
+  })
+
   test('dumps final WebSocket prewarm and main bodies when enabled', async () => {
     await withDumpEnv(async (dumpDir) => {
       const originalFetch = globalThis.fetch

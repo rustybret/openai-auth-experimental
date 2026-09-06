@@ -2372,6 +2372,128 @@ describe('createWebSocketFetch', () => {
       },
     )
   })
+
+  test('a 1009 after output has streamed fails with the size and no retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          if (data.length > 5000) {
+            // Output first: past this point the turn cannot move to another
+            // transport without replaying what the user already saw.
+            message(
+              JSON.stringify({
+                type: 'response.output_item.done',
+                item: { type: 'message', id: 'msg_1' },
+              }),
+            )
+            close(1009, '')
+            return
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_prewarm' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [{ note: 'x'.repeat(20000) }] }),
+        )
+
+        let caught: unknown
+        try {
+          await response.text()
+        } catch (error) {
+          caught = error
+        }
+
+        // Not a retryable APICallError: after output, replaying would repeat
+        // text and re-run tools, so the turn ends here.
+        expect(APICallError.isInstance(caught)).toBe(false)
+        const failure = caught as Error
+        expect(failure.message).toContain('message too big')
+        expect(failure.message).toMatch(/request was \d+(\.\d+)? (KB|MB)/)
+        expect(failure.message).toContain('not retried: output already emitted')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('a 1009 before any output finishes the turn over HTTP', async () => {
+    const httpCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          if (data.length > 5000) {
+            close(1009, '')
+            return
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_prewarm' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch: (async (input: URL | RequestInfo) => {
+            httpCalls.push(String(input))
+            return new Response('{"ok":true}', { status: 200 })
+          }) as unknown as typeof fetch,
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [{ note: 'x'.repeat(20000) }] }),
+        )
+
+        // The turn survives on the transport that does not impose the limit,
+        // instead of failing or resending the same oversized frame.
+        expect(httpCalls).toHaveLength(1)
+        expect(await response.text()).toBe('{"ok":true}')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('an ordinary mid-stream close stays retryable and carries no size', async () => {
+    await withFakeWebSocket(
+      ({ close }) => ({
+        send() {
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        let caught: unknown
+        try {
+          await response.text()
+        } catch (error) {
+          caught = error
+        }
+
+        const failure = caught as ResponseStreamError
+        expect(failure.isRetryable).toBe(true)
+        expect(failure.message).not.toContain('request was')
+        websocketFetch.close()
+      },
+    )
+  })
 })
 
 function streamRequest(body: Record<string, unknown>): RequestInit {

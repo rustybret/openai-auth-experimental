@@ -1,4 +1,4 @@
-import { getSettings } from './config'
+import { getSettings, refreshSettings } from './config'
 import {
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
@@ -726,10 +726,13 @@ async function executeDumpCommand(
       current.dump = { ...(current.dump ?? {}), enabled: true }
       return current
     }, ctx.accountStoragePath)
+    // The dump gates read memoized settings, so without this the running process
+    // keeps dumping nothing while the file says it is on.
+    const updated = refreshSettings()
     log.info('request dump enabled')
     return {
       command: 'openai-dump',
-      text: `## Request Dump Enabled\n\nDump directory: ${settings.dumpDir}\n\nWarning: body dumps may contain prompt/session content. Turn this off after debugging.`,
+      text: `## Request Dump Enabled\n\nDump directory: ${updated.dumpDir}\n\nWarning: body dumps may contain prompt/session content. Turn this off after debugging.`,
       knobs: { enabled: true },
     }
   }
@@ -739,6 +742,7 @@ async function executeDumpCommand(
       current.dump = { ...(current.dump ?? {}), enabled: false }
       return current
     }, ctx.accountStoragePath)
+    refreshSettings()
     log.info('request dump disabled')
     return {
       command: 'openai-dump',

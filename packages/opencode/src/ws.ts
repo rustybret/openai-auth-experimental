@@ -174,6 +174,21 @@ export function isUpgradeFailure(error: unknown): boolean {
   )
 }
 
+// Close code 1009: the peer refused the frame for its size. Marked rather than
+// matched on the message so the transport decision does not depend on wording.
+const oversizedFrames = new WeakSet<object>()
+
+export function isOversizedFrame(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && oversizedFrames.has(error)
+  )
+}
+
+export function markOversizedFrame<T extends object>(error: T): T {
+  oversizedFrames.add(error)
+  return error
+}
+
 function upgradeFailure(message: string, cause?: unknown): Error {
   const error = new Error(message, cause === undefined ? undefined : { cause })
   upgradeFailures.add(error)
@@ -282,6 +297,8 @@ export function streamResponsesWebSocket(
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined
   let cleanupSocket = () => {}
   let completed = false
+  /** Serialized size of the request frame, reported when the peer rejects it. */
+  let sentBytes = 0
   let emitted = false
   let emittedOutput = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
@@ -597,15 +614,21 @@ export function streamResponsesWebSocket(
 
   function onClose(event: CloseEvent) {
     if (completed) return
-    invalidateTransport(
-      new ResponseStreamError(
-        closeMessage(
-          'WebSocket closed before response.completed',
-          event.code,
-          event.reason,
-        ),
+    // 1009 is the peer refusing this request's size. Resending the same bytes
+    // over the same transport is pointless, so it is not retryable here; the
+    // pool routes it to HTTP instead when nothing has streamed yet. The size
+    // goes in the message because it is the part an operator can act on.
+    const oversized = event.code === 1009
+    const failure = new ResponseStreamError(
+      closeMessage(
+        'WebSocket closed before response.completed',
+        event.code,
+        event.reason,
+        oversized ? sentBytes : undefined,
       ),
+      { retryable: !oversized },
     )
+    invalidateTransport(oversized ? markOversizedFrame(failure) : failure)
   }
 
   function onAbort() {
@@ -640,7 +663,9 @@ export function streamResponsesWebSocket(
     const { background: _background, ...payload } = options.body
     resetIdleTimeout('idle timeout sending websocket request')
     try {
-      socket.send(JSON.stringify({ type: 'response.create', ...payload }))
+      const frame = JSON.stringify({ type: 'response.create', ...payload })
+      sentBytes = frame.length
+      socket.send(frame)
       resetIdleTimeout('idle timeout waiting for websocket')
     } catch (error) {
       if (completed) return
@@ -843,11 +868,24 @@ function isProviderRetryableAbortReason(reason: unknown): reason is Error {
   )
 }
 
-function closeMessage(message: string, code: number, reason: string | Buffer) {
+function closeMessage(
+  message: string,
+  code: number,
+  reason: string | Buffer,
+  sentBytes?: number,
+) {
   const details = [`code ${code}`]
   if (code === 1009) details.push('message too big')
   if (reason.length > 0) details.push(reason.toString())
+  if (sentBytes !== undefined && sentBytes > 0)
+    details.push(`request was ${formatBytes(sentBytes)}`)
   return `${message} (${details.join(': ')})`
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${bytes} B`
 }
 
 export * as OpenAIWebSocket from './ws'
