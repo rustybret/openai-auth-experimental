@@ -2425,13 +2425,17 @@ describe('createWebSocketFetch', () => {
     )
   })
 
-  test('a 1009 before any output finishes the turn over HTTP', async () => {
+  test('a 1009 arriving after the first-event grace still finishes over HTTP', async () => {
     const httpCalls: string[] = []
     await withFakeWebSocket(
       ({ message, close }) => ({
         send(data) {
           if (data.length > 5000) {
-            close(1009, '')
+            // A large body is still being written when the grace expires, and
+            // the peer only refuses it after reading enough to judge. The
+            // verdict therefore lands after the response was handed to the
+            // caller, which is the case this path exists for.
+            setTimeout(() => close(1009, ''), 40)
             return
           }
           message(
@@ -2445,6 +2449,7 @@ describe('createWebSocketFetch', () => {
       async () => {
         const websocketFetch = createWebSocketFetch({
           url: 'https://example.test/backend-api/codex/responses',
+          firstEventGraceMs: 5,
           httpFetch: (async (input: URL | RequestInfo) => {
             httpCalls.push(String(input))
             return new Response('{"ok":true}', { status: 200 })
@@ -2456,9 +2461,11 @@ describe('createWebSocketFetch', () => {
         )
 
         // The turn survives on the transport that does not impose the limit,
-        // instead of failing or resending the same oversized frame.
-        expect(httpCalls).toHaveLength(1)
+        // instead of failing or resending the same oversized frame. The switch
+        // happens while the body is being read, which is after the response
+        // itself was handed back.
         expect(await response.text()).toBe('{"ok":true}')
+        expect(httpCalls).toHaveLength(1)
         websocketFetch.close()
       },
     )
