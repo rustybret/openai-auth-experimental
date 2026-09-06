@@ -302,6 +302,17 @@ export function streamResponsesWebSocket(
   let emitted = false
   let emittedOutput = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
+  // Enough to describe a killed response to the provider. Without the id a
+  // response that never completed can only be identified as "the one after
+  // <previous_response_id>", and without the frame counters the gap between the
+  // last frame and the close cannot be bounded after the fact.
+  const previousResponseID =
+    typeof options.body.previous_response_id === 'string'
+      ? options.body.previous_response_id
+      : undefined
+  let createdResponseID: string | undefined
+  let framesSinceCreated = 0
+  let lastFrameAt: number | undefined
   // Call ids the response finalizes (one response.output_item.done per item).
   // Only these are guaranteed present in the response previous_response_id will
   // chain to, so only these are safe to trim from a later continuation suffix.
@@ -339,14 +350,35 @@ export function streamResponsesWebSocket(
   // charge. Narrowing this further needs a dispatch-based discriminator (has
   // OpenCode acted on the frame yet?), not a visibility-based one.
   function invalidateTransport(error: ResponseStreamError) {
+    // What the response was and how it was progressing when it died. A close
+    // carries no such context, so without this the gap between the last frame
+    // and the close cannot be bounded afterwards, and a killed continuation
+    // cannot be distinguished from a killed fresh request.
+    const shape = {
+      responseID: createdResponseID,
+      previousResponseID,
+      hasContinuation: previousResponseID !== undefined,
+      framesSinceCreated,
+      msSinceLastFrame:
+        lastFrameAt === undefined ? undefined : Date.now() - lastFrameAt,
+    }
     if (emittedOutput) {
       // Say why this is terminal. Without the suffix the message is identical
       // to the retryable case, so a deliberate no-replay reads as a transport
       // bug and sends the reader hunting for a fault that is not there.
-      const message = `${error.message} (not retried: output already emitted)`
+      //
+      // On a continuation the prior response id is named too: the turn cannot
+      // be retried here, so the operator resending it by hand is the recovery,
+      // and that is the identifier the provider can act on.
+      const context =
+        previousResponseID === undefined
+          ? ''
+          : ` (continuation of ${previousResponseID})`
+      const message = `${error.message}${context} (not retried: output already emitted)`
       logT.warn('stream failed after output; not retried', {
         reason: error.message,
         emittedOutput: true,
+        ...shape,
       })
       fail(
         new Error(message, { cause: error }),
@@ -357,6 +389,7 @@ export function streamResponsesWebSocket(
     logT.warn('stream failed before output; retryable', {
       reason: error.message,
       emittedOutput: false,
+      ...shape,
     })
     invalidate(error)
   }
@@ -567,6 +600,19 @@ export function streamResponsesWebSocket(
       ),
     )
     emitted = true
+    lastFrameAt = Date.now()
+    if (createdResponseID !== undefined) framesSinceCreated++
+    if (translatedEvent.type === 'response.created') {
+      createdResponseID = responseIDOf(translatedEvent)
+      // Logged rather than dumped: a response that dies before completing has
+      // no id anywhere else, and dumps are off by default, so without this the
+      // only way to name it to the provider is "the one after <previous id>".
+      logT.debug('response created', {
+        responseID: createdResponseID,
+        previousResponseID,
+        hasContinuation: previousResponseID !== undefined,
+      })
+    }
     if (
       translatedEvent.type !== 'response.created' &&
       translatedEvent.type !== 'response.in_progress'
@@ -866,6 +912,12 @@ function isProviderRetryableAbortReason(reason: unknown): reason is Error {
     (reason.name === 'ProviderHeaderTimeoutError' ||
       reason.name === 'ProviderResponseStreamError')
   )
+}
+
+function responseIDOf(event: Record<string, unknown>) {
+  const response = event.response
+  if (!isRecord(response)) return undefined
+  return typeof response.id === 'string' ? response.id : undefined
 }
 
 function closeMessage(
