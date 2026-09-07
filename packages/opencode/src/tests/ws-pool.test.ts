@@ -1114,6 +1114,129 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  // Guards a property that currently holds structurally rather than by any one
+  // line: the peer's close destroys the socket, and continuation state lives on
+  // that socket, so a chain cannot outlive the response it was refused on.
+  // Removing the continuation reset, the entry invalidation, or both leaves
+  // this green. It is here for the change that would break it — reconnecting
+  // and resuming a chain across a dead socket.
+  test('a killed continuation is not chained to again; the retry re-sends full input', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    let killed = false
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          sent.push(parsed)
+          const isPrewarm = parsed.generate === false
+          // Kill the first tool continuation the way the peer does: a clean FIN
+          // with no close frame, before anything streams. A main request that
+          // merely follows a prewarm also carries previous_response_id, so the
+          // tool output is what identifies the continuation under test.
+          const isToolContinuation =
+            Array.isArray(parsed.input) &&
+            parsed.input.some(
+              (item) =>
+                typeof item === 'object' &&
+                item !== null &&
+                (item as Record<string, unknown>).type ===
+                  'function_call_output',
+            )
+          if (!isPrewarm && !killed && isToolContinuation) {
+            killed = true
+            close(1006, 'socket closed')
+            return
+          }
+          if (!isPrewarm) {
+            message(
+              JSON.stringify({
+                type: 'response.output_item.done',
+                item: {
+                  type: 'function_call',
+                  call_id: 'call_1',
+                  name: 'bash',
+                },
+              }),
+            )
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: isPrewarm
+                  ? `resp_prewarm_${sent.length}`
+                  : `resp_main_${sent.length}`,
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const toolTurn = () =>
+          websocketFetch(
+            'https://example.test/backend-api/codex/responses',
+            streamRequest({
+              input: [
+                {
+                  role: 'user',
+                  content: [{ type: 'input_text', text: 'one' }],
+                },
+                { type: 'function_call', call_id: 'call_1', name: 'bash' },
+                {
+                  type: 'function_call_output',
+                  call_id: 'call_1',
+                  output: 'ok',
+                },
+              ],
+            }),
+          )
+
+        await (
+          await websocketFetch(
+            'https://example.test/backend-api/codex/responses',
+            streamRequest({
+              input: [
+                {
+                  role: 'user',
+                  content: [{ type: 'input_text', text: 'one' }],
+                },
+              ],
+            }),
+          )
+        ).text()
+
+        // Same turn, so no prewarm: this chains to the prior response and sends
+        // only the suffix. It dies before output.
+        try {
+          const dying = await toolTurn()
+          await dying.text()
+        } catch {
+          // The failure is the point; the retry below is what is under test.
+        }
+
+        // The host reissues the identical request.
+        await (await toolTurn()).text()
+
+        const mains = sent.filter((s) => s.generate !== false)
+        const killedRequest = mains.at(-2)
+        const retried = mains.at(-1)
+        // The killed attempt was a trimmed suffix against the prior response.
+        expect(killedRequest?.previous_response_id).toBe('resp_main_2')
+        expect(killedRequest?.input).toHaveLength(1)
+        // The retry must not chain to the response the peer refused to serve.
+        // It opens a fresh socket, so it may chain to that socket's own prewarm
+        // — what matters is that it carries the whole input rather than the
+        // suffix it would send if the killed chain had survived.
+        expect(retried?.previous_response_id).not.toBe('resp_main_2')
+        expect(retried?.input).toHaveLength(3)
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('prewarms again for a fresh user turn instead of continuing from the prior turn response', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(
