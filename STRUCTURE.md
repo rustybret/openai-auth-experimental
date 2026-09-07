@@ -133,7 +133,7 @@
 - `packages/pi/src/index.ts` — Pi extension entry.
 
 **Configuration:**
-- `packages/opencode/src/config.ts` — settings resolution (env > file > default), `DEFAULT_CODEX_API_ENDPOINT`, env-var constants.
+- `packages/opencode/src/config.ts` — settings resolution (env > file > default), memoization invalidation (`refreshSettings`), `DEFAULT_CODEX_API_ENDPOINT`, env-var constants.
 - `packages/opencode/package.json` — `bin.openai-auth` entry point, `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
 - `packages/opencode/src/tui-preferences.ts` — shared `tui-preferences.jsonc` reader/writer/watcher (used by the TUI sidebar slot config).
 - `biome.json` — formatter/linter config.
@@ -154,15 +154,16 @@
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
 - `packages/opencode/src/core/refresh-file-lock.ts` — generation-fenced single-writer eviction-marker lock.
 - `packages/opencode/src/codex-http.ts` — HTTP fallback sanitization for WebSocket downgrades.
-- `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool.
-- `packages/opencode/src/ws.ts` — low-level WS connect/stream.
+- `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool with continuation chaining, refusal cleanup, and HTTP relay fallback for oversized frames (1009).
+- `packages/opencode/src/ws.ts` — low-level WS connect/stream, response lifecycle logging, and oversized frame classification.
+- `packages/opencode/src/response-stream-error.ts` — retryable and terminal stream error shape for WS/HTTP.
 - `packages/opencode/src/WEBSOCKET.md` — developer reference for WebSocket flow, lifetime, and retry strategies.
 - `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` / `packages/opencode/src/raw-ws-upgrade.ts` — hand-rolled RFC 6455 clients and HTTP upgrade response parser.
 - `packages/opencode/src/hosted-web-search.ts` — provider-hosted `web_search` tool + replay/SSE translation.
 - `packages/opencode/src/quota-normalize.ts` — HTTP/WS/wham → `OAuthQuotaSnapshot`.
 - `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot, tolerant reader, and SHA-256-keyed sticky session assignments with seven-day TTL.
-- `packages/opencode/src/dump.ts` — optional transport request dumps for cache debugging.
-- `packages/opencode/src/logger.ts` — leveled, secret-redacting, size-rotating logger.
+- `packages/opencode/src/dump.ts` — optional transport request dumps with tool schema preservation for cache debugging.
+- `packages/opencode/src/logger.ts` — leveled, secret-redacting (`redact` and `redactStrings`), size-rotating logger.
 - `packages/opencode/src/model-costs.ts` — model cost resolution and restoration from `models.dev` catalog.
 
 **Tests:**

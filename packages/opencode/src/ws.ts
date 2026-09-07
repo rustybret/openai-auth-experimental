@@ -310,6 +310,19 @@ export function streamResponsesWebSocket(
     typeof options.body.previous_response_id === 'string'
       ? options.body.previous_response_id
       : undefined
+  // The log carries two session identifiers: socket events are keyed by the
+  // Codex thread id, while request and completion records are keyed by the
+  // host's session id. Anyone reading one set cannot find the matching records
+  // in the other without joining on pid and timestamp, so both identifiers are
+  // attached to every line written below.
+  const codexSessionID =
+    typeof options.body.prompt_cache_key === 'string'
+      ? options.body.prompt_cache_key
+      : undefined
+  const sessionKeys = {
+    sessionID: options.sessionID,
+    codexSessionID,
+  }
   let createdResponseID: string | undefined
   let framesSinceCreated = 0
   let lastFrameAt: number | undefined
@@ -355,6 +368,7 @@ export function streamResponsesWebSocket(
     // and the close cannot be bounded afterwards, and a killed continuation
     // cannot be distinguished from a killed fresh request.
     const shape = {
+      ...sessionKeys,
       responseID: createdResponseID,
       previousResponseID,
       hasContinuation: previousResponseID !== undefined,
@@ -608,6 +622,7 @@ export function streamResponsesWebSocket(
       // no id anywhere else, and dumps are off by default, so without this the
       // only way to name it to the provider is "the one after <previous id>".
       logT.debug('response created', {
+        ...sessionKeys,
         responseID: createdResponseID,
         previousResponseID,
         hasContinuation: previousResponseID !== undefined,
