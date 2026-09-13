@@ -302,6 +302,14 @@ export function streamResponsesWebSocket(
   let emitted = false
   let emittedOutput = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
+  // The opening frame types, for diagnosing a response that dies early.
+  // emittedOutput is one bit and trips on every frame that is not a lifecycle
+  // frame, so it cannot say whether what reached the reader was a part-start or
+  // an actual text delta. Those carry different replay risk, and the difference
+  // is not recoverable after the fact. Bounded, because only the opening of a
+  // response is ever in question.
+  const openingFrameTypes: string[] = []
+  const OPENING_FRAME_LIMIT = 12
   // Enough to describe a killed response to the provider. Without the id a
   // response that never completed can only be identified as "the one after
   // <previous_response_id>", and without the frame counters the gap between the
@@ -369,6 +377,7 @@ export function streamResponsesWebSocket(
     // cannot be distinguished from a killed fresh request.
     const shape = {
       ...sessionKeys,
+      openingFrameTypes,
       responseID: createdResponseID,
       previousResponseID,
       hasContinuation: previousResponseID !== undefined,
@@ -616,6 +625,9 @@ export function streamResponsesWebSocket(
     emitted = true
     lastFrameAt = Date.now()
     if (createdResponseID !== undefined) framesSinceCreated++
+    if (openingFrameTypes.length < OPENING_FRAME_LIMIT) {
+      openingFrameTypes.push(String(translatedEvent.type))
+    }
     if (translatedEvent.type === 'response.created') {
       createdResponseID = responseIDOf(translatedEvent)
       // Logged rather than dumped: a response that dies before completing has
