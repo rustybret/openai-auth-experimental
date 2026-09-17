@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.8.0-1 — 2026-09-17
+
+### [Upstream Changes]
+- Merged upstream `v0.8.0` (including `0c90408` docs):
+  - Retired `openai-auth` CLI binary in favor of integrated OpenCode and Pi auth management surfaces.
+  - Added OpenCode auth management menu inside `opencode auth login` (add account, auth current, check quotas, auth doctor, apply repairs, delete all accounts).
+  - Added Pi extension account commands (`openai-account`, `openai-quota`, `openai-routing`) backed by shared core.
+  - Transport fix: do not treat transport envelope as shown output.
+  - Self-contained private core packaging.
+  - Documentation updates for auth menu and Pi command surface in `ARCHITECTURE.md` and `STRUCTURE.md`.
+
+### [Arcus/Internal Modifications]
+- Bumped package versions to `0.8.0-1` (`@cortexkit/opencode-openai-auth`, `@cortexkit/pi-openai-auth`).
+- Reconciled Arcus fleet governance and fork-sync exclusions.
+
 ## v0.7.2-1 — 2026-09-17
 
 ### [Upstream Changes]
