@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.7.2-1 — 2026-09-17
+
+### [Upstream Changes]
+- Merged upstream `v0.7.2`:
+  - Extracted shared command implementations and types into `@cortexkit/openai-auth-core` (`packages/core`).
+  - Transport stream resilience: record opening frame types on stream failure; prevent provider wording from reopening closed turns; keep oversized-frame refusals out of host retry matches.
+  - Dependency toolchain updates: updated `@ai-sdk/openai`, OpenTUI, and Pi packages.
+  - Rate limit credit reset tooling: updated `/openai-reset` command preconditions and wham credit counting.
+
+### [Arcus/Internal Modifications]
+- Declarative Arcus v2 manifest: added `arcus.json` specifying Archetype A (`opencode-openai-auth` / `opencode-plugin`).
+- Versioning format: adopted `<upstream_semver>-<fork_revision>` standard (`0.7.2-1`).
+- Slash command formatting: updated `/openai-account` status to distinguish connected primary OpenCode account from empty fallback roster, referencing `opencode providers login --provider openai`.
+- Fork sync automation: maintained `scripts/fork-sync-exclusions` with `regenerate:` verb for `bun.lock` and `keep-deleted:` for upstream CI/release workflows.
+
 ## v0.2.0-experimental — 2026-06-20
 
 This release integrates upstream v0.1.3 (CortexKit's official multi-account release) alongside two local fixes developed ahead of that release. The hostname guard closes a cross-provider auth-header corruption bug introduced by the OpenCode plugin system's global fetch hook — without it, requests to Google, Anthropic, and other provider proxies would have their API keys stripped and replaced with a Codex OAuth token. The upstream `rate_limits` crashfix resolves a wire-shape mismatch where `additional_rate_limits` arrives as an object keyed by model name rather than a flat array, which caused a `{} is not iterable` exception that tore down the WebSocket frame loop mid-session. Both fixes are tested; the suite grew by one regression case to 393 passing tests.

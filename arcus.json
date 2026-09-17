@@ -1,0 +1,12 @@
+{
+  "$schema": "file://~/.config/arcus/manifests/schema.json",
+  "package_id": "opencode-openai-auth",
+  "software_type": "opencode-plugin",
+  "source_id": "arcus",
+  "channel": "stable",
+  "format": "tar.gz",
+  "plugin": {
+    "package_name": "@cortexkit/opencode-openai-auth",
+    "strip_components": 1
+  }
+}
