@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "setup": "bash setup.sh",
-    "build": "cd packages/opencode && bun run build && cd ../pi && bun run build",
+    "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
     "build:arcus": "bun run build && bash scripts/pack-arcus.sh",
     "package:arcus": "bash scripts/pack-arcus.sh",
     "pack:arcus": "bash scripts/pack-arcus.sh",
@@ -21,8 +21,8 @@
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "analyze:cache": "bun scripts/analyze-cache-cliffs.mjs",
-    "test": "bun test",
-    "typecheck": "cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck",
+    "test": "cd packages/core && bun run test && cd ../opencode && bun run test && cd ../pi && bun run test",
+    "typecheck": "cd packages/core && bun run typecheck && cd ../opencode && bun run typecheck && cd ../pi && bun run typecheck",
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",
@@ -39,6 +39,7 @@
     "@types/bun": "1.4.2",
     "bun-types": "1.4.2",
     "lefthook": "2.1.12",
+    "tsdown": "0.23.0",
     "typescript": "7.0.2"
   }
 }
