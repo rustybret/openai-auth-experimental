@@ -12,7 +12,7 @@
 
 ---
 
-# CortexKit OpenAI Auth for OpenCode
+## CortexKit OpenAI Auth for OpenCode
 
 ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained by [CortexKit](https://github.com/cortexkit).
 
@@ -54,7 +54,7 @@ bun run build   # output: packages/opencode/dist/index.js
 
 **3. After any code change:**
 
-- Run (from `packages/opencode/`) 
+- Run (from `packages/opencode/`)
 
 ```bash
 `bun run build` 
@@ -66,7 +66,6 @@ bun run build   # output: packages/opencode/dist/index.js
 rm -rf ~/.cache/opencode
 ```
 
-
 ### Authenticate
 
 Log in with OpenCode's normal auth command and pick the `openai` provider:
@@ -74,6 +73,7 @@ Log in with OpenCode's normal auth command and pick the `openai` provider:
 ```text
 opencode auth login 
 ```
+
 - select openai
 
 Three methods are offered:

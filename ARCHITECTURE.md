@@ -33,6 +33,7 @@
 - Used by: Plugin loader, `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
 
 **Quota cache and policy:**
+
 - Purpose: In-memory cache of main + per-fallback quota snapshots, dedup of inflight fetches, refresh-after math, backoff gating, and mid-stream rate-limit marks.
 - Location: `packages/core/src/quota-manager.ts`, `packages/core/src/refresh-all-quota.ts`, plus `packages/opencode/src/core/background-quota-refresh.ts` and `packages/opencode/src/core/sticky-routing.ts`
 - Contains: `QuotaManager` class with `getMain`/`setMain`/`getFallback`/`setFallback`/`seedFallbacksFromAccounts`/`isBackedOff`/`isFallbackBackedOff`, rate limit marking (`markRateLimited`, `isRateLimited`, `rateLimitedUntil`), stable-identity policy peeks (`peekMainForPolicy`, `peekFallbackForPolicy`) to prevent token refreshes from invalidating cached quota, token-fingerprint helpers, `refreshAllQuota` orchestration (treats quota endpoint 401s as token refresh triggers, skips poll attempts for accounts with armed non-transient refresh backoff by marking them permanent failures, and displays quota readings with their own age when older than 15 minutes), `BackgroundQuotaRefresh` (unref'd 5-minute jittered poll with 4-minute freshness gating and auto-renewed `bg-quota-refresh` file lease lock), and `sticky-routing.ts` candidate selection and break classification (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`). Mid-stream rate-limit reset resolution (`resolveMidStreamRateLimitResetAt`) prefers explicit provider resets (e.g. from admission-time errors or HTTP/WS 429 upgrade frames) over cached named-window resets or bounded defaults. Policies drop cached window snapshots when their reset timestamps are in the past.
@@ -56,6 +57,7 @@
 - Used by: Plugin loader (`/login openai` `methods`), CLI (`login`), `/openai-account add`.
 
 **Cache keep-warm:**
+
 - Purpose: Track idle main-agent (and optionally subagent) sessions and replay the last real request as a `store:false` shadow request just before Codex evicts the prompt cache. Employs model-aware TTL (raising GPT-5.6 TTL to 30 min from the 5-min default), gpt-5.6 subagent 2-warm caps, a process clock-bound window (outside of which warming and capture are skipped), and extended subagent idle bounds (75 min for GPT-5.6 subagents). `sustain` defaults off and bypasses only main idle pruning; it leaves the clock window, subagent limits, target-count, byte, and LRU caps intact.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Contains: `CacheKeepManager` class (target map, timer, idle caps, backoff), `buildKeepwarmCapture`, `buildKeepwarmBody`, model-aware TTL matcher (`isGpt56Model`, `ttlForModel`), clock window checker (`isWithinCacheKeepWindow`), SSE/JSON usage extraction.
@@ -63,12 +65,14 @@
 - Used by: Plugin loader (per-instance wiring); `/openai-cachekeep` command.
 
 **Request transformation:**
+
 - Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for eligible GPT-5.6 models and `gpt-6-astra`. Responses Lite trades capabilities for compact requests by disabling parallel tool calls, moving system instructions and tools into developer messages prefixing the input sequence, excluding hosted tools, and stripping details from images. Preserves OpenCode's native `max` reasoning variant on the wire, sets Codex client version to `0.153.0` (required for `gpt-6-astra`), caps `gpt-5.6` variants context and input (244k input, 372k context) to stay within OpenAI's cheap pricing tier below the 272k 2x-pricing threshold, while `gpt-6-astra` receives its full reported window (744k input, 872k context) exempt from the Codex long-context surcharge at the default endpoint. Preserves byte-identical prefix caches for `gpt-6-astra` by pinning request-level reasoning effort to session-opening values and carrying mid-conversation effort changes as `configuration_update` input items immediately preceding the new user turn (unsupported models like `gpt-5.6-sol` retain standard request-level effort updates), and filters legacy experimental `-pro` model entries and bare disallowed IDs (`gpt-5.6`, `gpt-6`) while accepting major/minor versions `> 5.4` (such as `gpt-6-astra`). Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
 - Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `maybeInjectCacheStabilizerTool`, `applyMidConversationEffort`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`), `packages/opencode/src/codex-http.ts` (`sanitizeHttpFallbackInit`, `sanitizeHttpFallbackBody`, `hasWebSocketResponsesLiteMetadata`), `packages/opencode/src/hosted-web-search.ts` (provider-hosted web-search tool + replay rewrite + SSE translation), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
 - Depends on: `util/uuid-v7.ts`, `util/stable-json.ts`, `packages/core/src/util/record.ts` (`isRecord`), `config.ts`.
 - Used by: Plugin loader `sendWithAccessToken`, `fetch` override.
 
 **Transports:**
+
 - Purpose: Run Codex requests over HTTP or WebSocket, with a session-keyed pool for the WebSocket path and Codex-style incremental streaming when the hand-rolled client is enabled. WebSocket connection starts with a prompt-prewarming phase (sending a `generate: false` body to populate the session's prompt cache and establish continuation state) before sending the main turn. Intercepts rate-limit notifications on prewarm and main connections (including admission-time `usage_limit_reached` frames and 429 handshake upgrade rejections parsed via `raw-ws-upgrade.ts`) via the `onRateLimitReached` callback to mark the account rate-limited with explicit provider resets. Applies a no-replay gate (forces a retryable `ResponseStreamError` only if no generated output item — including tool/function calls — was yet emitted (`emittedOutput`), enabling a same-turn fallback reroute on the stock `@ai-sdk/openai` runtime, else closes the stream to prevent duplication, double-billing, or re-running side-effecting tools; note that same-turn rerouting is bypassed under the experimental native runtime `OPENCODE_EXPERIMENTAL_NATIVE_LLM=1` where the errored body rejects with a non-retryable error, though the mark still steers the next turn off that account). Handles oversized WebSocket request frames (close code 1009) by marking them non-retryable on WebSocket; `relayWithOversizedFallback` in `ws-pool.ts` intercepts oversized frame failures on the returned response body and, provided no output bytes were yet delivered to the consumer, transparently issues the request over HTTP and streams the fallback response to finish the turn without spending futile retries. When a socket closes or continuation fails before output, the socket is destroyed and continuation state is cleared so retried turns resend full input rather than chaining to a refused response. In hand-rolled WebSocket clients (`raw-ws-bun.ts`, `raw-ws-node.ts`), parsed peer close frames take precedence over synthetic 1006 TCP close events. Transport lifecycle logging records `response.created` (with response ID and continuation tracking) and stream death diagnostics (frames produced, elapsed time, and continuation context) ungated by request-dump settings.
 - Location: `packages/opencode/src/ws.ts` (WS connect/stream, header ordering, idle timeout, retryable terminal hook, mid-stream event parser), `packages/opencode/src/ws-pool.ts` (account pool keyed by ChatGPT account ID or token hash fallback to prevent token refreshes from busting continuation chains, turn rotation via shared `advanceTurn`, prewarm connection limit failover, `OpenAIWebSocketPool`), `packages/opencode/src/raw-ws.ts` (runtime selection), `packages/opencode/src/raw-ws-bun.ts` (`Bun.connect`), `packages/opencode/src/raw-ws-node.ts` (`node:net`/`node:tls`), `packages/opencode/src/raw-ws-upgrade.ts` (handshake upgrade 4xx/5xx status & header parser), `packages/opencode/src/util/proxy-env.ts`.
 - Depends on: `dump.ts`, `hosted-web-search.ts`, `packages/core/src/quota-normalize.ts`, `response-stream-error.ts`, `packages/core/src/util/error.ts` (`errorMessage`), `packages/core/src/util/record.ts` (`isRecord`).
@@ -83,6 +87,7 @@
 - Used by: Plugin loader (server + notifications push), `tui.tsx` (RPC client polling + dialog delivery).
 
 **TUI sidebar:**
+
 - Purpose: Render an OpenCode sidebar slot showing main/fallback quota bars, routing/killswitch/health state, and the command dialog surfaces. The TUI does not own any auth state — it reads `sidebar-state.json`, resolves the session-safe active account via `resolveSessionSidebarRouting`, and pushes commands via RPC.
 - Location: `packages/opencode/src/tui.tsx`, `packages/opencode/src/tui/entry.mjs`, generated `packages/opencode/src/tui-compiled/`, `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/sidebar-state.ts`, `packages/opencode/src/tui-preferences.ts`.
 - Depends on: `@opentui/core`, `@opentui/solid`, `solid-js`, `jsonc-parser`.
@@ -96,6 +101,7 @@
 - Used by: Plugin loader (push), `refresh-all-quota.ts`, `cachekeep.ts`, `provider.ts` (dynamic import to avoid a cycle).
 
 **Model cost restoration:**
+
 - Purpose: Restore real model costs from a local cache or a remote catalog (`models.dev`) when cost zeroing is disabled.
 - Location: `packages/opencode/src/model-costs.ts`
 - Contains: `loadModelsDevCosts`, `resetModelCostsForTest`, `toSdkCost` with strict price validation, `modelsCachePath` checking `OPENCODE_OPENAI_AUTH_MODELS_CACHE`/`OPENCODE_MODELS_PATH` env vars and falling back to XDG cache, and catalog caching with a timeout-backed fetch.
@@ -118,9 +124,10 @@
 - Used by: Everywhere.
 
 **Commands (dialogs):**
- - Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback. Projects identity fields and scrubs credentials from knob payloads before sending over RPC. The shared bodies (quota, account, routing, reset, plus the dispatch and scrubbing) live in `packages/core/src/commands.ts` with module-private `execute*` bodies; the four host-owned bodies (killswitch, dump, logging, cachekeep) live in `packages/opencode/src/commands.ts` as `hostCommandBodies` and run through the core's `buildDialogPayload`/`applyCommand` so scrubbing applies uniformly.
- - Location: `packages/core/src/commands.ts` (shared bodies + seam), `packages/opencode/src/commands.ts` (host bodies + re-exported seam)
- - Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
+
+- Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback. Projects identity fields and scrubs credentials from knob payloads before sending over RPC. The shared bodies (quota, account, routing, reset, plus the dispatch and scrubbing) live in `packages/core/src/commands.ts` with module-private `execute*` bodies; the four host-owned bodies (killswitch, dump, logging, cachekeep) live in `packages/opencode/src/commands.ts` as `hostCommandBodies` and run through the core's `buildDialogPayload`/`applyCommand` so scrubbing applies uniformly.
+- Location: `packages/core/src/commands.ts` (shared bodies + seam), `packages/opencode/src/commands.ts` (host bodies + re-exported seam)
+- Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
 - Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
 - Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
 
@@ -198,33 +205,39 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Pattern: Factory; accepts `PluginInput` + `CodexAuthPluginOptions`; wires the auth loader, the WebSocket pool, the RPC server, and the global `__openaiAuthCacheKeepManager`.
 
 **`FallbackAccountManager`:**
+
 - Purpose: Owns the in-memory fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware).
 - Location: `packages/core/src/accounts.ts`
 - Pattern: Constructor-injected `refreshFn` (`codexRefreshFn`) and `quotaManager`; background timer with on-demand `markUsed` to refresh before the next request.
 
 **`QuotaManager`:**
+
 - Purpose: Single source of truth for in-memory main + per-fallback quota. Inflight dedup per fingerprint so concurrent calls with different tokens never cross-pollute.
 - Location: `packages/core/src/quota-manager.ts`
 - Pattern: Push-only (no `fetchQuotaFn` injected — quota comes via `setMain`/`setFallback`); active refresh is orchestrated by `refreshAllQuota`.
 
 **`BackgroundQuotaRefresh`:**
+
 - Purpose: Periodic background quota polling for idle accounts across processes with an auto-renewing cross-process lease lock (`bg-quota-refresh`), per-window freshness gating, and timestamp-based snapshot merging.
 - Location: `packages/opencode/src/core/background-quota-refresh.ts`
 - Pattern: Unref'd interval timer with jitter; non-blocking cancellation (`isStopped()` check before writing sidebar state); serialized cross-process execution via `acquireBackgroundRefreshLock`.
 
 **Sticky candidate selection:**
+
 - Purpose: Cold-session candidate selection, sustainable spend-rate weighting, and sticky-break classification.
 - Location: `packages/opencode/src/core/sticky-routing.ts`
 - Pattern: Pure functions (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`) calculating quota pressure divided by sustainable spendable rate; excludes stale or killswitch-failing accounts; falls open to configured order.
 
 **`CacheKeepManager`:**
+
 - Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm. Main-only `sustain` bypasses idle pruning without affecting the other bounds.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Pattern: Target map keyed by session id; interval timer; bounded (`maxTargets`, `maxBytes`) so a long-lived process cannot leak; model-aware TTL adjustment (30-min TTL for GPT-5.6 models) and gpt-5.6 subagent 2-warm limits.
 
 **Reset credit redemption coordinator:**
+
 - Purpose: Preview reset-credit eligibility and redeem exactly one explicit credit for an exhausted account after identity-bound confirmation.
- - Location: `packages/core/src/reset-credits.ts`; command orchestration in `packages/core/src/commands.ts` (`executeResetCommand` shared body).
+- Location: `packages/core/src/reset-credits.ts`; command orchestration in `packages/core/src/commands.ts` (`executeResetCommand` shared body).
 - Pattern: Persisted `(creditId, redeemRequestId)` claim before the consume POST; confirm-time identity and new-attempt precondition checks; terminal-only finalization with bounded, identifier-stable retry for ambiguous outcomes.
 
 **`OpenAIWebSocketPool` / `createWebSocketFetch`:**
@@ -240,6 +253,7 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Pattern: HTTP server on `127.0.0.1:<ephemeral>` with a 32-byte bearer token written to `port-<pid>.json`; client discovers via pid-liveness scan of the dir.
 
 **Sidebar snapshot:**
+
 - Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema; also owns machine-global sticky assignments.
 - Location: `packages/opencode/src/sidebar-state.ts`
 - Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState`, short-lived session display records via `upsertSidebarActiveRouting`, and SHA-256-keyed sticky assignments via `resolveSidebarStickyAssignment`; file locking and a promise serialization chain preserve concurrent placement and pending-byte accounting. Pins expire after seven days.
@@ -253,6 +267,7 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Responsibilities: Returns `Hooks`; `provider.models` filters the OpenAI model list (allow-list + GPT >5.4 fallback) and zeroes OAuth costs; `auth.loader` does the heavy lifting on first OAuth request; `auth.fetch` is the per-request wrapper; `command.execute.before` returns `cleanAbort` for `/openai-*`; `tool.web_search` registers `HostedWebSearchTool`; `event` cleans session state on `session.deleted`; `dispose` closes WS, stops cachekeep, stops background refresh, and stops background quota polling.
 
 **TUI entry:**
+
 - Location: `packages/opencode/src/tui/entry.mjs` (exported as `./tui`; dispatches to the precompiled or raw TUI)
 - Triggers: OpenCode TUI loads the plugin per its `oc-plugin: ["server", "tui"]` field.
 - Responsibilities: Renders the sidebar (quota, fallback accounts, routing, health, pacing); polls the loader RPC for dialogs; dispatches Apply; reads/writes `tui-preferences.jsonc`.
