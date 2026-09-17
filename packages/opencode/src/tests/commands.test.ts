@@ -420,6 +420,25 @@ describe('commands', () => {
     expect(payload.text).toContain('/openai-routing reset')
   })
 
+  test('account command distinguishes the connected main account from an empty fallback roster', async () => {
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload('openai-account', '', ctx)
+
+    expect(payload.text).toContain(
+      'Main account: **connected** (OpenCode OAuth).',
+    )
+    expect(payload.text).toContain('No fallback accounts configured.')
+    expect(payload.text).toContain('opencode providers login --provider openai')
+    expect(payload.text).not.toContain('No accounts configured')
+    expect(payload.text).not.toContain('/login openai')
+  })
+
   test('routing reset clears only the current session pin', async () => {
     const clearStickyRouting = mock(async () => true)
     const ctx: CommandContext = {

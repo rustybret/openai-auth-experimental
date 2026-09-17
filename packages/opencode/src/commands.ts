@@ -281,10 +281,9 @@ async function executeAccountCommand(
   if (tokens.length === 0) {
     // Show status
     const lines = ['## OpenAI Accounts', '']
+    lines.push('Main account: **connected** (OpenCode OAuth).')
     if (accounts.length === 0) {
-      lines.push(
-        'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add a fallback account.',
-      )
+      lines.push('', 'No fallback accounts configured.')
     } else {
       const mode: RoutingMode = storage.routing?.mode ?? 'main-first'
       lines.push(
@@ -298,7 +297,7 @@ async function executeAccountCommand(
     }
     lines.push('')
     lines.push(
-      'Commands: `/openai-account add [label]` | `/openai-account remove <id>`',
+      'Commands: `/openai-account add [label]` | `/openai-account remove <id>` | `opencode providers login --provider openai` to change the main account.',
     )
     return {
       command: 'openai-account',

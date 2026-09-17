@@ -14,10 +14,10 @@ The plugin registers the built-in `openai` provider id. OpenCode loads external 
 }
 ```
 
-Restart OpenCode after changing plugin config, then authenticate:
+Restart OpenCode after changing plugin config, then authenticate the main account:
 
 ```text
-/login openai
+opencode providers login --provider openai
 ```
 
 ## Features
@@ -26,7 +26,7 @@ Restart OpenCode after changing plugin config, then authenticate:
 - Codex request rewriting for OAuth requests, with Codex identity parity.
 - OAuth model filtering and zero-cost display.
 - Prompt-cache stabilizer (`web_search`) that keeps tool-continuation requests on the backend's cached path (on by default).
-- Multiple ChatGPT accounts with automatic reactive fallback on rate limits, `main-first`, `fallback-first`, or sticky-balanced routing, and a per-account quota killswitch.
+- Multiple ChatGPT accounts with automatic reactive fallback on rate limits, `main-first`, `fallback-first`, or `sticky-balanced` routing, and a per-account quota killswitch.
 - Per-turn quota tracking (5-hour + weekly windows) on both transports, with a sidebar readout and an explicit all-accounts refresh.
 - Idle prompt-cache keep-warm, with an optional subagent mode and main-only sustain mode.
 - Leveled, secret-redacting, rotating log file.
@@ -40,7 +40,7 @@ Each opens an interactive dialog in the TUI. Commands with listed arguments also
 | Command | Arguments | Purpose |
 | --- | --- | --- |
 | `/openai-quota` | — | Show 5h + weekly quota for all accounts. |
-| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts. |
+| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | Show the connected main account and manage fallback accounts. |
 | `/openai-routing` | `main-first` · `fallback-first` · `sticky-balanced` · `reset` | Routing order, sticky balanced session pins, or clear the current pin. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` · `sustain on` · `sustain off` | Idle prompt-cache keep-warm; sustain bypasses only main idle pruning. |
@@ -48,7 +48,7 @@ Each opens an interactive dialog in the TUI. Commands with listed arguments also
 | `/openai-logging` | `<level>` | Set log level live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
 
-CLI (fallback accounts only; the main account comes from `/login openai`). Run via `npx` — no global install needed:
+CLI (fallback accounts only; the main account comes from OpenCode OAuth via `opencode providers login --provider openai`). Run via `npx` — no global install needed:
 
 ```text
 npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
