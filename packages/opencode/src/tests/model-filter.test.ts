@@ -96,6 +96,16 @@ async function surfacedModels() {
         reasoningMode: 'pro',
       }),
       'gpt-5.6-terra': model('gpt-5.6-terra', 'gpt-5.6-terra'),
+      // gpt-6: the bare id is refused by the backend the way gpt-5.6 is, and
+      // its synthetics inherit that api.id, so all three drop.
+      'gpt-6': model('gpt-6', 'gpt-6'),
+      'gpt-6-fast': model('gpt-6-fast', 'gpt-6'),
+      // gpt-6-astra is major-only — no decimal in the id — which the version
+      // gate must still admit.
+      'gpt-6-astra': model('gpt-6-astra', 'gpt-6-astra'),
+      'gpt-6-astra-pro': model('gpt-6-astra-pro', 'gpt-6-astra', {
+        reasoningMode: 'pro',
+      }),
     },
   }
 
@@ -367,20 +377,56 @@ describe('provider.models filter', () => {
     expect(models['gpt-5.6-sol-pro']).toBeUndefined()
   })
 
-  it('keeps allow-listed models and drops pre-5.4 models', async () => {
+  it('surfaces gpt-6-astra, whose id carries no minor version', async () => {
+    // The version gate parses the number after "gpt-". Requiring a decimal there
+    // matched every model that existed when it was written and silently dropped
+    // the first major-only id, even though the backend serves it.
     const models = await surfacedModels()
-    expect(models['gpt-5.4']).toBeDefined()
-    expect(models['gpt-5.5']).toBeDefined()
-    expect(models['gpt-4.1']).toBeUndefined()
+    expect(models['gpt-6-astra']).toBeDefined()
   })
 
-  it('assigns gpt-5.6 variants the real 372k context window', async () => {
+  it('gives gpt-6-astra the full reported window, exempt from the surcharge', async () => {
+    // OpenAI's rate card (read 2026-09-05) exempts gpt-6-astra from the >272k
+    // long-context multiplier on the Codex backend, which is where the default
+    // endpoint points. Holding it at the 5.6 family's 244k input cap would give
+    // up roughly two thirds of its input allowance to avoid a charge not levied
+    // there. The window here is the backend's reported 872k, not the slightly
+    // higher ceiling probing found.
     const models = await surfacedModels()
+    expect(models['gpt-6-astra']?.limit).toEqual({
+      context: 872_000,
+      input: 744_000,
+      output: 128_000,
+    })
+  })
+
+  it('keeps the 5.6 family under the long-context surcharge line', async () => {
+    // The exemption covers gpt-6-astra only: the 5.6 family still costs 2x input
+    // and 1.5x output on the whole request above 272k input tokens, so its 244k
+    // input cap stays even though the Codex backend accepted 861,550 input
+    // tokens from gpt-5.6-sol when measured.
+    const models = await surfacedModels()
+    expect(models['gpt-5.6-sol']?.limit?.input).toBeLessThan(272_000)
     expect(models['gpt-5.6-luna']?.limit).toEqual({
       context: 372_000,
       input: 244_000,
       output: 128_000,
     })
+  })
+
+  it('drops the bare gpt-6 and its synthetics', async () => {
+    // Refused by the backend as "not supported when using Codex with a ChatGPT
+    // account", exactly like the bare gpt-5.6.
+    const models = await surfacedModels()
+    expect(models['gpt-6']).toBeUndefined()
+    expect(models['gpt-6-fast']).toBeUndefined()
+  })
+
+  it('keeps allow-listed models and drops pre-5.4 models', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-5.4']).toBeDefined()
+    expect(models['gpt-5.5']).toBeDefined()
+    expect(models['gpt-4.1']).toBeUndefined()
   })
 
   it('keeps the gpt-5.5 400k downshift', async () => {

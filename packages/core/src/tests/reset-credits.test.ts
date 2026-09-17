@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  type AccountPaths,
   type AccountStorage,
+  deriveStatePath,
   loadAccounts,
   mutateAccounts,
   type OAuthQuotaSnapshot,
   type ResetInFlight,
-} from '../core/accounts.ts'
+} from '../accounts.ts'
 import {
   claimResetAttempt,
   consumeResetCredit,
@@ -22,7 +24,7 @@ import {
   type RunResetCreditDeps,
   runResetCreditRedemption,
   selectCreditToSpend,
-} from '../core/reset-credits.ts'
+} from '../reset-credits.ts'
 
 function fetchStub(
   implementation: (
@@ -448,20 +450,14 @@ describe('reset redemption precondition', () => {
 
   it('accepts an exhausted live window with an applicable credit', () => {
     expect(
-      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, 1, now),
+      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, now),
     ).toEqual({ ok: true })
   })
 
   it('refuses healthy quota', () => {
     expect(
-      evaluateResetPrecondition({ primary: quotaWindow(20) }, false, 1, now),
+      evaluateResetPrecondition({ primary: quotaWindow(20) }, false, now),
     ).toEqual({ ok: false, reason: 'not exhausted' })
-  })
-
-  it('refuses exhausted quota without applicable credits', () => {
-    expect(
-      evaluateResetPrecondition({ primary: quotaWindow(100) }, false, 0, now),
-    ).toEqual({ ok: false, reason: 'no applicable credits' })
   })
 
   it('treats a 100%-used expired window as stale rather than exhausted', () => {
@@ -471,7 +467,6 @@ describe('reset redemption precondition', () => {
           primary: quotaWindow(100, '2026-07-17T11:59:59.999Z'),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: false, reason: 'not exhausted' })
@@ -485,7 +480,6 @@ describe('reset redemption precondition', () => {
           secondary: quotaWindow(100),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
@@ -499,7 +493,6 @@ describe('reset redemption precondition', () => {
           secondary: quotaWindow(100, '2026-07-17T11:59:59.999Z'),
         },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: false, reason: 'not exhausted' })
@@ -510,7 +503,6 @@ describe('reset redemption precondition', () => {
       evaluateResetPrecondition(
         { primary: quotaWindow(100, undefined) },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
@@ -518,18 +510,13 @@ describe('reset redemption precondition', () => {
       evaluateResetPrecondition(
         { primary: quotaWindow(100, 'not-a-date') },
         false,
-        1,
         now,
       ),
     ).toEqual({ ok: true })
   })
 
   it('lets a live rate-limit mark satisfy only exhaustion', () => {
-    expect(evaluateResetPrecondition({}, true, 1, now)).toEqual({ ok: true })
-    expect(evaluateResetPrecondition({}, true, 0, now)).toEqual({
-      ok: false,
-      reason: 'no applicable credits',
-    })
+    expect(evaluateResetPrecondition({}, true, now)).toEqual({ ok: true })
   })
 })
 
@@ -548,10 +535,15 @@ function deferred<T>(): Deferred<T> {
 
 let redemptionDir: string
 let redemptionConfigPath: string
+let redemptionPaths: AccountPaths
 
 beforeEach(() => {
   redemptionDir = mkdtempSync(join(tmpdir(), 'oai-reset-redemption-'))
   redemptionConfigPath = join(redemptionDir, 'openai-auth.json')
+  redemptionPaths = {
+    configPath: redemptionConfigPath,
+    statePath: deriveStatePath(redemptionConfigPath),
+  }
   writeFileSync(
     redemptionConfigPath,
     JSON.stringify({
@@ -611,6 +603,7 @@ function redemptionDeps(
 ): RunResetCreditDeps {
   return {
     configPath: redemptionConfigPath,
+    statePath: redemptionPaths.statePath,
     mutateAccountsFn: mutateAccounts,
     loadAccountsFn: loadAccounts,
     now: options.now ?? (() => Date.parse('2026-07-17T12:00:00.000Z')),
@@ -654,11 +647,11 @@ async function seedResetState(
     current.reset ??= {}
     current.reset[accountKey] = state
     return current
-  }, redemptionConfigPath)
+  }, redemptionPaths)
 }
 
 async function persistedResetState(accountKey = 'main') {
-  return (await loadAccounts(redemptionConfigPath))?.reset?.[accountKey]
+  return (await loadAccounts(redemptionPaths))?.reset?.[accountKey]
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -1135,7 +1128,7 @@ describe('atomic reset credit redemption', () => {
       }),
     )
     expect(
-      (await loadAccounts(redemptionConfigPath))?.reset?.main?.inFlight,
+      (await loadAccounts(redemptionPaths))?.reset?.main?.inFlight,
     ).toEqual({
       redeemRequestId: 'partial-request',
       startedAt: Date.parse('2026-07-17T11:59:00.000Z'),
@@ -1192,7 +1185,7 @@ describe('atomic reset credit redemption', () => {
 
     expect(decision.kind).toBe('fresh')
     expect(mutationCount).toBe(0)
-    expect((await loadAccounts(redemptionConfigPath))?.reset).toBeUndefined()
+    expect((await loadAccounts(redemptionPaths))?.reset).toBeUndefined()
   })
 
   it('observes persisted in-flight state from a new coordinator invocation', async () => {

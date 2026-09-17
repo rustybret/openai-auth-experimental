@@ -7,8 +7,45 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import {
+  type AccountStorage,
+  acquireRefreshFileLock,
+  buildRefreshOperationError,
+  buildUserAgent,
+  codexRefreshFn,
+  errorMessage,
+  extractAccountId,
+  extractAccountIdFromClaims,
+  type FallbackAccount,
+  FallbackAccountManager,
+  formatRefreshBackoffMessage,
+  getKillswitchThresholdsForAccount,
+  hashRefreshToken,
+  isCompleteQuotaHeaderFrame,
+  isCostZeroingEnabled,
+  isKillswitchEnabled,
+  isOAuthAccount,
+  isRecord,
+  killswitchPassesPolicy,
+  killswitchRetryAfterSeconds,
+  loadAccounts,
+  migrateIfNeeded,
+  mutateAccounts,
+  normalizeQuotaHeaders,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  parseJwtClaims,
+  type QuotaEntry,
+  QuotaManager,
+  type RoutingMode,
+  refreshAllQuota,
+  refreshBackoffActive,
+  resolveMidStreamRateLimitResetAt,
+  shouldFallbackStatus,
+  whamUsageFn,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
-
+import { createAuthMethods } from './auth/methods'
 import {
   buildDialogPayload,
   type CommandContext,
@@ -24,61 +61,16 @@ import {
   type ResetTargetIdentity,
 } from './commands'
 import { getConfigDir, getConfigPath, getSettings } from './config'
-import {
-  type AccountStorage,
-  type FallbackAccount,
-  FallbackAccountManager,
-  getKillswitchThresholdsForAccount,
-  isCostZeroingEnabled,
-  isKillswitchEnabled,
-  isOAuthAccount,
-  killswitchPassesPolicy,
-  killswitchRetryAfterSeconds,
-  loadAccounts,
-  migrateIfNeeded,
-  mutateAccounts,
-  type OAuthAccount,
-  type OAuthQuotaSnapshot,
-  type RoutingMode,
-  shouldFallbackStatus,
-} from './core/accounts'
+import { getAccountPaths, getAccountStatePath } from './core/account-paths'
 import {
   BackgroundQuotaRefresh,
   refreshQuotaInBackground,
 } from './core/background-quota-refresh'
 import {
-  buildRefreshOperationError,
-  formatRefreshBackoffMessage,
-  hashRefreshToken,
-  refreshBackoffActive,
-} from './core/backoff'
-import {
   buildKeepwarmCapture,
   CacheKeepManager,
   getCacheKeepWindow,
 } from './core/cachekeep'
-import {
-  base64UrlEncode,
-  beginDeviceAuth,
-  buildAuthorizeUrl,
-  completeDeviceAuth,
-  extractAccountId,
-  extractAccountIdFromClaims,
-  flowCleanup,
-  generatePKCE,
-  parseJwtClaims,
-  startOAuthServer,
-  USER_AGENT,
-  waitForOAuthCallback,
-} from './core/oauth'
-import { codexRefreshFn, whamUsageFn } from './core/provider'
-import {
-  type QuotaEntry,
-  QuotaManager,
-  resolveMidStreamRateLimitResetAt,
-} from './core/quota-manager'
-import { refreshAllQuota } from './core/refresh-all-quota'
-import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import {
   decideStickyBreak,
   type StickyBreakDecision,
@@ -93,10 +85,6 @@ import {
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
-import {
-  isCompleteQuotaHeaderFrame,
-  normalizeQuotaHeaders,
-} from './quota-normalize'
 import {
   drainNotifications,
   isTuiConnected,
@@ -127,10 +115,9 @@ import {
   setSidebarMachineState,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import { errorMessage } from './util/error'
-import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
+import { PackageVersion } from './version'
 import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
 const ALLOWED_MODELS = new Set([
@@ -144,19 +131,28 @@ const ALLOWED_MODELS = new Set([
 // -luna/-sol/-terra variants work. Its -fast/-pro synthetics inherit the same
 // api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
 // keeping the working variants (api.id gpt-5.6-luna, etc.).
-const DISALLOWED_MODELS = new Set(['gpt-5.6'])
-// Exact models currently marked `use_responses_lite` in Codex's catalog.
+// Same shape for gpt-6: the backend rejects the bare id ("not supported when
+// using Codex with a ChatGPT account") and serves only the named gpt-6-astra
+// variant, so any -fast/-pro synthetics inheriting api.id "gpt-6" drop with it.
+const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
+// Exact models currently marked `use_responses_lite` in Codex's catalog. Read
+// from the backend's own model list rather than assumed:
+//   GET /backend-api/codex/models?client_version=<v>
+// reports `use_responses_lite` per model, and gpt-6-astra is marked true.
 const RESPONSES_LITE_MODELS = new Set([
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
+  'gpt-6-astra',
 ])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-5.6 requires Codex client >= 0.144.0 (older versions 400 with "requires a
-// newer version of Codex"). 0.144.0 also works for gpt-5.4/5.5, so the bump is
-// safe across the whole model range.
-const CODEX_VERSION = '0.144.0'
+// gpt-6-astra requires Codex client >= 0.153.0; below that the backend 400s with
+// "requires a newer version of Codex". Measured against the live backend: 0.152.0
+// is refused and 0.153.0 is accepted. Verified non-regressive for every model we
+// surface (gpt-5.3-codex-spark, 5.4, 5.4-mini, 5.5, and the three 5.6 variants),
+// so one version serves the whole range.
+const CODEX_VERSION = '0.153.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
@@ -224,6 +220,7 @@ interface ResetTargetResolverDeps {
   ) => Promise<OAuthAccount>
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
+  accountStatePath: string
   now: () => number
 }
 
@@ -241,7 +238,10 @@ function resetTargetNeedsRefresh(
 export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
   return async (accountKey: string): Promise<ResetTargetIdentity> => {
     if (accountKey === 'main') {
-      const storage = await deps.loadAccounts(deps.accountStoragePath)
+      const storage = await deps.loadAccounts({
+        configPath: deps.accountStoragePath,
+        statePath: deps.accountStatePath,
+      })
       let auth = await deps.getAuth()
       if (auth.type !== 'oauth') {
         throw new ResetTargetResolutionError(
@@ -268,7 +268,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       const liveAccountId = claims
         ? extractAccountIdFromClaims(claims)
         : undefined
-      const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+      const freshStorage = await deps.loadAccounts({
+        configPath: deps.accountStoragePath,
+        statePath: deps.accountStatePath,
+      })
       return {
         accountKey,
         label: 'Main account',
@@ -277,7 +280,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       }
     }
 
-    const storage = await deps.loadAccounts(deps.accountStoragePath)
+    const storage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
     const account = storage?.accounts.find(
       (candidate) => candidate.id === accountKey,
     )
@@ -318,7 +324,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       )
     }
 
-    const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+    const freshStorage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
     const freshAccount = freshStorage?.accounts.find(
       (candidate) => candidate.id === accountKey,
     )
@@ -373,7 +382,7 @@ export {
   extractAccountIdFromClaims,
   type IdTokenClaims,
   parseJwtClaims,
-} from './core/oauth'
+} from '@cortexkit/openai-auth-core/internal'
 
 interface CodexAuthPluginOptions {
   issuer?: string
@@ -388,6 +397,12 @@ interface CodexSessionMetadata {
   windowID: string
   turnStartedAt?: number
   input?: unknown[]
+  /**
+   * The `reasoning.effort` this session opened with. Held so a later change can
+   * be carried as a `configuration_update` item instead of as a different
+   * request-level value. See `applyMidConversationEffort`.
+   */
+  pinnedEffort?: string
 }
 
 interface PersistedCodexSessions {
@@ -592,6 +607,7 @@ function prepareCodexRequest(input: {
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
+  applyMidConversationEffort(parsed, input.metadata)
   if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
@@ -834,6 +850,58 @@ function stripResponsesLiteImageDetails(value: unknown) {
     stripResponsesLiteImageDetails(nested)
 }
 
+// Only gpt-6-astra accepts `configuration_update`; measured against the backend,
+// gpt-5.6-sol answers 400 "The 'configuration_update' item type is not supported
+// with this model" for the identical body.
+const MID_CONVERSATION_EFFORT_MODELS = new Set(['gpt-6-astra'])
+
+/**
+ * Change reasoning effort mid-session without disturbing the replayed prefix.
+ *
+ * Sending a different request-level `reasoning.effort` works, and is what the
+ * host does on its own. The cost is that the effort is part of what the backend
+ * keys its prefix cache on, so raising effort on turn 20 asks it to re-read the
+ * whole conversation. Pinning the request-level value to whatever the session
+ * opened with, and carrying the change as a `configuration_update` item
+ * instead, leaves the prefix byte-identical.
+ *
+ * The item is re-asserted on every request rather than written into history:
+ * the host owns the history and will not replay an item this plugin injected,
+ * so an update recorded once would be gone by the next turn. Re-asserting also
+ * places it immediately before the final entry — the new user message — which
+ * is past the cached prefix, and makes two updates landing adjacent impossible.
+ * The API rejects adjacent updates.
+ *
+ * The response keeps reporting the request-level effort rather than the updated
+ * one, so usage records will show the pinned value. That is the documented
+ * behaviour, not a bug to chase.
+ */
+function applyMidConversationEffort(
+  parsed: Record<string, unknown>,
+  metadata: CodexSessionMetadata,
+) {
+  const model = typeof parsed.model === 'string' ? parsed.model : ''
+  if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return
+  const reasoning = isRecord(parsed.reasoning) ? parsed.reasoning : undefined
+  const effort =
+    typeof reasoning?.effort === 'string' ? reasoning.effort : undefined
+  if (!effort) return
+  if (metadata.pinnedEffort === undefined) {
+    metadata.pinnedEffort = effort
+    return
+  }
+  if (effort === metadata.pinnedEffort) return
+  const input = Array.isArray(parsed.input) ? parsed.input : undefined
+  // With nothing to sit in front of, an update would be the whole request; let
+  // the request-level value stand rather than send a bare instruction.
+  if (!input || input.length === 0) return
+  parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
+  input.splice(input.length - 1, 0, {
+    type: 'configuration_update',
+    reasoning: { effort },
+  })
+}
+
 // Responses Lite trades capabilities for Codex's compact request shape. It is
 // opt-in because it disables parallel tool calls and excludes hosted tools.
 function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
@@ -945,6 +1013,15 @@ export async function CodexAuthPlugin(
   // let any disposal kill the shared poller).
   const backgroundQuotaRefresh = new BackgroundQuotaRefresh()
 
+  let loaderGetAuth:
+    | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
+    | undefined
+  const authMethods = createAuthMethods({
+    client: input.client,
+    getAuth: async () => loaderGetAuth?.(),
+    fetchImpl: fetch,
+  })
+
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
       | { promptAsync?: (req: unknown) => Promise<unknown> }
@@ -993,7 +1070,8 @@ export async function CodexAuthPlugin(
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
       if (sidebarStateFileForEvents) {
-        const accounts = (await loadAccounts(getConfigPath()))?.accounts
+        const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
+          ?.accounts
         await removeSidebarActiveRouting(
           info.id,
           accounts,
@@ -1008,7 +1086,7 @@ export async function CodexAuthPlugin(
       async models(provider, ctx) {
         if (ctx.auth?.type !== 'oauth') return provider.models
 
-        const storage = await loadAccounts(getConfigPath())
+        const storage = await loadAccounts(getAccountPaths(getConfigPath()))
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
         const catalog = zeroCosts ? null : await loadModelsDevCosts()
         if (!zeroCosts && catalog && !loggedCostRestoration) {
@@ -1028,7 +1106,10 @@ export async function CodexAuthPlugin(
               if (model.options.reasoningMode === 'pro') return false
               if (ALLOWED_MODELS.has(model.api.id)) return true
               if (DISALLOWED_MODELS.has(model.api.id)) return false
-              const match = model.api.id.match(/^gpt-(\d+\.\d+)/)
+              // The minor is optional: a major-only id like gpt-6-astra carries
+              // no decimal, and requiring one silently dropped it from the
+              // catalogue even though the backend serves it.
+              const match = model.api.id.match(/^gpt-(\d+(?:\.\d+)?)/)
               const version = match?.[1]
               return version ? parseFloat(version) > 5.4 : false
             })
@@ -1047,15 +1128,53 @@ export async function CodexAuthPlugin(
                       input: 272_000,
                       output: 128_000,
                     }
-                  : // gpt-5.6 (luna/sol/terra) real context window is 372k on
-                    // the Codex backend, not the 1.05M models.dev reports.
-                    model.id.includes('gpt-5.6')
+                  : // gpt-6-astra pays no long-context surcharge on the Codex
+                    // backend, so it keeps the full window that backend reports.
+                    // Per OpenAI's enterprise rate card, read 2026-09-05 at
+                    // help.openai.com/en/articles/20001415 — section "GPT-6 Astra
+                    // — Codex long-context exception": "GPT-6 Astra usage in
+                    // Codex does not incur additional long-context multipliers
+                    // above 272K input tokens." The exemption is per-surface:
+                    // the same model billed through the platform API does pay it
+                    // (developers.openai.com/api/docs/models/gpt-6-astra).
+                    //
+                    // That makes this correct for the DEFAULT endpoint. A
+                    // `codexApiEndpoint` override pointed at a relay or a
+                    // differently-billed surface inherits this window without
+                    // inheriting the exemption, which is the operator's to
+                    // re-check.
+                    //
+                    // 872k is the Codex backend's own reported
+                    // max_context_window, from
+                    // GET /backend-api/codex/models?client_version=<v>. The
+                    // configured window follows that reported number rather than
+                    // the hard ceiling probing found just above it (876,934
+                    // input tokens accepted on 2026-09-04), since the reported
+                    // number is the one the backend maintains. Input and output
+                    // draw on one shared budget, so `input` is that window minus
+                    // the 128k output reserve.
+                    model.id.includes('gpt-6-astra')
                     ? {
-                        context: 372_000,
-                        input: 244_000,
+                        context: 872_000,
+                        input: 744_000,
                         output: 128_000,
                       }
-                    : model.limit,
+                    : // The 5.6 family is NOT exempt — same rate card, same date:
+                      // above 272k input tokens it costs 2x input and 1.5x
+                      // output ON THE WHOLE REQUEST, so
+                      // `input` is held under that line at 244k and `context` is
+                      // that cap plus the 128k output reserve. This is a cost
+                      // decision, never a capability one — gpt-5.6-sol accepted
+                      // 861,550 input tokens when measured — so do not "correct"
+                      // these numbers upward to that ceiling without re-reading
+                      // the rate card first.
+                      model.id.includes('gpt-5.6')
+                      ? {
+                          context: 372_000,
+                          input: 244_000,
+                          output: 128_000,
+                        }
+                      : model.limit,
               },
             ]),
         )
@@ -1067,6 +1186,7 @@ export async function CodexAuthPlugin(
     auth: {
       provider: 'openai',
       async loader(getAuth) {
+        loaderGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
@@ -1078,13 +1198,15 @@ export async function CodexAuthPlugin(
             refresh: auth.refresh ?? '',
             expires: auth.expires ?? 0,
           },
-          getConfigPath(),
+          getAccountPaths(getConfigPath()),
         )
 
         // Construct managers for push-only quota updates from response headers.
         // Wrap the first boot-time read so a corrupt store surfaces a clear,
         // actionable message instead of a raw JSON.parse SyntaxError.
-        const storage = await loadAccounts(getConfigPath()).catch((err) => {
+        const storage = await loadAccounts(
+          getAccountPaths(getConfigPath()),
+        ).catch((err) => {
           const path = getConfigPath()
           throw new Error(
             `OpenAI auth store at ${path} is corrupt or unreadable: ${err instanceof Error ? err.message : String(err)}. Fix or remove it to continue.`,
@@ -1112,7 +1234,7 @@ export async function CodexAuthPlugin(
             ) {
               return requestStorageCache.storage
             }
-            const next = await loadAccounts(path)
+            const next = await loadAccounts(getAccountPaths(path))
             requestStorageCache = {
               path,
               mtimeMs: stat.mtimeMs,
@@ -1122,7 +1244,7 @@ export async function CodexAuthPlugin(
             return next
           } catch {
             requestStorageCache = undefined
-            return loadAccounts(path)
+            return loadAccounts(getAccountPaths(path))
           }
         }
 
@@ -1148,7 +1270,7 @@ export async function CodexAuthPlugin(
             await mutateAccounts((current) => {
               current.mainAccountId = liveAccountId
               return current
-            }, getConfigPath())
+            }, getAccountPaths(getConfigPath()))
             storage.mainAccountId = liveAccountId
             invalidateRequestStorageCache()
           }
@@ -1180,11 +1302,13 @@ export async function CodexAuthPlugin(
 
         const quotaManager = new QuotaManager({
           storage,
+          configPath: getConfigPath(),
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
         })
         let currentMainIdentity: string | undefined
         let mainIdentityGeneration = 0
         const fallbackManager = new FallbackAccountManager({
+          paths: getAccountPaths(getConfigPath()),
           refreshFn: (opts) =>
             codexRefreshFn({
               refreshToken: opts.refreshToken,
@@ -1254,7 +1378,7 @@ export async function CodexAuthPlugin(
             current.refresh = current.refresh ?? {}
             update(current)
             return current
-          }, getConfigPath())
+          }, getAccountPaths(getConfigPath()))
           invalidateRequestStorageCache()
         }
 
@@ -1305,7 +1429,9 @@ export async function CodexAuthPlugin(
               }
 
               const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
-              const latestStorage = await loadAccounts(getConfigPath())
+              const latestStorage = await loadAccounts(
+                getAccountPaths(getConfigPath()),
+              )
               const mainError = latestStorage?.refresh?.mainLastRefreshError
               if (
                 mainError &&
@@ -1351,7 +1477,9 @@ export async function CodexAuthPlugin(
                     refreshTokenHash
                 })
 
-                const latestLease = await loadAccounts(getConfigPath())
+                const latestLease = await loadAccounts(
+                  getAccountPaths(getConfigPath()),
+                )
                 if (
                   latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
                   latestLease.refresh.mainRefreshLeaseTokenHash !==
@@ -1710,6 +1838,8 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         cmdCtx = {
           accountStoragePath: getConfigPath(),
+          accountStatePath: getAccountStatePath(getConfigPath()),
+          packageVersion: PackageVersion,
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
@@ -1720,6 +1850,7 @@ export async function CodexAuthPlugin(
               fallbackManager.refreshAccount(account, currentStorage),
             loadAccounts,
             accountStoragePath: getConfigPath(),
+            accountStatePath: getAccountStatePath(getConfigPath()),
             now: Date.now,
           }),
           ...buildResetRedemptionDeps(),
@@ -1744,7 +1875,7 @@ export async function CodexAuthPlugin(
               sessionId,
             ),
           refreshSidebar: async () => {
-            const store = await loadAccounts(getConfigPath())
+            const store = await loadAccounts(getAccountPaths(getConfigPath()))
             await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
@@ -1759,7 +1890,8 @@ export async function CodexAuthPlugin(
               client: input.client as CommandContext['client'],
               fetchImpl: fetch,
               now: Date.now,
-              configPath: getConfigPath(),
+              paths: getAccountPaths(getConfigPath()),
+              readSidebarState: () => getSidebarState(boundSidebarFile),
               storageMainAccountId: storage?.mainAccountId,
               isOAuthAccountFn: isOAuthAccount,
               whamFn: whamUsageFn,
@@ -1777,7 +1909,8 @@ export async function CodexAuthPlugin(
                 client: input.client as CommandContext['client'],
                 fetchImpl: fetch,
                 now: Date.now,
-                configPath: getConfigPath(),
+                paths: getAccountPaths(getConfigPath()),
+                readSidebarState: () => getSidebarState(boundSidebarFile),
                 storageMainAccountId: storage?.mainAccountId,
                 isOAuthAccountFn: isOAuthAccount,
                 whamFn: whamUsageFn,
@@ -2812,7 +2945,8 @@ export async function CodexAuthPlugin(
             >[0]['client'],
             fetchImpl: fetch,
             now: Date.now,
-            configPath: getConfigPath(),
+            paths: getAccountPaths(getConfigPath()),
+            readSidebarState: () => getSidebarState(boundSidebarFile),
             storageMainAccountId: storage?.mainAccountId,
             isOAuthAccountFn: isOAuthAccount,
             whamFn: whamUsageFn,
@@ -2843,7 +2977,7 @@ export async function CodexAuthPlugin(
               >[0]['client'],
               fetchImpl: fetch,
               now: Date.now,
-              configPath: getConfigPath(),
+              paths: getAccountPaths(getConfigPath()),
               storageMainAccountId: storage?.mainAccountId,
               isOAuthAccountFn: isOAuthAccount,
               whamFn: whamUsageFn,
@@ -3323,81 +3457,13 @@ export async function CodexAuthPlugin(
           },
         }
       },
-      methods: [
-        {
-          label: 'ChatGPT Pro/Plus (browser)',
-          type: 'oauth',
-          authorize: async () => {
-            const { redirectUri } = await startOAuthServer()
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(
-              crypto.getRandomValues(new Uint8Array(32)).buffer,
-            )
-            const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
-
-            const callbackPromise = waitForOAuthCallback(pkce, state)
-
-            return {
-              url: authUrl,
-              instructions:
-                'Complete authorization in your browser. This window will close automatically.',
-              method: 'auto' as const,
-              callback: async () => {
-                try {
-                  const tokens = await callbackPromise
-                  const accountId = extractAccountId(tokens)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId,
-                  }
-                } finally {
-                  flowCleanup(state)
-                }
-              },
-            }
-          },
-        },
-        {
-          label: 'ChatGPT Pro/Plus (headless)',
-          type: 'oauth',
-          authorize: async () => {
-            const { deviceData, url, instructions } = await beginDeviceAuth()
-
-            return {
-              url,
-              instructions,
-              method: 'auto' as const,
-              async callback() {
-                try {
-                  const tokens = await completeDeviceAuth(deviceData)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId: extractAccountId(tokens),
-                  }
-                } catch {
-                  return { type: 'failed' as const }
-                }
-              },
-            }
-          },
-        },
-        {
-          label: 'Manually enter API Key',
-          type: 'api',
-        },
-      ],
+      methods: authMethods,
     },
     'chat.headers': async (input, output) => {
       if (input.model.providerID !== 'openai') return
       output.headers.originator = 'opencode'
       output.headers['User-Agent'] =
-        `${USER_AGENT} (${os.platform()} ${os.release()}; ${os.arch()})`
+        `${buildUserAgent(PackageVersion)} (${os.platform()} ${os.release()}; ${os.arch()})`
       output.headers['session-id'] = input.sessionID
       // Temporary fetch-layer hack: title generation currently shares the conversation
       // session ID, so the OpenAI plugin marks it for HTTP fallback until transport

@@ -1,4 +1,6 @@
 /** @jsxImportSource @opentui/solid */
+
+import { errorMessage, openUrl } from '@cortexkit/openai-auth-core/internal'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { createLogger } from '../logger'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
@@ -9,8 +11,6 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.js'
-import { errorMessage } from '../util/error'
-import { openUrl } from '../util/open-url'
 
 const log = createLogger('rpc-tui')
 
@@ -142,7 +142,7 @@ function resetAccountOptions(payload: OpenDialogPayload): ResetDialogOption[] {
         account.usedPercent === undefined
           ? 'quota unavailable'
           : `${account.usedPercent}%`
-      const counts = `${account.applicableAvailableCount ?? 0}/${account.availableCount ?? 0}`
+      const counts = `${account.applicableAvailableCount === undefined ? '?' : account.applicableAvailableCount}/${account.availableCount ?? '?'}`
       const status = account.eligible
         ? 'eligible'
         : (account.reason ?? 'unavailable')
@@ -278,12 +278,12 @@ function openResetDialog(
       const preview = state.knobs.preview as ResetPreviewKnob | undefined
       const accountKey = preview?.accountKey
       const chatgptAccountId = preview?.chatgptAccountId
-      const applicableCount = preview?.applicableAvailableCount ?? 0
+      const availableCount = preview?.availableCount ?? 'unknown'
       const DialogConfirm = api.ui.DialogConfirm
       api.ui.dialog.replace(() => (
         <DialogConfirm
           title='Reset quota window'
-          message={`${state.text}\n\nThis SPENDS 1 of ${applicableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
+          message={`${state.text}\n\nThis SPENDS 1 of ${availableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
           onConfirm={() => {
             if (!accountKey || !chatgptAccountId) return
             applyAndRender(

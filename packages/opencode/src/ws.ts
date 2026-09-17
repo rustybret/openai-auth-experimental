@@ -1,18 +1,24 @@
 // Low-level OpenAI Responses WebSocket protocol helpers. Session pooling,
 // fallback, and continuation state intentionally live above this file.
 
+import {
+  errorMessage,
+  isRecord,
+  normalizeWsFrame,
+} from '@cortexkit/openai-auth-core/internal'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
 import { translateHostedWebSearchEvent } from './hosted-web-search'
 import { createLogger } from './logger'
-import { normalizeWsFrame } from './quota-normalize'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
-import { errorMessage } from './util/error'
 import { ProxyEnv } from './util/proxy-env'
-import { isRecord } from './util/record'
 
 const logQ = createLogger('quota')
+// Transport lifecycle. Separate from the request dumper on purpose: a stream
+// failure the user sees as a hard error has to leave a record at the normal log
+// level, and dumps are off by default.
+const logT = createLogger('transport')
 
 export const PROTOCOL_HEADER = 'responses_websockets=2026-02-06'
 
@@ -170,6 +176,21 @@ export function isUpgradeFailure(error: unknown): boolean {
   )
 }
 
+// Close code 1009: the peer refused the frame for its size. Marked rather than
+// matched on the message so the transport decision does not depend on wording.
+const oversizedFrames = new WeakSet<object>()
+
+export function isOversizedFrame(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && oversizedFrames.has(error)
+  )
+}
+
+export function markOversizedFrame<T extends object>(error: T): T {
+  oversizedFrames.add(error)
+  return error
+}
+
 function upgradeFailure(message: string, cause?: unknown): Error {
   const error = new Error(message, cause === undefined ? undefined : { cause })
   upgradeFailures.add(error)
@@ -278,9 +299,43 @@ export function streamResponsesWebSocket(
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined
   let cleanupSocket = () => {}
   let completed = false
+  /** Serialized size of the request frame, reported when the peer rejects it. */
+  let sentBytes = 0
   let emitted = false
   let emittedOutput = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
+  // The opening frame types, for diagnosing a response that dies early.
+  // emittedOutput is one bit and trips on every frame that is not a lifecycle
+  // frame, so it cannot say whether what reached the reader was a part-start or
+  // an actual text delta. Those carry different replay risk, and the difference
+  // is not recoverable after the fact. Bounded, because only the opening of a
+  // response is ever in question.
+  const openingFrameTypes: string[] = []
+  const OPENING_FRAME_LIMIT = 12
+  // Enough to describe a killed response to the provider. Without the id a
+  // response that never completed can only be identified as "the one after
+  // <previous_response_id>", and without the frame counters the gap between the
+  // last frame and the close cannot be bounded after the fact.
+  const previousResponseID =
+    typeof options.body.previous_response_id === 'string'
+      ? options.body.previous_response_id
+      : undefined
+  // The log carries two session identifiers: socket events are keyed by the
+  // Codex thread id, while request and completion records are keyed by the
+  // host's session id. Anyone reading one set cannot find the matching records
+  // in the other without joining on pid and timestamp, so both identifiers are
+  // attached to every line written below.
+  const codexSessionID =
+    typeof options.body.prompt_cache_key === 'string'
+      ? options.body.prompt_cache_key
+      : undefined
+  const sessionKeys = {
+    sessionID: options.sessionID,
+    codexSessionID,
+  }
+  let createdResponseID: string | undefined
+  let framesSinceCreated = 0
+  let lastFrameAt: number | undefined
   // Call ids the response finalizes (one response.output_item.done per item).
   // Only these are guaranteed present in the response previous_response_id will
   // chain to, so only these are safe to trim from a later continuation suffix.
@@ -318,13 +373,53 @@ export function streamResponsesWebSocket(
   // charge. Narrowing this further needs a dispatch-based discriminator (has
   // OpenCode acted on the frame yet?), not a visibility-based one.
   function invalidateTransport(error: ResponseStreamError) {
+    // What the response was and how it was progressing when it died. A close
+    // carries no such context, so without this the gap between the last frame
+    // and the close cannot be bounded afterwards, and a killed continuation
+    // cannot be distinguished from a killed fresh request.
+    const shape = {
+      ...sessionKeys,
+      openingFrameTypes,
+      responseID: createdResponseID,
+      previousResponseID,
+      hasContinuation: previousResponseID !== undefined,
+      framesSinceCreated,
+      msSinceLastFrame:
+        lastFrameAt === undefined ? undefined : Date.now() - lastFrameAt,
+    }
     if (emittedOutput) {
+      // Say why this is terminal. Without the suffix the message is identical
+      // to the retryable case, so a deliberate no-replay reads as a transport
+      // bug and sends the reader hunting for a fault that is not there.
+      //
+      // On a continuation the prior response id is named too: the turn cannot
+      // be retried here, so the operator resending it by hand is the recovery,
+      // and that is the identifier the provider can act on.
+      // Deliberately fixed text, carrying neither the provider's wording nor
+      // any identifier. The host decides retries by pattern-matching this
+      // string (opencode v1.18.30, session/retry.ts `retryable`), and a match
+      // wins even over an explicit non-retryable flag. So a provider message
+      // like "Rate limit reached", a peer close reason, or an id that happens
+      // to contain 429 or 503 would turn this no-replay into a replay and
+      // duplicate output the user already saw. What died is in the log line
+      // below, which is written at warn and not gated on the dump setting.
+      const message = TERMINAL_AFTER_OUTPUT_MESSAGE
+      logT.warn('stream failed after output; not retried', {
+        reason: error.message,
+        emittedOutput: true,
+        ...shape,
+      })
       fail(
-        new Error(error.message, { cause: error }),
-        new ResponseStreamError(error.message, { cause: error }),
+        new Error(message, { cause: error }),
+        new ResponseStreamError(message, { cause: error }),
       )
       return
     }
+    logT.warn('stream failed before output; retryable', {
+      reason: error.message,
+      emittedOutput: false,
+      ...shape,
+    })
     invalidate(error)
   }
 
@@ -534,10 +629,24 @@ export function streamResponsesWebSocket(
       ),
     )
     emitted = true
-    if (
-      translatedEvent.type !== 'response.created' &&
-      translatedEvent.type !== 'response.in_progress'
-    ) {
+    lastFrameAt = Date.now()
+    if (createdResponseID !== undefined) framesSinceCreated++
+    if (openingFrameTypes.length < OPENING_FRAME_LIMIT) {
+      openingFrameTypes.push(String(translatedEvent.type))
+    }
+    if (translatedEvent.type === 'response.created') {
+      createdResponseID = responseIDOf(translatedEvent)
+      // Logged rather than dumped: a response that dies before completing has
+      // no id anywhere else, and dumps are off by default, so without this the
+      // only way to name it to the provider is "the one after <previous id>".
+      logT.debug('response created', {
+        ...sessionKeys,
+        responseID: createdResponseID,
+        previousResponseID,
+        hasContinuation: previousResponseID !== undefined,
+      })
+    }
+    if (!isNonEmittingFrame(translatedEvent.type)) {
       emittedOutput = true
     }
     resetIdleTimeout('idle timeout waiting for websocket')
@@ -581,15 +690,32 @@ export function streamResponsesWebSocket(
 
   function onClose(event: CloseEvent) {
     if (completed) return
-    invalidateTransport(
-      new ResponseStreamError(
-        closeMessage(
-          'WebSocket closed before response.completed',
-          event.code,
-          event.reason,
-        ),
-      ),
+    // 1009 is the peer refusing this request's size. Resending the same bytes
+    // over the same transport is pointless, so it is not retryable here; the
+    // pool routes it to HTTP instead when nothing has streamed yet.
+    const oversized = event.code === 1009
+    // The host can override a non-retryable flag by matching the message text,
+    // so this one is built without the peer's reason and without the size: a
+    // reason mentioning a lost connection, or a size that reads as 503 KB,
+    // would revive the resend loop this flag exists to stop. Both are logged.
+    const failure = new ResponseStreamError(
+      oversized
+        ? OVERSIZED_FRAME_MESSAGE
+        : closeMessage(
+            'WebSocket closed before response.completed',
+            event.code,
+            event.reason,
+          ),
+      { retryable: !oversized },
     )
+    if (oversized) {
+      logT.warn('websocket peer refused the request size', {
+        ...sessionKeys,
+        requestBytes: sentBytes,
+        reason: event.reason.toString(),
+      })
+    }
+    invalidateTransport(oversized ? markOversizedFrame(failure) : failure)
   }
 
   function onAbort() {
@@ -624,7 +750,9 @@ export function streamResponsesWebSocket(
     const { background: _background, ...payload } = options.body
     resetIdleTimeout('idle timeout sending websocket request')
     try {
-      socket.send(JSON.stringify({ type: 'response.create', ...payload }))
+      const frame = JSON.stringify({ type: 'response.create', ...payload })
+      sentBytes = frame.length
+      socket.send(frame)
       resetIdleTimeout('idle timeout waiting for websocket')
     } catch (error) {
       if (completed) return
@@ -827,9 +955,61 @@ function isProviderRetryableAbortReason(reason: unknown): reason is Error {
   )
 }
 
+function responseIDOf(event: Record<string, unknown>) {
+  const response = event.response
+  if (!isRecord(response)) return undefined
+  return typeof response.id === 'string' ? response.id : undefined
+}
+
+/**
+ * Surfaced when a stream dies after output has reached the reader.
+ *
+ * Must not contain any substring the host reads as retryable — no provider
+ * wording, no response ids, no byte counts. `ws-pool.test.ts` pins it against
+ * the host's pattern set.
+ */
+/**
+ * True for frames the host cannot turn into anything the reader sees.
+ *
+ * This decides whether a turn that dies mid-stream may be retried. Getting it
+ * wrong in one direction replays output someone already read; in the other it
+ * throws away a turn that nothing had come out of yet.
+ *
+ * Two lifecycle frames announce a response without carrying any of it. The
+ * `codex.` frames are the transport's own envelope — the host's parser has no
+ * branch for them and yields nothing (`openai-responses.ts` at v1.18.30 ends
+ * its dispatch with `NO_EVENTS`), so a stream that died right after one has
+ * shown the reader nothing at all. `codex.rate_limits` never reaches here; it
+ * is consumed for quota further up.
+ *
+ * Everything else counts, including the frame that merely opens a reasoning or
+ * text part, because the host opens a durable part from it.
+ */
+function isNonEmittingFrame(type: string): boolean {
+  return (
+    type === 'response.created' ||
+    type === 'response.in_progress' ||
+    type.startsWith('codex.')
+  )
+}
+
+export const TERMINAL_AFTER_OUTPUT_MESSAGE =
+  'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.'
+
+/**
+ * Surfaced when the peer refuses the request frame as too large (close 1009).
+ *
+ * Fixed text for the same reason as {@link TERMINAL_AFTER_OUTPUT_MESSAGE}: the
+ * host can override this error's non-retryable flag by matching the message,
+ * and resending a frame the peer has already measured and refused is the one
+ * outcome this path exists to prevent. The size and the peer's reason are
+ * logged instead.
+ */
+export const OVERSIZED_FRAME_MESSAGE =
+  'The request was larger than the websocket would carry, so it was sent over HTTP instead. Resending it unchanged over the same socket cannot succeed. The transport log records the size.'
+
 function closeMessage(message: string, code: number, reason: string | Buffer) {
   const details = [`code ${code}`]
-  if (code === 1009) details.push('message too big')
   if (reason.length > 0) details.push(reason.toString())
   return `${message} (${details.join(': ')})`
 }

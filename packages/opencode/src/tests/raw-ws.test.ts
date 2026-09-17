@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { createServer, type Socket } from 'node:net'
 import { RawWebSocket } from '../raw-ws-bun'
 import { RawWebSocket as NodeRawWebSocket } from '../raw-ws-node'
@@ -202,6 +203,60 @@ describe('RawWebSocket Node', () => {
       ])
       expect(event).toMatchObject({ message: 'WS upgrade failed: NOT HTTP' })
       expect(ws.readyState).toBe(3)
+    } finally {
+      ws.close()
+      peer?.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+})
+
+describe('close code provenance', () => {
+  it('reports the peer close code rather than a synthetic 1006', async () => {
+    let peer: Socket | undefined
+    const server = createServer((socket) => {
+      peer = socket
+      socket.once('data', (chunk: Buffer) => {
+        const key = /sec-websocket-key: (.+)\r\n/i.exec(chunk.toString())?.[1]
+        const accept = createHash('sha1')
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest('base64')
+        socket.write(
+          'HTTP/1.1 101 Switching Protocols\r\n' +
+            'Upgrade: websocket\r\n' +
+            'Connection: Upgrade\r\n' +
+            `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        )
+        // Close frame carrying 1009, then an immediate FIN. The FIN is what
+        // drives the TCP close handler, so this is the ordering that used to
+        // report 1006 and discard the peer's reason.
+        socket.write(Buffer.from([0x88, 0x02, 0x03, 0xf1]))
+        socket.end()
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') {
+      throw new Error('test server did not expose a TCP port')
+    }
+    const ws = new NodeRawWebSocket(`ws://127.0.0.1:${address.port}`, {})
+
+    try {
+      const closes: Array<Record<string, unknown>> = []
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('timed out waiting for close')),
+          1000,
+        )
+        ws.addEventListener('close', (event) => {
+          closes.push(event as Record<string, unknown>)
+          clearTimeout(timer)
+          // Settle a tick later so a second, synthetic close would be seen.
+          setTimeout(resolve, 50)
+        })
+      })
+      expect(closes).toHaveLength(1)
+      expect(closes[0]).toMatchObject({ code: 1009 })
     } finally {
       ws.close()
       peer?.destroy()

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
+import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
-import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
@@ -379,9 +379,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             invalidate(entry)
           }
         },
-        onConnectionInvalid: () => {
+        onConnectionInvalid: (error) => {
           entry.busy = false
           entry.lastUsedAt = Date.now()
+          // A frame the socket refuses for its size will be refused again at
+          // the same size, so this session finishes over HTTP, which does not
+          // carry the same limit. Codex reaches the same destination after
+          // exhausting its WebSocket retries; going straight there skips
+          // resending a body already known to be too large.
+          if (OpenAIWebSocket.isOversizedFrame(error)) entry.fallback = true
           if (!entry.fallback) recordStreamFailure(entry)
           entry.continuation = undefined
           invalidate(entry)
@@ -411,10 +417,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           headers: { 'content-type': 'application/json', ...first.headers },
         })
       }
-      if (!entry.fallback) return response
       // advanceTurn is idempotent for a body already applied this send, so the
       // post-attempt exits re-stamp the header without minting a second turn.
-      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
+      const runHttpFallback = () =>
+        httpFetch(input, httpFallbackInit(entry, body, httpInit))
+      if (!entry.fallback)
+        return relayWithOversizedFallback(response, runHttpFallback)
+      return runHttpFallback()
     } catch (error) {
       entry.busy = false
       entry.lastUsedAt = Date.now()
@@ -524,6 +533,74 @@ async function withGrace<T>(promise: Promise<T>, graceMs: number) {
         reject(error)
       },
     )
+  })
+}
+
+/**
+ * Hand back a body this pool controls, so an oversized frame can still be
+ * answered over HTTP.
+ *
+ * The verdict arrives late: writing a large request takes longer than the
+ * first-event grace, and the peer only refuses it after reading enough to
+ * judge. By then this response has been returned to the caller, so the choice
+ * of transport cannot be made before handing it over — it has to be made when
+ * the failure lands.
+ *
+ * Swapping is only safe while the consumer has seen nothing. One byte out and
+ * a second source would duplicate a stream the reader has already begun.
+ */
+function relayWithOversizedFallback(
+  response: Response,
+  fallback: () => Promise<Response>,
+): Response {
+  const source = response.body
+  if (!source) return response
+  let delivered = false
+  const relayed = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = source.getReader()
+      const pump = async (from: ReadableStreamDefaultReader<Uint8Array>) => {
+        while (true) {
+          const { done, value } = await from.read()
+          if (done) return
+          if (value && value.length > 0) {
+            delivered = true
+            controller.enqueue(value)
+          }
+        }
+      }
+      try {
+        await pump(reader)
+        controller.close()
+      } catch (error) {
+        if (delivered || !OpenAIWebSocket.isOversizedFrame(error)) {
+          controller.error(error)
+          return
+        }
+        try {
+          const http = await fallback()
+          if (!http.ok) {
+            controller.error(
+              new ResponseStreamError(
+                `HTTP fallback after an oversized WebSocket frame failed with ${http.status}`,
+              ),
+            )
+            return
+          }
+          if (http.body) await pump(http.body.getReader())
+          controller.close()
+        } catch (fallbackError) {
+          controller.error(fallbackError)
+        }
+      }
+    },
+    cancel(reason) {
+      void source.cancel(reason)
+    },
+  })
+  return new Response(relayed, {
+    status: response.status,
+    headers: response.headers,
   })
 }
 

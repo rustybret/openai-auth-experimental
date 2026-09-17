@@ -9,10 +9,13 @@ import {
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import {
+  acquireRefreshFileLock,
+  migrateIfNeeded,
+  type OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-import type { OAuthAccount } from '../core/accounts.ts'
-import { migrateIfNeeded } from '../core/accounts.ts'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
@@ -259,7 +262,7 @@ describe('integration: migration', () => {
         refresh: 'test-refresh-token',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
 
     const cfg = JSON.parse(readFileSync(configFile, 'utf8'))
@@ -287,7 +290,7 @@ describe('integration: migration', () => {
         refresh: 'r1',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
     const first = JSON.parse(readFileSync(configFile, 'utf8'))
 
@@ -299,7 +302,7 @@ describe('integration: migration', () => {
         refresh: 'r2',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
     const second = JSON.parse(readFileSync(configFile, 'utf8'))
 
@@ -2806,6 +2809,86 @@ describe('integration: active fallback routing', () => {
     if (!captured) throw new Error('missing captured request')
     return captured
   }
+
+  // Two turns in one session at different efforts; returns both wire bodies.
+  async function captureEffortChange(model: string, efforts: [string, string]) {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    const sent: Array<Record<string, unknown>> = []
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (
+          String(url).includes('/responses') &&
+          typeof init?.body === 'string'
+        )
+          sent.push(JSON.parse(init.body))
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      for (const effort of efforts) {
+        await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'session-id': 'sess-effort',
+          },
+          body: JSON.stringify({
+            model,
+            instructions: 'Be concise',
+            reasoning: { effort, summary: 'auto' },
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            ],
+          }),
+        })
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    return sent
+  }
+
+  test('astra carries a mid-session effort change as a configuration_update', async () => {
+    const sent = await captureEffortChange('gpt-6-astra', ['low', 'xhigh'])
+    expect(sent).toHaveLength(2)
+    // Request-level effort stays at what the session opened with, so the prefix
+    // the backend caches on does not move.
+    expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe('low')
+    const input = sent[1]?.input as Array<Record<string, unknown>>
+    const update = input.find((item) => item.type === 'configuration_update')
+    expect(update?.reasoning).toEqual({ effort: 'xhigh' })
+    // Immediately before the new user message: past the cached prefix, and two
+    // updates can never land adjacent.
+    expect(input[input.length - 2]?.type).toBe('configuration_update')
+  })
+
+  test('astra leaves an unchanged effort alone', async () => {
+    const sent = await captureEffortChange('gpt-6-astra', ['high', 'high'])
+    const input = sent[1]?.input as Array<Record<string, unknown>>
+    expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe('high')
+    expect(input.some((item) => item.type === 'configuration_update')).toBe(
+      false,
+    )
+  })
+
+  test('a model that rejects the item keeps the request-level effort change', async () => {
+    // gpt-5.6-sol answers 400 for configuration_update, so the only correct
+    // behaviour there is to let the request-level value change as before.
+    const sent = await captureEffortChange('gpt-5.6-sol', ['low', 'xhigh'])
+    const input = sent[1]?.input as Array<Record<string, unknown>>
+    expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
+      'xhigh',
+    )
+    expect(input.some((item) => item.type === 'configuration_update')).toBe(
+      false,
+    )
+  })
 
   function headerValue(init: unknown, name: string) {
     const headers = (init as { headers?: HeadersInit } | undefined)?.headers
@@ -7683,13 +7766,13 @@ describe('integration: no real config read', () => {
   })
 
   it('getAccountStoragePath uses the isolated temp file', () => {
-    const { getAccountStoragePath } = require('../core/accounts.ts')
+    const { getAccountStoragePath } = require('../core/account-paths.ts')
     const path = getAccountStoragePath()
     expect(path).toBe(configFile)
   })
 
   it('getAccountStatePath uses the isolated temp file', () => {
-    const { getAccountStatePath } = require('../core/accounts.ts')
+    const { getAccountStatePath } = require('../core/account-paths.ts')
     const path = getAccountStatePath()
     expect(path).toBe(stateFile)
   })

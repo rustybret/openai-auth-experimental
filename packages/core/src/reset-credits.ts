@@ -1,4 +1,5 @@
 import {
+  type AccountPaths,
   type AccountStorage,
   isSafeResetAccountKey,
   type loadAccounts,
@@ -54,15 +55,26 @@ export type ResetPrecondition =
   | { ok: true }
   | {
       ok: false
-      reason: 'not exhausted' | 'no applicable credits'
+      reason: 'not exhausted'
     }
 
 export interface ResetStateDeps {
   configPath: string
+  /**
+   * Kept as its own field rather than folded into an `AccountPaths` so the
+   * caller supplies the same two values the rest of its context already
+   * carries, and the store calls below compose the pair where they need it.
+   */
+  statePath: string
   mutateAccountsFn: typeof mutateAccounts
   loadAccountsFn: typeof loadAccounts
   now: () => number
   randomUUID: () => string
+}
+
+/** The config/state pair these deps describe, in the shape the store takes. */
+function storePaths(deps: ResetStateDeps): AccountPaths {
+  return { configPath: deps.configPath, statePath: deps.statePath }
 }
 
 export interface ResetResolvedTarget {
@@ -92,7 +104,6 @@ export type ResetRedemptionErrorKind =
   | 'expired_unreconciled'
   | 'retry_without_inflight'
   | 'not_exhausted'
-  | 'no_applicable_credits'
   | 'no_eligible_credit'
 
 export class ResetRedemptionError extends Error {
@@ -319,7 +330,7 @@ async function inspectResetAttempt(
   if (!isSafeResetAccountKey(accountKey)) {
     return { kind: 'fresh', beforeState: undefined }
   }
-  const current = await deps.loadAccountsFn(deps.configPath)
+  const current = await deps.loadAccountsFn(storePaths(deps))
   return inspectResetState(
     current ? resetStateForAccount(current, accountKey) : undefined,
     deps.now(),
@@ -339,7 +350,7 @@ async function resolveCorruptResetAttempt(
       resolveCorruptState(current, accountKey, now)
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
   if (!decision) throw new Error('corrupt reset state mutation did not run')
   return decision
 }
@@ -415,7 +426,7 @@ export async function claimResetAttempt(
       claim: { inFlight: claimedInFlight, selectedCredit },
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
   if (!decision) throw new Error('reset claim mutation did not run')
   return decision
 }
@@ -448,7 +459,7 @@ export async function finalizeResetAttempt(
       delete state.cooldownUntil
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
 }
 
 export function resetWindowIsExhausted(
@@ -464,7 +475,6 @@ export function resetWindowIsExhausted(
 export function evaluateResetPrecondition(
   quota: OAuthQuotaSnapshot,
   hasActiveRateLimitMark: boolean,
-  applicableAvailableCount: number,
   now: number,
 ): ResetPrecondition {
   const exhausted =
@@ -472,9 +482,6 @@ export function evaluateResetPrecondition(
     resetWindowIsExhausted(quota.primary, now) ||
     resetWindowIsExhausted(quota.secondary, now)
   if (!exhausted) return { ok: false, reason: 'not exhausted' }
-  if (applicableAvailableCount <= 0) {
-    return { ok: false, reason: 'no applicable credits' }
-  }
   return { ok: true }
 }
 
@@ -576,15 +583,24 @@ export function selectCreditToSpend(
   credits: readonly ResetCredit[],
 ): ResetCredit | undefined {
   return [...credits]
-    .filter(
-      (credit) =>
-        credit.status === 'available' &&
-        credit.isSupportedByPlan &&
-        credit.resetType === 'codex_rate_limits',
-    )
+    .filter(isResetCreditEligible)
     .sort(
       (left, right) => Date.parse(left.expiresAt) - Date.parse(right.expiresAt),
     )[0]
+}
+
+export function isResetCreditEligible(credit: ResetCredit): boolean {
+  return (
+    credit.status === 'available' &&
+    credit.isSupportedByPlan &&
+    credit.resetType === 'codex_rate_limits'
+  )
+}
+
+export function countEligibleResetCredits(
+  credits: readonly ResetCredit[],
+): number {
+  return credits.filter(isResetCreditEligible).length
 }
 
 function isTerminalConsumeKind(value: unknown): value is ResetConsumeKind {
@@ -742,16 +758,10 @@ export async function runResetCreditRedemption(
     const precondition = evaluateResetPrecondition(
       quota,
       deps.hasActiveRateLimitMark(input.accountKey),
-      quota.resetCreditsApplicable ?? 0,
       deps.now(),
     )
     if (!precondition.ok) {
-      throw new ResetRedemptionError(
-        precondition.reason === 'not exhausted'
-          ? 'not_exhausted'
-          : 'no_applicable_credits',
-        precondition.reason,
-      )
+      throw new ResetRedemptionError('not_exhausted', precondition.reason)
     }
     if (!selectCreditToSpend(credits.credits)) {
       throw new ResetRedemptionError(

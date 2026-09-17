@@ -160,10 +160,26 @@ function resolve(): ResolvedSettings {
 
 let cached: ResolvedSettings | undefined
 
-/** Resolved settings, computed once per process (env + config are process-static). */
+/**
+ * Resolved settings, memoized per process.
+ *
+ * Env and the config file are read once because neither changes under a running
+ * process — except through a command that writes the config itself. Those
+ * commands must call `refreshSettings()`, or the process keeps serving the
+ * values it read at startup while the file on disk says otherwise.
+ */
 export function getSettings(): ResolvedSettings {
   if (!cached) cached = resolve()
   return cached
+}
+
+/**
+ * Drop the memoized settings after a command writes the config file, so the
+ * running process picks the change up without a restart.
+ */
+export function refreshSettings(): ResolvedSettings {
+  cached = undefined
+  return getSettings()
 }
 
 /** Test-only: drop the memoized settings so a later getSettings() re-reads env + config. */

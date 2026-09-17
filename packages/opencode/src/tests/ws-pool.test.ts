@@ -2,7 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { ResponseStreamError } from '../response-stream-error'
-import { connectResponsesWebSocket } from '../ws'
+import {
+  connectResponsesWebSocket,
+  OVERSIZED_FRAME_MESSAGE,
+  TERMINAL_AFTER_OUTPUT_MESSAGE,
+} from '../ws'
 import {
   applyTurnId,
   CODEX_BODY_KEY_ORDER,
@@ -451,7 +455,7 @@ describe('createWebSocketFetch', () => {
           { window: 'rate_limit_exceeded', resetAt: undefined },
         ])
         const { resolveMidStreamRateLimitResetAt } = await import(
-          '../core/quota-manager'
+          '@cortexkit/openai-auth-core/internal'
         )
         expect(
           resolveMidStreamRateLimitResetAt(
@@ -1109,6 +1113,129 @@ describe('createWebSocketFetch', () => {
             { type: 'function_call_output', call_id: 'call_1' },
           ],
         })
+        websocketFetch.close()
+      },
+    )
+  })
+
+  // Guards a property that currently holds structurally rather than by any one
+  // line: the peer's close destroys the socket, and continuation state lives on
+  // that socket, so a chain cannot outlive the response it was refused on.
+  // Removing the continuation reset, the entry invalidation, or both leaves
+  // this green. It is here for the change that would break it — reconnecting
+  // and resuming a chain across a dead socket.
+  test('a killed continuation is not chained to again; the retry re-sends full input', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    let killed = false
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          sent.push(parsed)
+          const isPrewarm = parsed.generate === false
+          // Kill the first tool continuation the way the peer does: a clean FIN
+          // with no close frame, before anything streams. A main request that
+          // merely follows a prewarm also carries previous_response_id, so the
+          // tool output is what identifies the continuation under test.
+          const isToolContinuation =
+            Array.isArray(parsed.input) &&
+            parsed.input.some(
+              (item) =>
+                typeof item === 'object' &&
+                item !== null &&
+                (item as Record<string, unknown>).type ===
+                  'function_call_output',
+            )
+          if (!isPrewarm && !killed && isToolContinuation) {
+            killed = true
+            close(1006, 'socket closed')
+            return
+          }
+          if (!isPrewarm) {
+            message(
+              JSON.stringify({
+                type: 'response.output_item.done',
+                item: {
+                  type: 'function_call',
+                  call_id: 'call_1',
+                  name: 'bash',
+                },
+              }),
+            )
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: isPrewarm
+                  ? `resp_prewarm_${sent.length}`
+                  : `resp_main_${sent.length}`,
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const toolTurn = () =>
+          websocketFetch(
+            'https://example.test/backend-api/codex/responses',
+            streamRequest({
+              input: [
+                {
+                  role: 'user',
+                  content: [{ type: 'input_text', text: 'one' }],
+                },
+                { type: 'function_call', call_id: 'call_1', name: 'bash' },
+                {
+                  type: 'function_call_output',
+                  call_id: 'call_1',
+                  output: 'ok',
+                },
+              ],
+            }),
+          )
+
+        await (
+          await websocketFetch(
+            'https://example.test/backend-api/codex/responses',
+            streamRequest({
+              input: [
+                {
+                  role: 'user',
+                  content: [{ type: 'input_text', text: 'one' }],
+                },
+              ],
+            }),
+          )
+        ).text()
+
+        // Same turn, so no prewarm: this chains to the prior response and sends
+        // only the suffix. It dies before output.
+        try {
+          const dying = await toolTurn()
+          await dying.text()
+        } catch {
+          // The failure is the point; the retry below is what is under test.
+        }
+
+        // The host reissues the identical request.
+        await (await toolTurn()).text()
+
+        const mains = sent.filter((s) => s.generate !== false)
+        const killedRequest = mains.at(-2)
+        const retried = mains.at(-1)
+        // The killed attempt was a trimmed suffix against the prior response.
+        expect(killedRequest?.previous_response_id).toBe('resp_main_2')
+        expect(killedRequest?.input).toHaveLength(1)
+        // The retry must not chain to the response the peer refused to serve.
+        // It opens a fresh socket, so it may chain to that socket's own prewarm
+        // — what matters is that it carries the whole input rather than the
+        // suffix it would send if the killed chain had survived.
+        expect(retried?.previous_response_id).not.toBe('resp_main_2')
+        expect(retried?.input).toHaveLength(3)
         websocketFetch.close()
       },
     )
@@ -2372,6 +2499,136 @@ describe('createWebSocketFetch', () => {
       },
     )
   })
+
+  test('a 1009 after output has streamed fails with the size and no retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          if (data.length > 5000) {
+            // Output first: past this point the turn cannot move to another
+            // transport without replaying what the user already saw.
+            message(
+              JSON.stringify({
+                type: 'response.output_item.done',
+                item: { type: 'message', id: 'msg_1' },
+              }),
+            )
+            close(1009, '')
+            return
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_prewarm' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [{ note: 'x'.repeat(20000) }] }),
+        )
+
+        let caught: unknown
+        try {
+          await response.text()
+        } catch (error) {
+          caught = error
+        }
+
+        // Not a retryable APICallError: after output, replaying would repeat
+        // text and re-run tools, so the turn ends here.
+        expect(APICallError.isInstance(caught)).toBe(false)
+        const failure = caught as Error
+        expect(failure.message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+        // The size and the close code are diagnostics, and they travel in the
+        // log rather than the surfaced message, which the host pattern-matches.
+        expect(failure.message).not.toMatch(/request was \d/)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('a 1009 arriving after the first-event grace still finishes over HTTP', async () => {
+    const httpCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          if (data.length > 5000) {
+            // A large body is still being written when the grace expires, and
+            // the peer only refuses it after reading enough to judge. The
+            // verdict therefore lands after the response was handed to the
+            // caller, which is the case this path exists for.
+            setTimeout(() => close(1009, ''), 40)
+            return
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_prewarm' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          firstEventGraceMs: 5,
+          httpFetch: (async (input: URL | RequestInfo) => {
+            httpCalls.push(String(input))
+            return new Response('{"ok":true}', { status: 200 })
+          }) as unknown as typeof fetch,
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [{ note: 'x'.repeat(20000) }] }),
+        )
+
+        // The turn survives on the transport that does not impose the limit,
+        // instead of failing or resending the same oversized frame. The switch
+        // happens while the body is being read, which is after the response
+        // itself was handed back.
+        expect(await response.text()).toBe('{"ok":true}')
+        expect(httpCalls).toHaveLength(1)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('an ordinary mid-stream close stays retryable and carries no size', async () => {
+    await withFakeWebSocket(
+      ({ close }) => ({
+        send() {
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        let caught: unknown
+        try {
+          await response.text()
+        } catch (error) {
+          caught = error
+        }
+
+        const failure = caught as ResponseStreamError
+        expect(failure.isRetryable).toBe(true)
+        expect(failure.message).not.toContain('request was')
+        websocketFetch.close()
+      },
+    )
+  })
 })
 
 function streamRequest(body: Record<string, unknown>): RequestInit {
@@ -2394,6 +2651,251 @@ type FakeWebSocketBehavior = {
   send?: (data: string) => void
   close?: () => void
 }
+
+describe('transport close provenance', () => {
+  test('a close after output says why it was not retried', async () => {
+    // The no-replay gate makes this terminal on purpose. Without the reason in
+    // the message it is indistinguishable from the retryable case, which reads
+    // as a transport bug and sends operators hunting a fault that is not there.
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'response.output_item.added',
+              item: { type: 'message', id: 'msg_1' },
+            }),
+          )
+          // Unframed TCP close: what the hand-rolled client synthesises as 1006.
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-close-after',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect((streamError as { message: string })?.message).toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
+        )
+        // Still terminal: a retryable error here would replay the turn and
+        // duplicate whatever was already streamed.
+        expect(streamError).not.toBeInstanceOf(ResponseStreamError)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('the after-output message cannot be read as retryable by the host', () => {
+    // opencode decides retries by matching the error message against this set
+    // (v1.18.30, packages/opencode/src/session/retry.ts). A match wins even
+    // over an explicit non-retryable flag, so any provider wording, peer close
+    // reason, byte count or response id that reached the surfaced message could
+    // turn a deliberate no-replay into a replay. Copied verbatim; if opencode
+    // adds a pattern this test is where the divergence should show up.
+    const hostRetryablePatterns = [
+      /429|500|502|503|504|524/i,
+      /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+      /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
+      /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+      /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+      /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+    ]
+    // Both messages carry a decision the host must not overturn: one says the
+    // turn is finished, the other says this socket cannot carry this request.
+    for (const pattern of hostRetryablePatterns) {
+      expect(pattern.test(TERMINAL_AFTER_OUTPUT_MESSAGE)).toBe(false)
+      expect(pattern.test(OVERSIZED_FRAME_MESSAGE)).toBe(false)
+    }
+    // The inputs that used to reach this message, each of which the host reads
+    // as retryable. They are the reason the message is fixed text.
+    for (const leaked of [
+      'Rate limit reached for gpt-5.6-sol',
+      'Internal server error',
+      'upstream connect error or disconnect/reset before headers',
+      'request was 503 KB',
+      'continuation of resp_0429aa',
+    ]) {
+      expect(
+        hostRetryablePatterns.some((pattern) => pattern.test(leaked)),
+      ).toBe(true)
+      expect(TERMINAL_AFTER_OUTPUT_MESSAGE).not.toContain(leaked)
+      expect(OVERSIZED_FRAME_MESSAGE).not.toContain(leaked)
+    }
+  })
+
+  test('a close before any output stays retryable and unsuffixed', async () => {
+    await withFakeWebSocket(
+      ({ close }) => ({
+        send() {
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-close-before',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        // The suffix belongs only to the terminal case; carrying it here would
+        // claim a non-retry that did not happen.
+        expect((streamError as { message: string }).message).not.toContain(
+          'not retried',
+        )
+        websocketFetch.close()
+      },
+    )
+  })
+
+  // Observed six times in one day against the live backend: a continuation dies
+  // with a bare 1006 after the transport's own envelope frame and nothing else.
+  // The reader has seen nothing at that point, because the host's parser has no
+  // branch for a `codex.` frame, so the turn can safely be sent again. Treating
+  // the envelope as output threw those turns away.
+  test('the transport envelope frame alone does not bar a retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'codex.response.metadata',
+              thread_id: 'th-1',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: 'resp-1' },
+            }),
+          )
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-envelope-only',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        expect((streamError as { message: string }).message).not.toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
+        )
+        websocketFetch.close()
+      },
+    )
+  })
+
+  // The other direction, and the one that must never regress: a reasoning part
+  // has been opened, so something is on screen and the turn is finished.
+  test('an opened reasoning part does bar a retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'codex.response.metadata',
+              thread_id: 'th-2',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: 'resp-2' },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.output_item.added',
+              item: { type: 'reasoning', id: 'rs_1' },
+            }),
+          )
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-part-opened',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect((streamError as { message: string }).message).toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
+        )
+        expect(streamError).not.toBeInstanceOf(ResponseStreamError)
+      },
+    )
+  })
+})
 
 async function withFakeWebSocket(
   behavior: (context: FakeWebSocketContext) => FakeWebSocketBehavior,

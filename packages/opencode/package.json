@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-openai-auth",
-  "version": "0.6.4",
+  "version": "0.7.2",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -10,9 +10,6 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "openai-auth": "./dist/cli.js"
-  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -36,22 +33,15 @@
   },
   "files": [
     "dist",
-    "src/tui.tsx",
-    "src/tui",
+    "src/tui/entry.mjs",
     "src/tui-compiled",
-    "src/sidebar-state.ts",
-    "src/tui-preferences.ts",
-    "src/logger.ts",
-    "src/core/account-paths.ts",
-    "src/core/refresh-file-lock.ts",
-    "src/util",
-    "src/rpc",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && bun run build:types && bun run build:tui",
     "build:tui": "bun scripts/build-tui.ts",
+    "build:types": "cd ../core && bun run build && cd ../opencode && tsdown --config tsdown.config.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",
@@ -61,10 +51,13 @@
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   },
+  "devDependencies": {
+    "@cortexkit/openai-auth-core": "workspace:*"
+  },
   "dependencies": {
-    "@opentui/core": ">=0.5.1",
-    "@opentui/solid": ">=0.5.1",
-    "ai": "^7.0.90",
+    "@opentui/core": ">=0.5.11",
+    "@opentui/solid": ">=0.5.11",
+    "ai": "^7.0.99",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
   }

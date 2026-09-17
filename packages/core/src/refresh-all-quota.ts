@@ -1,15 +1,15 @@
-import { createLogger } from '../logger'
-import { getSidebarState, type SidebarState } from '../sidebar-state'
-import { errorMessage } from '../util/error'
 import type {
+  AccountPaths,
   FallbackAccountManager,
   isOAuthAccount,
   loadAccounts,
   OAuthAccount,
 } from './accounts'
 import { formatRefreshBackoffMessage, refreshBackoffActive } from './backoff.ts'
+import { createLogger } from './logger'
 import type { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
+import { errorMessage } from './util/error'
 
 const log = createLogger('quota')
 
@@ -23,6 +23,30 @@ function isUnauthorized(error: unknown) {
   return (error as { status?: unknown } | null)?.status === 401
 }
 type QuotaLogger = Pick<typeof log, 'debug' | 'warn'>
+
+/** One account's cached quota reading as the shared sidebar snapshot records it. */
+export interface SidebarQuotaReading {
+  checkedAt?: number
+  primary?: { checkedAt?: number }
+  secondary?: { checkedAt?: number }
+}
+
+/**
+ * The part of a host's cross-process quota snapshot this poll reads.
+ *
+ * Declared structurally rather than imported, because the file that snapshot
+ * lives in is a host concern: each host decides where it writes and what else
+ * it keeps in there. All this poll needs is which reading belongs to which
+ * account and when it was taken.
+ */
+export interface SidebarQuotaSnapshot {
+  main: { mainAccountId?: string; quota?: SidebarQuotaReading | null }
+  fallbacks: ReadonlyArray<{
+    id: string
+    accountId?: string
+    quota?: SidebarQuotaReading | null
+  }>
+}
 
 export interface RefreshAllQuotaDeps {
   getAuth: () => Promise<{
@@ -67,14 +91,19 @@ export interface RefreshAllQuotaDeps {
   }
   fetchImpl: typeof fetch
   now: () => number
-  configPath: string
+  paths: AccountPaths
   storageMainAccountId: string | undefined
   isOAuthAccountFn: typeof isOAuthAccount
   whamFn?: typeof whamUsageFn
   respectBackoff?: boolean
   logger?: QuotaLogger
   skipFresherThanMs?: number
-  readSidebarState?: () => Promise<SidebarState>
+  /**
+   * Reads the host's shared quota snapshot. Required: the freshness gate below
+   * exists to stop several processes polling the provider for the same account,
+   * and a host that forgot to wire this in would silently lose that.
+   */
+  readSidebarState: () => Promise<SidebarQuotaSnapshot>
 }
 
 export interface RefreshAllQuotaOptions {
@@ -89,6 +118,16 @@ export interface RefreshAllQuotaResult {
   account: string
   ok: boolean
   error?: string
+  /**
+   * The account cannot recover on its own: the provider has rejected its
+   * credentials, so no amount of retrying will help until the operator re-adds
+   * it.
+   *
+   * Carried as a flag rather than left for the caller to infer from `error`,
+   * because sniffing an error string for a user-facing decision breaks the
+   * moment the wording changes.
+   */
+  permanent?: boolean
 }
 
 export async function refreshAllQuota(
@@ -114,10 +153,10 @@ export async function refreshAllQuota(
 
   const freshnessMs = deps.skipFresherThanMs
   let quotaUpdated = false
-  let sharedSidebarState: SidebarState | undefined
+  let sharedSidebarState: SidebarQuotaSnapshot | undefined
   if (freshnessMs !== undefined) {
     try {
-      sharedSidebarState = await (deps.readSidebarState ?? getSidebarState)()
+      sharedSidebarState = await deps.readSidebarState()
     } catch {}
   }
   const sharedFallbacks = new Map(
@@ -139,9 +178,7 @@ export async function refreshAllQuota(
   // disk; comparing against the stale captured id would let the previous
   // account's fresh quota suppress polling for the new one. A load failure fails
   // open to the captured id so the main refresh still runs.
-  const storage = await deps
-    .loadAccounts(deps.configPath)
-    .catch(() => undefined)
+  const storage = await deps.loadAccounts(deps.paths).catch(() => undefined)
   const liveMainAccountId = storage?.mainAccountId ?? deps.storageMainAccountId
   if (!options.accountKey || options.accountKey === 'main') {
     // --- MAIN ---
@@ -293,6 +330,7 @@ export async function refreshAllQuota(
               armedRefreshError as NonNullable<typeof armedRefreshError>,
               deps.now(),
             ),
+            permanent: true,
           })
           continue
         }
@@ -403,7 +441,7 @@ export async function refreshAllQuota(
   }
 
   if (freshnessMs === undefined || quotaUpdated) {
-    const freshStorage = await deps.loadAccounts(deps.configPath)
+    const freshStorage = await deps.loadAccounts(deps.paths)
     await deps.writeSidebarState(deps.quotaManager, freshStorage)
   }
 
