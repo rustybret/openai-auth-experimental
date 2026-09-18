@@ -28,7 +28,7 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "0.8.0",
+      "version": "0.8.0-1",
       "dependencies": {
         "@cortexkit/subc-client": "^0.8.1",
         "@opentui/core": ">=0.5.11",
@@ -46,7 +46,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "0.8.0",
+      "version": "0.8.0-1",
       "devDependencies": {
         "@cortexkit/openai-auth-core": "workspace:*",
       },
