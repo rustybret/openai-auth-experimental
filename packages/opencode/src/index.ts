@@ -176,6 +176,18 @@ const ALLOWED_MODELS = new Set([
 // using Codex with a ChatGPT account") and serves only the named gpt-6-astra
 // variant, so any -fast/-pro synthetics inheriting api.id "gpt-6" drop with it.
 const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
+
+/**
+ * Surfaced when a request would go to the wire with no credential.
+ *
+ * Fixed text on purpose. The host decides retries by matching this string
+ * (opencode v1.18.30, session/retry.ts), so no account label, provider wording
+ * or number may reach it - an operator-chosen id like `acct-429` would read as
+ * retryable and hide a local defect behind a retry loop. Details go to the
+ * transport log.
+ */
+export const EMPTY_BEARER_MESSAGE =
+  'Refusing to send a request with no access token. This is a defect in the plugin, not a problem with the provider or the account; the transport log names the account and the path that produced it.'
 // Exact models currently marked `use_responses_lite` in Codex's catalog. Read
 // from the backend's own model list rather than assumed:
 //   GET /backend-api/codex/models?client_version=<v>
@@ -1302,21 +1314,30 @@ export async function CodexAuthPlugin(
   let loaderGetAuth:
     | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
     | undefined
+  const custodyQuotaDepsForAuthMenu: Pick<
+    Parameters<typeof refreshAllQuota>[0],
+    | 'isFallbackRefreshInert'
+    | 'resolveFallbackAccess'
+    | 'reportCustodyAuthFailure'
+  > = {}
   const authMethods = createAuthMethods({
     client: input.client,
     getAuth: async () => loaderGetAuth?.(),
     fetchImpl: fetch,
-    dependencies: custodyOptions?.authorize
-      ? {
-          authorizeBrowser: custodyAuthorize(
-            custodyOptions.authorize.browser,
-            'Complete authorization in your browser. This window will close automatically.',
-          ),
-          authorizeHeadless: custodyAuthorize(
-            custodyOptions.authorize.headless,
-          ),
-        }
-      : undefined,
+    dependencies: {
+      ...(custodyOptions?.authorize
+        ? {
+            authorizeBrowser: custodyAuthorize(
+              custodyOptions.authorize.browser,
+              'Complete authorization in your browser. This window will close automatically.',
+            ),
+            authorizeHeadless: custodyAuthorize(
+              custodyOptions.authorize.headless,
+            ),
+          }
+        : {}),
+      custodyQuotaDeps: custodyQuotaDepsForAuthMenu,
+    },
   })
   const wrapCustodyAuthorize =
     (
@@ -1793,6 +1814,32 @@ export async function CodexAuthPlugin(
             },
           })
         }
+        async function resolveMainAccessForCustody(
+          currentStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): ReturnType<typeof resolveFallbackAccess> {
+          if (claustrumMode(currentStorage) !== 'claustrum') {
+            return CUSTODY_EXCLUDED
+          }
+          const manifest = await readCustodyManifest()
+          const handle = lookupManifestHandle(manifest, 'main')
+          const cache = custodyRuntimeForDeps.getCache()
+          const refuse = (
+            reason: 'no-handle' | 'blocked' | 'reauth' | 'cache-miss',
+          ): typeof CUSTODY_REFUSE => {
+            custodyLogger.warn('custody main request refused', { reason })
+            return CUSTODY_REFUSE
+          }
+          if (!handle || !cache) return refuse('no-handle')
+          const now = (custodyOptions?.now ?? Date.now)()
+          if (cache.isBlocked(handle)) return refuse('blocked')
+          if (cache.isReauth(handle, now)) return refuse('reauth')
+          const served = await cache.peek(handle)
+          if (!served || served.expiresAtMs <= now) return refuse('cache-miss')
+          return {
+            token: served.payload.access,
+            provenance: { handle, recordVersion: served.recordVersion },
+          }
+        }
         async function reportAuthFailureForCustody(params: {
           handle: string
           providerStatus: number
@@ -1806,6 +1853,11 @@ export async function CodexAuthPlugin(
             recordVersion: params.recordVersion,
           })
         }
+        Object.assign(custodyQuotaDepsForAuthMenu, {
+          isFallbackRefreshInert: isFallbackAccountRefreshInert,
+          resolveFallbackAccess: resolveAccountAccessForCustody,
+          reportCustodyAuthFailure: reportAuthFailureForCustody,
+        })
         function buildRefreshAllQuotaDeps(
           overrides: Partial<
             Pick<
@@ -2696,6 +2748,28 @@ export async function CodexAuthPlugin(
           keepwarmAccountKey: string = 'main',
           provenance?: VaultProvenance | 'local',
         ): Promise<Response> {
+          // Nothing may leave here without a credential. An empty token is
+          // always a local defect, but on the wire it becomes `Bearer ` and
+          // comes back as a provider 401 - indistinguishable from an expired
+          // or revoked account, so whoever debugs it starts at the provider
+          // and not at the bug. That cost a day when a tombstoned main
+          // resolved its vault credential and then dropped it. Refusing here
+          // makes the whole class say where it came from, once, for every
+          // path that reaches the wire.
+          //
+          // The message is fixed text and carries no account id: a fallback's
+          // id is an operator-chosen label, the host decides retries by
+          // pattern-matching this string, and a label like `acct-429` would
+          // read as retryable. The id goes to the log instead.
+          if (!accessToken.trim()) {
+            logT.warn('refusing to send a request with no access token', {
+              account: keepwarmAccountKey,
+              accountId,
+              hasProvenance: Boolean(provenance && provenance !== 'local'),
+            })
+            throw new Error(EMPTY_BEARER_MESSAGE)
+          }
+
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
           headers.delete('api-key')
@@ -3139,6 +3213,8 @@ export async function CodexAuthPlugin(
           sidebarState: SidebarState
           primaryAccess: string
           mainAccountIdentity?: string
+          mainCustodyRefused: boolean
+          primaryProvenance?: VaultProvenance
         }): Promise<StickyRouteCandidate[]> {
           const killswitchEnabled = isKillswitchEnabled(input.storage)
           const killswitchNow = Date.now()
@@ -3164,22 +3240,27 @@ export async function CodexAuthPlugin(
                 killswitchNow,
               )
             : undefined
-          const roster: StickyRouteCandidate[] = [
-            {
-              accountId: 'main',
-              wireAccountId: input.mainAccountIdentity,
-              access: input.primaryAccess,
-              keepwarmAccountKey: 'main',
-              quota: mainFreshest.quota,
-              quotaCheckedAt: mainFreshest.quotaCheckedAt,
-              reservePercent: getKillswitchThresholdsForAccount(input.storage),
-              configuredOrder: 0,
-              resetCreditsApplicable: resetCreditsApplicable(
-                mainFreshest.quota,
-              ),
-              killswitchPasses: mainKillswitchPasses,
-            },
-          ]
+          const roster: StickyRouteCandidate[] = input.mainCustodyRefused
+            ? []
+            : [
+                {
+                  accountId: 'main',
+                  wireAccountId: input.mainAccountIdentity,
+                  access: input.primaryAccess,
+                  provenance: input.primaryProvenance,
+                  keepwarmAccountKey: 'main',
+                  quota: mainFreshest.quota,
+                  quotaCheckedAt: mainFreshest.quotaCheckedAt,
+                  reservePercent: getKillswitchThresholdsForAccount(
+                    input.storage,
+                  ),
+                  configuredOrder: 0,
+                  resetCreditsApplicable: resetCreditsApplicable(
+                    mainFreshest.quota,
+                  ),
+                  killswitchPasses: mainKillswitchPasses,
+                },
+              ]
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(input.storage)
           if (!input.storage) return roster
@@ -3760,31 +3841,47 @@ export async function CodexAuthPlugin(
             const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
             init = await materializeRequestInit(requestInput, init)
-            let primaryAccess: string = currentAuth.access ?? ''
+            const mainCustodyOwned =
+              recognizedMainTombstone &&
+              claustrumMode(reqStorage) === 'claustrum'
+            let primaryAccess = ''
+            let primaryProvenance: VaultProvenance | undefined
+            let mainCustodyRefused = false
 
-            // Refresh expired main tokens and mirror them into opencode's slot.
-            if (
-              !currentAuth.access ||
-              (currentAuth.expires ?? 0) < Date.now()
-            ) {
-              logR.debug('token refresh triggered', {
-                pid: process.pid,
-                hasAccess: Boolean(currentAuth.access),
-                expiresInMs: currentAuth.expires
-                  ? currentAuth.expires - Date.now()
-                  : undefined,
-              })
-              try {
-                const refreshed = await refreshMainWithLease()
-                currentAuth.access = refreshed.access
-                currentAuth.refresh = refreshed.refresh
-                currentAuth.expires = refreshed.expires
-              } catch (error) {
-                if (isAuthPersistError(error)) throw error
-                // Use stale token on refresh failure
+            if (mainCustodyOwned) {
+              const access = await resolveMainAccessForCustody(reqStorage)
+              if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
+                mainCustodyRefused = true
+              } else {
+                primaryAccess = access.token
+                primaryProvenance =
+                  access.provenance === 'local' ? undefined : access.provenance
               }
+            } else {
+              // Refresh expired main tokens and mirror them into opencode's slot.
+              if (
+                !currentAuth.access ||
+                (currentAuth.expires ?? 0) < Date.now()
+              ) {
+                logR.debug('token refresh triggered', {
+                  pid: process.pid,
+                  hasAccess: Boolean(currentAuth.access),
+                  expiresInMs: currentAuth.expires
+                    ? currentAuth.expires - Date.now()
+                    : undefined,
+                })
+                try {
+                  const refreshed = await refreshMainWithLease()
+                  currentAuth.access = refreshed.access
+                  currentAuth.refresh = refreshed.refresh
+                  currentAuth.expires = refreshed.expires
+                } catch (error) {
+                  if (isAuthPersistError(error)) throw error
+                  // Use stale token on refresh failure
+                }
+              }
+              primaryAccess = currentAuth.access ?? ''
             }
-            primaryAccess = currentAuth.access ?? ''
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
@@ -3826,6 +3923,8 @@ export async function CodexAuthPlugin(
                 sidebarState,
                 primaryAccess,
                 mainAccountIdentity,
+                mainCustodyRefused,
+                primaryProvenance,
               })
               let stickyCandidate = await resolveStickyRouteCandidate({
                 sessionId: sidebarSessionId,
@@ -4083,14 +4182,16 @@ export async function CodexAuthPlugin(
                 )
               } else {
                 // Send through the main account.
-                response = await sendWithAccessToken(
-                  requestInput,
-                  init,
-                  primaryAccess,
-                  mainAccountIdentity,
-                  'main',
-                  undefined,
-                )
+                response = mainCustodyRefused
+                  ? new Response(null, { status: 401 })
+                  : await sendWithAccessToken(
+                      requestInput,
+                      init,
+                      primaryAccess,
+                      mainAccountIdentity,
+                      'main',
+                      primaryProvenance,
+                    )
               }
             }
 
