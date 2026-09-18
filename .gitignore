@@ -48,5 +48,6 @@ temp/
 !.github/*
 .opencode/package-lock.json
 .opencode/package.json
+/.opencode/skills/
 ucs.json
 /.ucs

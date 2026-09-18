@@ -97,7 +97,7 @@ describe('openai-auth arcus packaging & sync', () => {
     }
   })
 
-  it('enforces Arcus v2 alignment across scripts (sequence auto-allocation, sync-index, fail-closed validation)', () => {
+  it('enforces Arcus v3 alignment across scripts (sequence auto-allocation, submission bundle, fail-closed validation)', () => {
     const packScript = readFileSync(
       resolve(repoRoot, 'scripts/pack-arcus.sh'),
       'utf-8',
@@ -112,7 +112,7 @@ describe('openai-auth arcus packaging & sync', () => {
       resolve(repoRoot, 'scripts/publish-arcus.sh'),
       'utf-8',
     )
-    expect(publishScript).toContain('sync-index --write')
+    expect(publishScript).toContain('submission bundle')
 
     const validateScript = readFileSync(
       resolve(repoRoot, 'scripts/validate-arcus.sh'),
@@ -137,12 +137,15 @@ describe('openai-auth arcus packaging & sync', () => {
     expect(pipelineScript).toContain('migrate')
   })
 
-  it('wires Arcus scripts as symlinks to submodules/arcus without vendoring drift', () => {
+  it('wires Arcus scripts as symlinks to packages/arcus/toolchain without submodule dependencies', () => {
     expect(existsSync(resolve(repoRoot, 'setup.sh'))).toBe(true)
-    expect(existsSync(resolve(repoRoot, '.gitmodules'))).toBe(true)
-
-    const gitmodules = readFileSync(resolve(repoRoot, '.gitmodules'), 'utf-8')
-    expect(gitmodules).toContain('submodules/arcus')
+    expect(existsSync(resolve(repoRoot, 'packages/arcus/bootstrap.sh'))).toBe(
+      true,
+    )
+    expect(existsSync(resolve(repoRoot, 'packages/arcus/arcus.json'))).toBe(
+      true,
+    )
+    expect(existsSync(resolve(repoRoot, '.gitmodules'))).toBe(false)
 
     const arcusScripts = [
       'pack-arcus.sh',
@@ -159,7 +162,7 @@ describe('openai-auth arcus packaging & sync', () => {
       const stat = lstatSync(scriptPath)
       expect(stat.isSymbolicLink()).toBe(true)
       const target = readlinkSync(scriptPath)
-      expect(target).toBe(`../submodules/arcus/skills/scripts/${script}`)
+      expect(target).toBe(`../packages/arcus/toolchain/scripts/${script}`)
       expect(existsSync(resolve(repoRoot, 'scripts', target))).toBe(true)
     }
   })

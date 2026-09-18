@@ -2,7 +2,7 @@
 # ==============================================================================
 # Repository Setup & Toolchain Bootstrap (openai-auth)
 # ==============================================================================
-# Hydrates git submodules (sparse checkout for Arcus v2 lifecycle scripts),
+# Bootstraps Arcus v3 publisher toolchain via packages/arcus,
 # verifies toolchain dependencies, and ensures scripts symlinks are wired.
 # ==============================================================================
 
@@ -14,23 +14,19 @@ PROJECT_DIR="$SCRIPT_DIR"
 cd "$PROJECT_DIR"
 
 echo "======================================================================"
-echo " openai-auth Setup & Submodule Bootstrap"
+echo " openai-auth Setup & Arcus Publisher Bootstrap"
 echo "======================================================================"
 echo ""
 
 # ------------------------------------------------------------------------------
-# 1. Initialize & Hydrate Submodules (Sparse Checkout)
+# 1. Bootstrap Arcus Publisher Toolchain
 # ------------------------------------------------------------------------------
-echo "==> 1/3 Initializing Git submodules..."
-if [ -f ".gitmodules" ]; then
-  git submodule update --init --recursive submodules/arcus
-  if [ -d "submodules/arcus" ]; then
-    echo "  Configuring sparse-checkout for submodules/arcus (skills/scripts, skills/arcus-packaging)..."
-    git -C submodules/arcus sparse-checkout set skills/scripts skills/arcus-packaging
-  fi
-  echo "✓ Git submodules initialized and hydrated."
+echo "==> 1/3 Bootstrapping Arcus publisher toolchain..."
+if [ -f "packages/arcus/bootstrap.sh" ]; then
+  sh packages/arcus/bootstrap.sh
+  echo "✓ Arcus publisher toolchain bootstrapped."
 else
-  echo "• No .gitmodules found; skipping."
+  echo "• packages/arcus/bootstrap.sh not found; skipping."
 fi
 echo ""
 
@@ -46,9 +42,12 @@ ARCUS_SCRIPTS=(
   "publish-arcus.sh"
   "migrate-arcus.sh"
   "arcus-pipeline.sh"
+  "arcus-toolchain.json"
+  "arcus.schema.json"
+  "submission.schema.json"
 )
 
-TARGET_DIR="../submodules/arcus/skills/scripts"
+TARGET_DIR="../packages/arcus/toolchain/scripts"
 for script in "${ARCUS_SCRIPTS[@]}"; do
   link="scripts/${script}"
   target="${TARGET_DIR}/${script}"
@@ -57,7 +56,7 @@ for script in "${ARCUS_SCRIPTS[@]}"; do
     ln -sf "$target" "$link"
   fi
   if [ ! -e "$link" ]; then
-    echo "✗ Error: broken symlink: $link -> $target (submodule not hydrated?)"
+    echo "✗ Error: broken symlink: $link -> $target (toolchain not bootstrapped?)"
     exit 1
   fi
 done

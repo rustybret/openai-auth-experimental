@@ -14,6 +14,11 @@
 ### [Arcus/Internal Modifications]
 - Bumped package versions to `0.8.0-1` (`@cortexkit/opencode-openai-auth`, `@cortexkit/pi-openai-auth`).
 - Reconciled Arcus fleet governance and fork-sync exclusions.
+- Transitioned to Arcus v3 publisher process:
+  - Decommissioned `submodules/arcus` and removed `.gitmodules`.
+  - Adopted `packages/arcus/` consumer integration layout with `bootstrap.sh` toolchain hydration and `arcus.json` manifest.
+  - Configured Authentik gateway sequence allocation (`https://arcus-auth.rustybret.com`) and immutable submission bundle publishing with zero direct git checkout operations.
+  - Rewired `scripts/` lifecycle symlinks to `packages/arcus/toolchain/scripts/`.
 
 ## v0.7.2-1 — 2026-09-17
 

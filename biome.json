@@ -24,6 +24,8 @@
       "!packages/opencode/src/tests/fixtures/claustrum-golden",
       "packages/*/*.json",
       "scripts/**",
+      "!scripts/arcus-toolchain.json",
+      "!scripts/*.schema.json",
       "*.json",
       "*.yml",
       "*.yaml",
