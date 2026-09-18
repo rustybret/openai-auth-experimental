@@ -763,11 +763,11 @@ export function findCachekeepFallbackAccount(
   )
 }
 
-// wham is the only source that reports reset-credit counts; header/WS pushes
-// never carry the fields. An incoming push that omits them inherits the last
-// known counts for the same account so the sidebar and the reset dialog do
-// not lose them on every per-turn header/WS update — but an explicit incoming
-// value (including 0) always wins over a stale cached one.
+// wham is the only source that reports reset-credit counts and spend-control
+// budgets; header/WS pushes never carry those fields. An incoming push that
+// omits them inherits the last known reading for the same account so the
+// sidebar and command output do not lose it on every per-turn update — but an
+// explicit incoming value (including 0) always wins over a stale cached one.
 export function mergePushedQuotaMetadata(
   incoming: OAuthQuotaSnapshot,
   previous: OAuthQuotaSnapshot | undefined,
@@ -782,6 +782,12 @@ export function mergePushedQuotaMetadata(
     if (merged[key] === undefined && carried !== undefined) {
       merged[key] = carried
     }
+  }
+  if (
+    merged.spendControl === undefined &&
+    previous.spendControl !== undefined
+  ) {
+    merged.spendControl = previous.spendControl
   }
   return merged
 }
@@ -1910,6 +1916,7 @@ export async function CodexAuthPlugin(
             whamFn: whamUsageFn,
             isFallbackRefreshInert: isFallbackAccountRefreshInert,
             resolveFallbackAccess: resolveAccountAccessForCustody,
+            resolveMainAccess: resolveMainAccessForCustody,
             reportCustodyAuthFailure: reportAuthFailureForCustody,
             ...(respectBackoff === undefined ? {} : { respectBackoff }),
             ...(skipFresherThanMs === undefined ? {} : { skipFresherThanMs }),
@@ -2589,8 +2596,20 @@ export async function CodexAuthPlugin(
                 ),
               readManifest: readCustodyManifest,
               preflight: async ({ accountId, handle }) => {
-                const cache = custodyRuntime.getCache()
-                if (!cache || cache.isBlocked(handle)) return 'vault-cold'
+                custodyLogger.info('preflight probing participant', {
+                  accountId,
+                  hasHandle: handle.length > 0,
+                })
+                const cache = await custodyRuntime.ensureCache()
+                const blocked = cache?.isBlocked(handle)
+                if (!cache || blocked) {
+                  custodyLogger.warn('preflight vault-cold', {
+                    accountId,
+                    hasCache: cache !== undefined,
+                    blocked,
+                  })
+                  return 'vault-cold'
+                }
                 if (
                   cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
                 ) {
@@ -2621,8 +2640,34 @@ export async function CodexAuthPlugin(
                 }
               },
               auth: {
-                all: () => hostAuth.all(),
-                get: (value) => hostAuth.get(value),
+                all: async () => {
+                  if (typeof hostAuth.all === 'function') return hostAuth.all()
+                  const dataHome =
+                    process.env.XDG_DATA_HOME ??
+                    join(os.homedir(), '.local', 'share')
+                  const authPath = join(dataHome, 'opencode', 'auth.json')
+                  try {
+                    const parsed: unknown = JSON.parse(
+                      readFileSync(authPath, 'utf8'),
+                    )
+                    return isRecord(parsed) ? parsed : {}
+                  } catch {
+                    return {}
+                  }
+                },
+                get: async (value) => {
+                  if (typeof hostAuth.get === 'function') {
+                    return hostAuth.get(value)
+                  }
+                  if (value.path.id !== 'openai' || !loaderGetAuth) {
+                    custodyLogger.warn('auth.get unavailable for slot', {
+                      id: value.path.id,
+                      hasLoaderGetAuth: loaderGetAuth !== undefined,
+                    })
+                    return undefined
+                  }
+                  return loaderGetAuth()
+                },
                 set: async (value) => {
                   await hostAuth.set(value)
                 },
@@ -4326,6 +4371,10 @@ export async function CodexAuthPlugin(
       output.maxOutputTokens = undefined
     },
     config: async (config: { command?: Record<string, unknown> }) => {
+      createLogger('commands').info('registering commands', {
+        existing: Object.keys(config.command ?? {}).length,
+        pid: process.pid,
+      })
       config.command = {
         ...(config.command ?? {}),
         [OPENAI_QUOTA_COMMAND_NAME]: {
@@ -4374,8 +4423,19 @@ export async function CodexAuthPlugin(
       arguments: string
       sessionID: string
     }) => {
+      createLogger('commands').info('command hook entered', {
+        command: input.command,
+        arguments: input.arguments,
+        modal: MODAL_COMMANDS.includes(input.command as CommandModalName),
+        hasCmdCtx: cmdCtx !== null,
+        pid: process.pid,
+      })
       if (!MODAL_COMMANDS.includes(input.command as CommandModalName)) return
       if (!cmdCtx) {
+        createLogger('commands').warn('command rejected: context not loaded', {
+          command: input.command,
+          pid: process.pid,
+        })
         await sendIgnoredMessage(
           input.sessionID,
           'OpenAI auth plugin is still initializing. Send a request first, then try again.',
