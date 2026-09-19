@@ -13,10 +13,11 @@ export const HostedWebSearchTool: ToolDefinition = tool({
     queries: tool.schema.array(tool.schema.string()).optional(),
   },
   async execute(args) {
+    const action = normalizeWebSearchAction(args)
     return {
       title: 'OpenAI Web Search',
-      output: JSON.stringify({ action: args }),
-      metadata: { action: args },
+      output: JSON.stringify({ action }),
+      metadata: { action },
     }
   },
 })
@@ -240,20 +241,54 @@ function isHostedWebSearchItemReference(
   )
 }
 
+export function normalizeWebSearchAction(
+  raw?: unknown,
+): Record<string, unknown> {
+  const base = isRecord(raw) ? { ...raw } : {}
+
+  if (typeof base.type !== 'string' || !base.type) {
+    if (typeof base.url === 'string' && !base.query && !base.queries) {
+      base.type = 'open_page'
+    } else {
+      base.type = 'search'
+    }
+  }
+
+  if (base.type === 'search') {
+    if (
+      typeof base.query !== 'string' &&
+      Array.isArray(base.queries) &&
+      typeof base.queries[0] === 'string'
+    ) {
+      base.query = base.queries[0]
+    }
+  }
+
+  return base
+}
+
 function toCodexWebSearchCall(
   _id: string,
   output: unknown,
   call?: Record<string, unknown>,
 ) {
   const parsed = parseOutput(output)
-  const action = isRecord(parsed?.action)
+  const rawAction = isRecord(parsed?.action)
     ? parsed.action
-    : parseArguments(call?.arguments)
+    : isRecord(parsed) &&
+        (parsed.type !== undefined ||
+          parsed.query !== undefined ||
+          parsed.queries !== undefined ||
+          parsed.url !== undefined)
+      ? parsed
+      : parseArguments(call?.arguments)
+
+  const action = normalizeWebSearchAction(rawAction)
 
   return {
     type: 'web_search_call',
     status: 'completed',
-    ...(action ? { action } : {}),
+    action,
   }
 }
 

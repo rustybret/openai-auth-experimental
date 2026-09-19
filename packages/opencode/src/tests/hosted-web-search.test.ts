@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  HostedWebSearchTool,
+  normalizeWebSearchAction,
   rewriteHostedWebSearchReplay,
   translateHostedWebSearchEvent,
   translateHostedWebSearchResponse,
@@ -176,5 +178,127 @@ describe('hosted web search replay', () => {
         action: { type: 'search', query: 'restart test' },
       },
     ])
+  })
+
+  test('normalizes web_search_call action to include action.type when arguments omit it', () => {
+    const body: Record<string, unknown> = {
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'ws_astra_1',
+          name: 'web_search',
+          arguments: '{"queries":["OpenAI news","GPT-6 Astra"]}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'ws_astra_1',
+          output: '{"action":{"queries":["OpenAI news","GPT-6 Astra"]}}',
+        },
+      ],
+    }
+
+    expect(rewriteHostedWebSearchReplay(body)).toBe(true)
+    expect(body.input).toEqual([
+      {
+        type: 'web_search_call',
+        status: 'completed',
+        action: {
+          type: 'search',
+          queries: ['OpenAI news', 'GPT-6 Astra'],
+          query: 'OpenAI news',
+        },
+      },
+    ])
+  })
+
+  test('normalizes web_search_call action when only query is provided without type', () => {
+    const body: Record<string, unknown> = {
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'ws_astra_2',
+          name: 'web_search',
+          arguments: '{"query":"GPT-6 release"}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'ws_astra_2',
+          output: '{"action":{"query":"GPT-6 release"}}',
+        },
+      ],
+    }
+
+    expect(rewriteHostedWebSearchReplay(body)).toBe(true)
+    expect(body.input).toEqual([
+      {
+        type: 'web_search_call',
+        status: 'completed',
+        action: {
+          type: 'search',
+          query: 'GPT-6 release',
+        },
+      },
+    ])
+  })
+
+  test('normalizes web_search_call action when arguments and output are empty', () => {
+    const body: Record<string, unknown> = {
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'ws_astra_3',
+          name: 'web_search',
+          arguments: '{}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'ws_astra_3',
+          output: '{}',
+        },
+      ],
+    }
+
+    expect(rewriteHostedWebSearchReplay(body)).toBe(true)
+    expect(body.input).toEqual([
+      {
+        type: 'web_search_call',
+        status: 'completed',
+        action: {
+          type: 'search',
+        },
+      },
+    ])
+  })
+
+  test('normalizes url-only action to open_page type', () => {
+    expect(
+      normalizeWebSearchAction({ url: 'https://help.openai.com' }),
+    ).toEqual({
+      type: 'open_page',
+      url: 'https://help.openai.com',
+    })
+  })
+
+  test('HostedWebSearchTool.execute normalizes action with action.type', async () => {
+    const execute = HostedWebSearchTool.execute as (
+      args: Record<string, unknown>,
+    ) => Promise<{
+      output: string
+      metadata: { action: Record<string, unknown> }
+    }>
+
+    const result = await execute({ queries: ['weather in SF'] })
+    expect(result.metadata.action).toEqual({
+      type: 'search',
+      queries: ['weather in SF'],
+      query: 'weather in SF',
+    })
+    expect(JSON.parse(result.output)).toEqual({
+      action: {
+        type: 'search',
+        queries: ['weather in SF'],
+        query: 'weather in SF',
+      },
+    })
   })
 })
