@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "setup": "bash setup.sh",
-    "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
+    "build": "bun scripts/check-installed-ranges.mjs && cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
     "build:arcus": "bun run build && bash scripts/pack-arcus.sh",
     "package:arcus": "bash scripts/pack-arcus.sh",
     "pack:arcus": "bash scripts/pack-arcus.sh",
@@ -26,7 +26,11 @@
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",
-    "lint": "biome lint ."
+    "lint": "biome lint .",
+    "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
+    "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
+    "prepublishOnly": "bun run build",
+    "check:ranges": "bun scripts/check-installed-ranges.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.13",

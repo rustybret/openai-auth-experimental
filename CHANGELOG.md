@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.0-1 — 2026-09-20
+
+### [Upstream Changes]
+- Merged upstream `v0.9.0`:
+  - Upstream release bump to 0.9.0.
+  - Subc client and claustrum mode enhancements.
+
+### [Arcus/Internal Modifications]
+- Web search replay fix: guarantee `action.type` (`"search"`) in `web_search_call` replay to prevent OpenAI `AI_APICallError: Missing required parameter: 'input[...].action.type'` schema rejection.
+- Arcus v3 publisher transition: adopted canonical `packages/arcus/` toolchain layout, gateway sequence auto-allocation, and removed git submodules.
+- Fork synchronization: synchronized with upstream `v0.9.0` under `<upstream_semver>-<fork_revision>` standard (`0.9.0-1`).
+
 ## v0.8.0-1 — 2026-09-17
 
 ### [Upstream Changes]
