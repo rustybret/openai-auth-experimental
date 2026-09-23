@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.0-2 — 2026-09-22
+
+### [Arcus/Internal Modifications]
+- Dependency alignment: updated `@cortexkit/subc-client` to `^0.13.1` across core and opencode packages to sync with subconscious subc crate and CortexKit shared transport protocols.
+- Toolchain synchronization: refreshed lockfile with latest toolchain and plugin dependencies.
+- Arcus publication: released v0.9.0-2 and submitted submission bundle to Arcus gateway.
+
 ## v0.9.0-1 — 2026-09-20
 
 ### [Upstream Changes]
