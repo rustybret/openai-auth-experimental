@@ -2938,6 +2938,53 @@ test('machine writes cannot clobber fresher main and fallback quota from disk', 
   expect(written.activeRouting?.session?.activeId).toBe('fallback-1')
 })
 
+test('machine writes keep the fresher spend-control budget for the same account', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-spend-control-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  const currentBudget = {
+    limit: 2500,
+    used: 501.7787666320801,
+    remaining: 1998.2212333679199,
+    usedPercent: 20.071150665283206,
+    remainingPercent: 79.9288493347168,
+    resetsAt: '2026-10-01T00:00:00.000Z',
+    unit: 'credits',
+    source: 'individual_limit',
+    reached: false,
+  }
+  await setSidebarState(
+    make({
+      main: {
+        ...main({ ...quota(10, now), spendControl: currentBudget }),
+        mainAccountId: 'acct-x',
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main({
+          ...quota(90, stale),
+          spendControl: { ...currentBudget, used: 2400, remaining: 100 },
+        }),
+        mainAccountId: 'acct-x',
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.spendControl).toEqual(currentBudget)
+})
+
 test('machine write keeps the existing identity when the existing quota wins the merge (re-login race)', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-keep-'))
   const file = join(tempDir, 'sidebar-state.json')
@@ -3268,6 +3315,66 @@ describe('isQuotaExhausted / exhaustedQuotaResetAt', () => {
     const quota: AccountQuota = { secondary: windowAt(30, future) }
     expect(isQuotaExhausted(quota, now)).toBe(false)
   })
+
+  const spendControlAt = (
+    reached: boolean,
+    resetsAt?: string,
+  ): AccountQuota['spendControl'] => ({
+    limit: 2500,
+    used: reached ? 2500 : 500,
+    remaining: reached ? 0 : 2000,
+    usedPercent: reached ? 100 : 20,
+    remainingPercent: reached ? 0 : 80,
+    ...(resetsAt === undefined ? {} : { resetsAt }),
+    reached,
+  })
+
+  test('a reached credit budget with a future reset exhausts the account', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(20, future),
+      spendControl: spendControlAt(true, laterFuture),
+    }
+    expect(isQuotaExhausted(quota, now)).toBe(true)
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: laterFuture,
+      resetAtMs: Date.parse(laterFuture),
+    })
+  })
+
+  test('a healthy credit budget does not exhaust the account', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(20, future),
+      spendControl: spendControlAt(false, laterFuture),
+    }
+    expect(isQuotaExhausted(quota, now)).toBe(false)
+  })
+
+  test('the credit reset competes with window resets for the earliest', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(100, laterFuture),
+      spendControl: spendControlAt(true, future),
+    }
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: future,
+      resetAtMs: Date.parse(future),
+    })
+  })
+
+  test.each([
+    ['missing reset', spendControlAt(true)],
+    ['malformed reset', spendControlAt(true, 'not-a-date')],
+    ['reset already past', spendControlAt(true, past)],
+  ])(
+    'fails open on a reached credit budget with %s',
+    (_label, spendControl) => {
+      const quota: AccountQuota = {
+        primary: windowAt(20, future),
+        spendControl,
+      }
+      expect(isQuotaExhausted(quota, now)).toBe(false)
+      expect(exhaustedQuotaResetAt(quota, now)).toBeUndefined()
+    },
+  )
 })
 test('machine write ranks a fresh secondary window above an older incoming primary', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-secondary-fresh-'))

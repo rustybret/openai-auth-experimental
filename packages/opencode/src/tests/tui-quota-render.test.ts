@@ -4,12 +4,45 @@ import {
   buildApplyRequest,
   buildQuotaRowsForDisplay,
   buildRoutingRowsForDisplay,
+  computeQuotaLabelWidth,
+  getAccountMetadataRows,
   getQuotaMetadataRows,
   isQuotaLoaded,
+  renderedQuotas,
 } from '../tui.tsx'
 
 describe('dynamic quota TUI rows', () => {
   const now = Date.UTC(2026, 6, 16, 12, 0, 0)
+
+  function projectQuotaRow(row: {
+    label: string
+    labelWidth: number
+    window: { usedPercent: number }
+  }): string {
+    return `${row.label.padEnd(row.labelWidth)}▓▓▓▓▓▓▓▓ ${String(Math.round(row.window.usedPercent)).padStart(3)}%`
+  }
+
+  const twoWindows = {
+    primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
+    secondary: {
+      usedPercent: 51,
+      remainingPercent: 49,
+      windowMinutes: 10_080,
+    },
+  }
+  const withSpendControl = {
+    ...twoWindows,
+    spendControl: {
+      limit: 2500,
+      used: 501.7787666320801,
+      remaining: 1998.2212333679199,
+      usedPercent: 20.071150665283206,
+      remainingPercent: 79.9288493347168,
+      unit: 'credit',
+      source: 'individual_limit',
+      reached: false,
+    },
+  }
 
   test('one 7-day primary window produces one 7d row paced over seven days', () => {
     const rows = buildQuotaRowsForDisplay(
@@ -51,6 +84,141 @@ describe('dynamic quota TUI rows', () => {
       ).map((row) => row.label),
     ).toEqual(['5h', '7d'])
     expect(buildQuotaRowsForDisplay({}, now, true)).toEqual([])
+  })
+
+  test('renders a third credit-budget bar when spend control is present', () => {
+    const rows = buildQuotaRowsForDisplay(
+      {
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+        spendControl: {
+          limit: 2500,
+          used: 501.7787666320801,
+          remaining: 1998.2212333679199,
+          usedPercent: 20.071150665283206,
+          remainingPercent: 79.9288493347168,
+          resetsAt: '2026-10-01T00:00:00.000Z',
+          unit: 'credits',
+          source: 'individual_limit',
+          reached: false,
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(
+      rows.map((row) => [row.key, row.label, row.window.usedPercent]),
+    ).toEqual([
+      ['primary', '5h', 3],
+      ['secondary', '7d', 20],
+      ['spendControl', 'credits', 20.071150665283206],
+    ])
+  })
+
+  test('renders the existing two-bar sidebar output without spend control', () => {
+    const rows = buildQuotaRowsForDisplay(
+      {
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(
+      rows.map((row) => [row.key, row.label, row.window.usedPercent]),
+    ).toEqual([
+      ['primary', '5h', 3],
+      ['secondary', '7d', 20],
+    ])
+    expect(rows.some((row) => row.key === 'spendControl')).toBe(false)
+  })
+
+  test('a sidebar with no spend control anywhere keeps the three-column label width', () => {
+    const fallback = {
+      primary: { usedPercent: 12, remainingPercent: 88, windowMinutes: 300 },
+    }
+    const labelWidth = computeQuotaLabelWidth([twoWindows, fallback])
+
+    expect(labelWidth).toBe(3)
+    expect(
+      buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓   0%', '7d ▓▓▓▓▓▓▓▓  51%'])
+    expect(
+      buildQuotaRowsForDisplay(fallback, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓  12%'])
+  })
+
+  // The width is only as correct as the set it measures, and the set is built
+  // in the sidebar where no test can reach it. A fallback dropped here narrows
+  // the column back to the defect this fixed, with every unit test still green.
+  test('the measured set covers main and every enabled fallback', () => {
+    const measured = renderedQuotas({
+      main: { quota: twoWindows },
+      fallbacks: [
+        { enabled: true, quota: withSpendControl },
+        { enabled: false, quota: withSpendControl },
+      ],
+    })
+
+    expect(measured).toEqual([twoWindows, withSpendControl])
+    // A disabled account draws no rows, so counting it would widen the column
+    // for a row nobody sees.
+    expect(measured).toHaveLength(2)
+    expect(computeQuotaLabelWidth(measured)).toBe(8)
+  })
+
+  test('one account with spend control widens every account label column', () => {
+    const labelWidth = computeQuotaLabelWidth([twoWindows, withSpendControl])
+
+    expect(labelWidth).toBe(8)
+    expect(
+      buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h      ▓▓▓▓▓▓▓▓   0%', '7d      ▓▓▓▓▓▓▓▓  51%'])
+    expect(
+      buildQuotaRowsForDisplay(withSpendControl, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual([
+      '5h      ▓▓▓▓▓▓▓▓   0%',
+      '7d      ▓▓▓▓▓▓▓▓  51%',
+      'credits ▓▓▓▓▓▓▓▓  20%',
+    ])
+  })
+
+  test('the longest label keeps a separator before its bar', () => {
+    const labelWidth = computeQuotaLabelWidth([withSpendControl])
+    const creditsRow = buildQuotaRowsForDisplay(
+      withSpendControl,
+      now,
+      false,
+      labelWidth,
+    ).find((row) => row.key === 'spendControl')
+
+    expect(creditsRow?.label.padEnd(creditsRow.labelWidth)).toBe('credits ')
   })
 
   test('distinguishes an unloaded quota from a loaded snapshot with no windows', () => {
@@ -104,6 +272,41 @@ describe('dynamic quota TUI rows', () => {
       { label: 'resets', value: '2' },
     ])
     expect(tui.getAccountMetadataRows?.()).toEqual([])
+  })
+
+  test('renders grouped credit amounts with a pluralised unit', () => {
+    const rows = getAccountMetadataRows(undefined, {
+      limit: 2500,
+      used: 501.7787666320801,
+      remaining: 1998.22123336792,
+      usedPercent: 20.071150665283206,
+      remainingPercent: 79.9288493347168,
+      unit: 'credit',
+      source: 'individual_limit',
+      reached: false,
+    })
+    const rendered = JSON.stringify(rows)
+
+    expect(rows).toContainEqual({
+      label: 'credits',
+      value: '502 / 2,500 credits',
+    })
+    expect(rendered).not.toContain('501.7787666320801')
+    expect(rendered).not.toContain('$')
+  })
+
+  test('a single-credit budget keeps the unit singular', () => {
+    expect(
+      getAccountMetadataRows(undefined, {
+        limit: 1,
+        used: 1,
+        remaining: 0,
+        usedPercent: 100,
+        remainingPercent: 0,
+        unit: 'credit',
+        reached: true,
+      }),
+    ).toContainEqual({ label: 'credits', value: '1 / 1 credit' })
   })
 
   test('modal routing apply sends sessionId on its RPC request', () => {

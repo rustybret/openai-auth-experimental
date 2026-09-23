@@ -1,10 +1,12 @@
 import {
   type AccountPaths,
+  claustrumMode,
   type loadAccounts as defaultLoadAccounts,
   type FallbackAccount,
   isSafeResetAccountKey,
   mutateAccounts,
   type OAuthAccount,
+  type OAuthSpendControlReading,
   type RoutingMode,
   readConfigRosterIds,
 } from './accounts'
@@ -145,11 +147,26 @@ export interface CommandContext {
   fetchImpl?: typeof fetch
   now?: () => number
   randomUUID?: () => string
-  /** Starts OAuth for a fallback account; omitted to use the default browser/device flow. */
+  /** Starts an OAuth account-add flow; injected by the runtime boundary. */
   beginAccountLogin?: typeof beginAccountLogin
   refreshResetTargetQuota?: (
     accountKey: string,
   ) => Promise<RefreshAllQuotaResult>
+  enterClaustrumMode?: () => Promise<{
+    status: 'completed' | 'incomplete' | 'aborted'
+    outcomes: Record<string, string>
+    reason?: string
+  }>
+  leaveClaustrumMode?: () => Promise<void>
+  withFallbackAccountLock?: <T>(
+    accountId: string,
+    action: () => Promise<T>,
+  ) => Promise<T>
+  checkUsableCustodyBinding?: (
+    account: OAuthAccount,
+  ) => Promise<
+    { ready: true; accountId: string } | { ready: false; reason: string }
+  >
 }
 
 export interface ResetTargetIdentity {
@@ -157,6 +174,7 @@ export interface ResetTargetIdentity {
   label: string
   accessToken: string
   chatgptAccountId?: string
+  onAuthFailure?: (status: number) => Promise<void>
 }
 
 /**
@@ -231,6 +249,20 @@ function quotaAge(checkedAt: number | undefined, now: number): string {
   return ` (${Math.floor(ageMs / 60_000)}m old)`
 }
 
+function formatSpendControlLine(
+  spendControl: OAuthSpendControlReading,
+  indent = '',
+): string {
+  const resets = spendControl.resetsAt
+    ? ` · resets ${spendControl.resetsAt}`
+    : ''
+  const amount = (value: number) => Math.round(value).toLocaleString('en-US')
+  const unit = spendControl.unit ?? 'unit'
+  const plural =
+    spendControl.limit === 1 || unit.endsWith('s') ? unit : `${unit}s`
+  return `${indent}- credits: ${Math.round(spendControl.usedPercent)}% used (${amount(spendControl.used)} / ${amount(spendControl.limit)} ${plural}, ${amount(spendControl.remaining)} remaining)${resets}`
+}
+
 async function executeQuotaCommand(
   ctx: CommandContext,
 ): Promise<OpenDialogPayload> {
@@ -257,6 +289,9 @@ async function executeQuotaCommand(
     if (q.resetCreditsAvailable !== undefined) {
       lines.push(`- resets: ${q.resetCreditsAvailable}`)
     }
+    if (q.spendControl) {
+      lines.push(formatSpendControlLine(q.spendControl))
+    }
   } else {
     lines.push('No main quota snapshot available. Send a request first.')
   }
@@ -280,6 +315,9 @@ async function executeQuotaCommand(
       }
       if (entry.quota.resetCreditsAvailable !== undefined) {
         lines.push(`  - resets: ${entry.quota.resetCreditsAvailable}`)
+      }
+      if (entry.quota.spendControl) {
+        lines.push(formatSpendControlLine(entry.quota.spendControl, '  '))
       }
     }
   }
@@ -338,11 +376,176 @@ async function executeAccountCommand(
   ctx: CommandContext,
 ): Promise<OpenDialogPayload> {
   const tokens = args.trim().split(/\s+/).filter(Boolean)
+  log.info('account command parsed', { args, tokens })
   const storage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
     version: 1 as const,
     accounts: [],
   }
   const accounts = storage.accounts ?? []
+
+  if (tokens[0] === 'claustrum') {
+    log.info('claustrum mode requested', {
+      hasEnterFn: typeof ctx.enterClaustrumMode === 'function',
+      accounts: accounts.length,
+    })
+    if (!ctx.enterClaustrumMode) {
+      log.warn('claustrum refused: transition fn absent from command context')
+      return {
+        command: 'openai-account',
+        text: '## Claustrum Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
+        knobs: {
+          accounts: accounts.map(accountKnob),
+          claustrumMode: claustrumMode(storage),
+        },
+      }
+    }
+    log.info('claustrum transition starting', {})
+    let result: Awaited<ReturnType<NonNullable<typeof ctx.enterClaustrumMode>>>
+    try {
+      result = await ctx.enterClaustrumMode()
+    } catch (error) {
+      log.error('claustrum transition threw', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    log.info('claustrum transition finished', {
+      status: result.status,
+      reason: result.reason,
+      outcomes: result.outcomes,
+    })
+    const nextStorage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
+      version: 1 as const,
+      accounts: [],
+    }
+    const rows = Object.entries(result.outcomes).map(
+      ([id, outcome]) => `- \`${id}\`: ${outcome}`,
+    )
+    return {
+      command: 'openai-account',
+      text: [
+        `## Claustrum ${result.status}`,
+        '',
+        'do not run a login in another OpenCode window during this transition',
+        '',
+        ...(rows.length > 0 ? rows : ['- No enabled OAuth accounts.']),
+        ...(result.reason ? ['', `Reason: ${result.reason}`] : []),
+      ].join('\n'),
+      knobs: {
+        accounts: nextStorage.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(nextStorage),
+      },
+    }
+  }
+
+  if (tokens[0] === 'local') {
+    log.info('local mode requested', {
+      hasLeaveFn: typeof ctx.leaveClaustrumMode === 'function',
+    })
+    if (!ctx.leaveClaustrumMode) {
+      log.warn('local refused: transition fn absent from command context')
+      return {
+        command: 'openai-account',
+        text: '## Local Mode Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
+        knobs: {
+          accounts: accounts.map(accountKnob),
+          claustrumMode: claustrumMode(storage),
+        },
+      }
+    }
+    await ctx.leaveClaustrumMode()
+    const nextStorage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
+      version: 1 as const,
+      accounts: [],
+    }
+    return {
+      command: 'openai-account',
+      text: '## Local Mode\n\nClaustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.',
+      knobs: {
+        accounts: nextStorage.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(nextStorage),
+      },
+    }
+  }
+
+  if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
+    const targetId = tokens[1]
+    const enabled = tokens[0] === 'enable'
+    let refusal: string | undefined
+    let found = false
+    const withAccountLock =
+      ctx.withFallbackAccountLock ?? (async (_accountId, action) => action())
+    const next = await withAccountLock(targetId, async () => {
+      const current = await ctx.loadAccounts(storePaths(ctx))
+      const currentAccount = current?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === targetId && account.type === 'oauth',
+      )
+      if (!currentAccount)
+        return current ?? { version: 1 as const, accounts: [] }
+      if (enabled && claustrumMode(current) === 'claustrum') {
+        const binding = ctx.checkUsableCustodyBinding
+          ? await ctx.checkUsableCustodyBinding(currentAccount)
+          : {
+              ready: false as const,
+              reason: 'unbound-under-claustrum' as const,
+            }
+        if (!binding.ready) {
+          refusal = binding.reason
+          return current
+        }
+        return mutateAccounts((latest) => {
+          const account = latest.accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === targetId && candidate.type === 'oauth',
+          )
+          if (!account) return latest
+          found = true
+          account.accountId = binding.accountId
+          account.enabled = true
+          return latest
+        }, storePaths(ctx))
+      }
+      return mutateAccounts((latest) => {
+        const account = latest.accounts.find(
+          (candidate) => candidate.id === targetId,
+        )
+        if (!account) return latest
+        found = true
+        account.enabled = enabled
+        return latest
+      }, storePaths(ctx))
+    })
+    const resolvedNext = next ?? { version: 1 as const, accounts: [] }
+    if (refusal) {
+      return {
+        command: 'openai-account',
+        text: `## Cannot Enable Account\n\n\`${targetId}\` remains disabled: ${refusal}. Resolve the custody binding, then try again.`,
+        knobs: {
+          accounts: resolvedNext.accounts.map(accountKnob),
+          claustrumMode: claustrumMode(resolvedNext),
+        },
+      }
+    }
+    if (!found) {
+      return {
+        command: 'openai-account',
+        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
+        knobs: {
+          accounts: resolvedNext.accounts.map(accountKnob),
+          claustrumMode: claustrumMode(resolvedNext),
+        },
+      }
+    }
+    return {
+      command: 'openai-account',
+      text: `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
+      knobs: {
+        accounts: resolvedNext.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(resolvedNext),
+      },
+    }
+  }
 
   if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === 'list')) {
     // Show status
@@ -364,12 +567,15 @@ async function executeAccountCommand(
     }
     lines.push('')
     lines.push(
-      'Commands: `/openai-account add [label]` | `/openai-account remove <id>`',
+      `Claustrum mode: \`${claustrumMode(storage)}\`\n\nCommands: \`/openai-account claustrum\` | \`/openai-account local\` | \`/openai-account add [label]\` | \`/openai-account enable <id>\` | \`/openai-account disable <id>\` | \`/openai-account remove <id>\``,
     )
     return {
       command: 'openai-account',
       text: lines.join('\n'),
-      knobs: { accounts: accounts.map(accountKnob) },
+      knobs: {
+        accounts: accounts.map(accountKnob),
+        claustrumMode: claustrumMode(storage),
+      },
     }
   }
 
@@ -464,6 +670,13 @@ async function executeAccountCommand(
   }
 
   if (tokens[0] === 'add') {
+    if (storage.claustrum?.mode === 'claustrum') {
+      return {
+        command: 'openai-account',
+        text: '## Add Failed\n\nThat account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
+        knobs: {},
+      }
+    }
     const headless = tokens.includes('--headless')
     const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
     const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
@@ -483,29 +696,38 @@ async function executeAccountCommand(
     // never reach the user.
     completion
       .then(async (account) => {
-        let rejectedAsMain = false
-        // Route the add through mutateAccounts: read-modify-write under the lock
-        // so a concurrent add/remove cannot clobber this insertion, and so the
-        // main-identity check reads the freshest mainAccountId.
-        await mutateAccounts((current) => {
-          if (
-            account.accountId &&
-            current.mainAccountId &&
-            account.accountId === current.mainAccountId
-          ) {
-            rejectedAsMain = true
-            return current
+        let rejection: 'claustrum mode' | 'main identity' | undefined
+        const withAccountLock =
+          ctx.withFallbackAccountLock ??
+          (async (_accountId, action) => action())
+        await withAccountLock(account.id, async () => {
+          const currentStorage = await ctx.loadAccounts(storePaths(ctx))
+          if (claustrumMode(currentStorage ?? {}) === 'claustrum') {
+            rejection = 'claustrum mode'
+            return
           }
-          upsertAccount(current.accounts, account as OAuthAccount)
-          return current
-        }, storePaths(ctx))
+          await mutateAccounts((current) => {
+            if (
+              account.accountId &&
+              current.mainAccountId &&
+              account.accountId === current.mainAccountId
+            ) {
+              rejection = 'main identity'
+              return current
+            }
+            upsertAccount(current.accounts, account as OAuthAccount)
+            return current
+          }, storePaths(ctx))
+        })
 
-        if (rejectedAsMain) {
+        if (rejection) {
           const msg =
-            'That account is already your main account — not added as a fallback.'
+            rejection === 'claustrum mode'
+              ? 'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.'
+              : 'That account is already your main account — not added as a fallback.'
           // Log the internal account id, never the ChatGPT stable id (a sensitive
           // identity from the OAuth claims).
-          log.warn('account add rejected (main identity)', {
+          log.warn(`account add rejected (${rejection})`, {
             id: account.id,
             sessionId,
           })
@@ -559,8 +781,11 @@ async function executeAccountCommand(
 
   return {
     command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
-    knobs: { accounts: accounts.map(accountKnob) },
+    text: '## Account Commands\n\n- `/openai-account claustrum` — enter Claustrum mode\n- `/openai-account local` — leave Claustrum mode\n- `/openai-account add [label]` — add a new account\n- `/openai-account enable <id>` — enable a fallback\n- `/openai-account disable <id>` — disable a fallback\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
+    knobs: {
+      accounts: accounts.map(accountKnob),
+      claustrumMode: claustrumMode(storage),
+    },
   }
 }
 
@@ -727,8 +952,9 @@ async function buildResetPreviewRow(
   accountKey: string,
   ctx: ResetCommandContext,
 ): Promise<ResetPreviewRow> {
+  let target: ResetTargetIdentity | undefined
   try {
-    const target = await ctx.resolveResetTarget(accountKey)
+    target = await ctx.resolveResetTarget(accountKey)
     const wireAccountId =
       target.accountKey === 'main' ? undefined : target.chatgptAccountId
     const [quota, credits] = await Promise.all([
@@ -774,6 +1000,8 @@ async function buildResetPreviewRow(
       selectedCreditExpiresAt: selectedCredit?.expiresAt,
     }
   } catch (error) {
+    if ((error as { status?: unknown })?.status === 401)
+      await target?.onAuthFailure?.(401)
     log.warn('reset preview row failed', {
       accountKey,
       error: (error as Error)?.message ?? String(error),

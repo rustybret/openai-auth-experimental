@@ -153,6 +153,21 @@ describe('logger redaction', () => {
     expect(txt).toContain('"chatgpt_account_id":"***REDACTED***"')
   })
 
+  it('redacts served identity email and organization values from emitted log lines', async () => {
+    initLogger({ file: logFile, level: 'debug' })
+    const { createLogger, flushForTest } = await import('../logger.ts')
+    const log = createLogger('transport')
+    log.info('served-identity', {
+      email: 'served.identity@example.test',
+      orgName: 'Served Identity Organization',
+    })
+    await flushForTest()
+    const txt = readFileSync(logFile, 'utf8')
+    expect(txt).not.toContain('served.identity@example.test')
+    expect(txt).not.toContain('Served Identity Organization')
+    expect(txt).toContain('***REDACTED***')
+  })
+
   it('keeps token COUNT keys (input_tokens, cached_tokens, output_tokens) unredacted', async () => {
     initLogger({ file: logFile, level: 'debug' })
     const { createLogger, flushForTest } = await import('../logger.ts')
@@ -237,5 +252,18 @@ describe('logger redaction', () => {
     expect(txt).not.toContain('k-9')
     expect(txt).toContain('"ok":1')
     expect(txt).toMatch(/REDACTED|\*\*\*/)
+  })
+
+  it('redacts manifest handles embedded in messages without masking short ckh tokens', async () => {
+    initLogger({ file: logFile, level: 'debug' })
+    const { createLogger, flushForTest } = await import('../logger.ts')
+    const log = createLogger('transport')
+    const handle = `ckh_${'a'.repeat(43)}`
+    log.warn(`daemon rejected ${handle}; short token ckh_x remains diagnostic`)
+    await flushForTest()
+    const txt = readFileSync(logFile, 'utf8')
+    expect(txt).not.toContain(handle)
+    expect(txt).toContain('***REDACTED***')
+    expect(txt).toContain('ckh_x')
   })
 })

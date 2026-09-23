@@ -85,12 +85,19 @@ function isSecretKey(key: string): boolean {
   // needed for debugging — so it is intentionally NOT redacted by name. The genuine
   // ChatGPT id is kept out of logs at the source instead.
   if (k === 'chatgptaccountid') return true
+  // Operator identity carried on a served vault credential. These arrived with
+  // the client widening that added `accountId`/`email`/`orgName`/`projectId`;
+  // they are personal data with no diagnostic value, so they never reach a log
+  // file. The structural guard is not logging a served credential wholesale —
+  // this list only closes the fields that exist today.
+  if (k === 'email' || k === 'orgname' || k === 'organizationname') return true
   if (k.includes('apikey')) return true
   if (k.endsWith('secret') || k.endsWith('password')) return true
   if (k.endsWith('token') && !k.endsWith('tokens')) return true
   return false
 }
-const TOKEN_VALUE = /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+)\b/g
+const TOKEN_VALUE =
+  /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+)\b|ckh_[A-Za-z0-9_-]{20,}/g
 export function redact(value: unknown): unknown {
   return redactInner(value, new WeakSet<object>())
 }
@@ -219,7 +226,7 @@ function emit(channel: string, level: Level, message: string, data?: unknown) {
   if (logFileSource === undefined) return
   if (ORDER[level] > ORDER[configuredLevel()]) return
   const line =
-    `[${new Date().toISOString()}] ${level.toUpperCase()} [${channel}] ${message}` +
+    `[${new Date().toISOString()}] ${level.toUpperCase()} [${channel}] ${redactStrings(message)}` +
     (data === undefined ? '' : safeSerialize(data)) +
     '\n'
   buffer.push(line)

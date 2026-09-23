@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,11 +16,16 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+
+import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
+  type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
+  type CustodyRuntime,
+  EMPTY_BEARER_MESSAGE,
   findCachekeepFallbackAccount,
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
@@ -36,6 +42,11 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
+import {
+  claustrumConfig,
+  enrollmentManifest,
+  makeSentinelAccount,
+} from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -888,6 +899,77 @@ describe('integration: killswitch enforcement', () => {
 
       // The blocked request did NOT reach upstream — no extra spend.
       expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  // A defect that empties the access token used to reach the wire as `Bearer `
+  // and come back as a provider 401, which sends whoever debugs it to the
+  // provider's status page instead of to the plugin. The refusal is local, and
+  // it is deliberately not custody-specific: any path that loses a credential
+  // gets the same answer.
+  it('refuses to send when the access token is empty, and does not reach upstream', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    let upstreamCalls = 0
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      // Fail the token refresh so the slot keeps its empty access, which is the
+      // state the guard exists for. Everything else is quota chatter.
+      if (url.includes('oauth/token')) {
+        return new Response('{"error":"invalid_grant"}', { status: 400 })
+      }
+      if (url.includes('/responses')) upstreamCalls += 1
+      return new Response('{}', { status: 500 })
+    }) as unknown as typeof fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: '',
+          refresh: 'refresh-that-will-not-exchange',
+          expires: Date.now() - 1000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      let refusal: unknown
+      try {
+        await fetchOverride('https://api.openai.com/v1/responses', REQ_INIT)
+      } catch (error) {
+        refusal = error
+      }
+
+      expect((refusal as Error | undefined)?.message).toBe(EMPTY_BEARER_MESSAGE)
+      // The point of refusing locally: the provider never sees it, so it never
+      // answers for a bug that is ours.
+      expect(upstreamCalls).toBe(0)
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -2583,6 +2665,128 @@ describe('integration: 429 → reactive fallback', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  it('reports a vault-backed 401 returned by the WebSocket branch', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'ws-custody',
+      accountId: 'acct-ws-custody',
+      enabled: true,
+    })
+    const manifest = enrollmentManifest(fallback.id)
+    if (!manifest.ok) throw new Error('expected manifest fixture')
+    const manifestPath = join(configDir, 'handles.json')
+    const vaultAccess = `header.${Buffer.from(JSON.stringify({ chatgpt_account_id: fallback.accountId })).toString('base64url')}.signature`
+    const reports: number[] = []
+    let runtime: CustodyRuntime | undefined
+    let hooks: Hooks | undefined
+    const originalFetch = globalThis.fetch
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    writeFileSync(manifestPath, JSON.stringify(manifest.value))
+    chmodSync(manifestPath, 0o600)
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+        routing: { mode: 'fallback-first' },
+      }),
+    )
+    globalThis.fetch = (async (url: unknown) =>
+      new Response('{}', {
+        status: String(url).includes('wham') ? 500 : 401,
+      })) as typeof globalThis.fetch
+    const transport: ClaustrumCacheTransportLike = {
+      async getCredential() {
+        return {
+          material: vaultAccess,
+          recordVersion: 101,
+          expiresAtMs: Date.now() + 60_000,
+        }
+      },
+      async statusCredential() {
+        return {
+          ready: true,
+          lastErrorCode: null,
+          leaseHeld: false,
+          recordVersion: 101,
+        }
+      },
+      async reportAuthFailure(params) {
+        reports.push(params.recordVersion)
+      },
+      close() {},
+    }
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 401,
+              error: { message: 'expired' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+            custody: {
+              transport,
+              detection: 'available',
+              onRuntime: (value) => {
+                runtime = value
+              },
+            },
+          })
+          const loader = hooks.auth?.loader
+          if (!loader) throw new Error('expected auth loader')
+          const result = await loader(
+            async () => ({
+              type: 'oauth' as const,
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 3_600_000,
+            }),
+            {} as never,
+          )
+          if (!runtime) throw new Error('expected custody runtime')
+          await runtime.runTick()
+          expect(runtime.isEnabled()).toBe(true)
+          expect(
+            runtime
+              .getCache()
+              ?.peek(manifest.value.providers[0]!.accounts[0]!.handle),
+          ).toBeDefined()
+          const fetchOverride = (result as { fetch?: typeof globalThis.fetch })
+            .fetch
+          if (!fetchOverride) throw new Error('expected fetch override')
+          const response = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                model: 'gpt-5.5',
+                input: [],
+                stream: true,
+              }),
+            },
+          )
+          expect(response.status).toBe(401)
+          await new Promise((resolve) => setTimeout(resolve, 0))
+          expect(reports).toEqual([101])
+        } finally {
+          await hooks?.dispose?.()
+        }
+      },
+    )
+    globalThis.fetch = originalFetch
+    delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2877,9 +3081,79 @@ describe('integration: active fallback routing', () => {
     )
   })
 
-  test('a model that rejects the item keeps the request-level effort change', async () => {
-    // gpt-5.6-sol answers 400 for configuration_update, so the only correct
-    // behaviour there is to let the request-level value change as before.
+  test.each(['gpt-6-sol', 'gpt-6-luna'])(
+    '%s carries a mid-session effort change as a configuration_update',
+    async (model) => {
+      // Both were measured changing effort through the item, not merely
+      // accepting it, so they get the same prefix-preserving treatment as astra.
+      const sent = await captureEffortChange(model, ['low', 'xhigh'])
+      expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
+        'low',
+      )
+      const input = sent[1]?.input as Array<Record<string, unknown>>
+      expect(input[input.length - 2]).toEqual({
+        type: 'configuration_update',
+        reasoning: { effort: 'xhigh' },
+      })
+    },
+  )
+
+  test("the spoofed Codex version meets every surfaced model's minimum", async () => {
+    // The backend decides which models exist from this header. Below a model's
+    // minimum it omits the model from its catalog and answers 400 to a request,
+    // so lowering the version silently removes working models. Minimums are the
+    // catalog's own `minimal_client_version`, read 2026-09-25.
+    const minimums: Record<string, string> = {
+      'gpt-6-sol': '0.155.0',
+      'gpt-6-luna': '0.155.0',
+      'gpt-6-astra': '0.153.0',
+      'gpt-5.6-sol': '0.144.0',
+    }
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let version = ''
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (isResponsesSend(url)) version = headerValue(init, 'version')
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'session-id': 's-v' },
+        body: JSON.stringify({
+          model: 'gpt-6-sol',
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+          ],
+        }),
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    const parts = (v: string) => v.split('.').map(Number)
+    const atLeast = (have: string, need: string) => {
+      const [a, b] = [parts(have), parts(need)]
+      for (let i = 0; i < 3; i++)
+        if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0)
+      return true
+    }
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/)
+    for (const [model, need] of Object.entries(minimums)) {
+      expect({ model, ok: atLeast(version, need) }).toEqual({ model, ok: true })
+    }
+  })
+
+  test('a model without measured support keeps the request-level effort change', async () => {
+    // gpt-5.6-sol now accepts configuration_update but showed only a weak effect
+    // on one sample, so it keeps the request-level change it has always used.
+    // Moving it onto the item is a deliberate decision, not a side effect.
     const sent = await captureEffortChange('gpt-5.6-sol', ['low', 'xhigh'])
     const input = sent[1]?.input as Array<Record<string, unknown>>
     expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
@@ -3199,7 +3473,8 @@ describe('integration: active fallback routing', () => {
   it('logs both reachable sticky migration paths with account and reason', async () => {
     const sessionId = 'pre-send-migration-session'
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       return new Response('{}', {
         status: auth.includes('fallback-2') ? 401 : 200,
@@ -3208,6 +3483,16 @@ describe('integration: active fallback routing', () => {
     setLogLevel('debug')
     let hooks: Hooks | undefined
     try {
+      seedStickyBalancedAccounts()
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
       seedStickyBalancedAccounts()
       const preSendState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       preSendState.fallbacks[1].quota = stickyQuota(0, Date.now())
@@ -3220,14 +3505,6 @@ describe('integration: active fallback routing', () => {
         },
       }
       writeFileSync(sidebarFile, JSON.stringify(preSendState))
-      const loaded = await loadFetchOverride(
-        createMockPluginInput(),
-        Date.now() + 3600_000,
-        false,
-        false,
-        'acc-main',
-      )
-      hooks = loaded.hooks
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': sessionId }),
@@ -3543,8 +3820,7 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (url: unknown, init?: unknown) => {
-      if (!String(url).includes('responses'))
-        return new Response('{}', { status: 200 })
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       return new Response('{}', {
@@ -3562,6 +3838,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       const response = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'migrate-session' }),
@@ -4036,6 +4314,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       await runCommand(hooks, 'openai-cachekeep', 'on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
@@ -4256,14 +4536,8 @@ describe('integration: active fallback routing', () => {
 
   function mockAdmissionFetch(seenAuth: string[], status = 200) {
     return (async (url: unknown, init?: unknown) => {
-      if (String(url).includes('responses')) {
-        // Record the turn's own send only: the loader also issues an authorized,
-        // unawaited quota refresh at init, so recording every authorized fetch
-        // makes this assertion race it.
-        if (isResponsesSend(url)) {
-          seenAuth.push(headerValue(init, 'authorization'))
-        }
-      }
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
+      seenAuth.push(headerValue(init, 'authorization'))
       return new Response('{}', { status })
     }) as unknown as typeof globalThis.fetch
   }
@@ -4955,12 +5229,15 @@ describe('integration: active fallback routing', () => {
       await runCommand(hooks, 'openai-cachekeep', 'sustain on')
       const manager = (
         globalThis as typeof globalThis & {
-          __openaiAuthCacheKeepManager?: {
-            tick(): Promise<void>
-            status(): { tracked: number; sustain: boolean }
-          }
+          __openaiAuthCacheKeepManagers?: Map<
+            string,
+            {
+              tick(): Promise<void>
+              status(): { tracked: number; sustain: boolean }
+            }
+          >
         }
-      ).__openaiAuthCacheKeepManager
+      ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
       if (!manager) throw new Error('missing cachekeep manager')
 
       await manager.tick()
@@ -5164,6 +5441,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5184,6 +5462,108 @@ describe('integration: active fallback routing', () => {
 
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  function spentCreditBudget(
+    resetsAt: string,
+  ): NonNullable<SidebarState['main']['quota']>['spendControl'] {
+    return {
+      limit: 2500,
+      used: 2500,
+      remaining: 0,
+      usedPercent: 100,
+      remainingPercent: 0,
+      resetsAt,
+      reached: true,
+    }
+  }
+
+  it('admission quota skips a fallback whose credit budget is spent', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': {
+            ...admissionQuota(20, reset, now),
+            spendControl: spentCreditBudget(creditReset),
+          },
+          'client-alt': admissionQuota(20, reset, now),
+        },
+        fallbackAccountIds: {
+          'work-alt': 'chatgpt-work-alt',
+          'client-alt': 'chatgpt-client-alt',
+        },
+        activeId: 'work-alt',
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota preserves the last fallback when every credit budget is spent', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': {
+            ...admissionQuota(20, reset, now),
+            spendControl: spentCreditBudget(creditReset),
+          },
+        },
+        fallbackAccountIds: { 'work-alt': 'chatgpt-work-alt' },
+        mainQuota: admissionQuota(100, reset, now),
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -5279,6 +5659,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5320,6 +5701,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -6903,9 +7285,12 @@ describe('integration: active fallback routing', () => {
           now += 30 * 60_000
           const manager = (
             globalThis as typeof globalThis & {
-              __openaiAuthCacheKeepManager?: { tick(): Promise<void> }
+              __openaiAuthCacheKeepManagers?: Map<
+                string,
+                { tick(): Promise<void> }
+              >
             }
-          ).__openaiAuthCacheKeepManager
+          ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
           if (!manager) throw new Error('missing cachekeep manager')
           await manager.tick()
         },

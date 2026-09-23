@@ -6,10 +6,23 @@ export interface QuotaWindow {
   windowMinutes?: number
 }
 
+export interface SpendControlReading {
+  limit: number
+  used: number
+  remaining: number
+  usedPercent: number
+  remainingPercent: number
+  resetsAt?: string
+  unit?: string
+  source?: string
+  reached: boolean
+}
+
 export interface AccountQuota {
   checkedAt?: number
   primary?: QuotaWindow
   secondary?: QuotaWindow
+  spendControl?: SpendControlReading
   resetCreditsAvailable?: number
 }
 
@@ -88,6 +101,17 @@ export interface SidebarAccountState {
   killed: boolean
   enabled: boolean
   resetCredits?: number
+  custody?: SidebarAccountCustody
+}
+
+export type SidebarCustodyState = 'vault' | 'needsLogin' | 'local' | 'inert'
+
+export type SidebarCustodyReason = CustodyInertReason | 'corrupt'
+
+export interface SidebarAccountCustody {
+  state: SidebarCustodyState
+  reason?: SidebarCustodyReason
+  recordVersion?: number
 }
 
 export interface ActiveRoutingEntry {
@@ -132,6 +156,7 @@ export interface SidebarState {
     quota: AccountQuota | null
     /** ChatGPT identity of the main account this quota belongs to. */
     mainAccountId?: string
+    custody?: SidebarAccountCustody
     killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
@@ -156,6 +181,11 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/openai-auth-core/internal'
+import {
+  CUSTODY_INERT_REASONS,
+  type CustodyInertReason,
+  type CustodyVerdict,
+} from './core/custody-state'
 import { createLogger } from './logger'
 
 const logSb = createLogger('sidebar')
@@ -181,6 +211,49 @@ function normalizeResetCredits(value: unknown): number | undefined {
 function resetCreditsField(value: unknown): { resetCredits?: number } {
   const credits = normalizeResetCredits(value)
   return credits !== undefined ? { resetCredits: credits } : {}
+}
+
+const CUSTODY_STATES = new Set<SidebarCustodyState>([
+  'vault',
+  'needsLogin',
+  'local',
+  'inert',
+])
+
+const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
+  ...CUSTODY_INERT_REASONS,
+  'corrupt',
+])
+
+/**
+ * Tolerant reader for the per-fallback `custody` projection. Unknown state
+ * or reason values are dropped (NOT replaced with a default — a stale state
+ * file with an experimental `vaultHealing` value must not silently render
+ * as `local`, it must render as no-projection-at-all). Valid values round-
+ * trip byte-identical. The output contains only `state` and `reason`.
+ */
+function normalizeSidebarCustody(
+  value: unknown,
+): SidebarAccountCustody | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+  const c = value as Record<string, unknown>
+  if (
+    typeof c.state !== 'string' ||
+    !CUSTODY_STATES.has(c.state as SidebarCustodyState)
+  ) {
+    return undefined
+  }
+  const state = c.state as SidebarCustodyState
+  const out: SidebarAccountCustody = { state }
+  if (
+    typeof c.reason === 'string' &&
+    CUSTODY_REASONS.has(c.reason as SidebarCustodyReason)
+  ) {
+    out.reason = c.reason as SidebarCustodyReason
+  }
+  return out
 }
 
 function normalizeActiveRouting(value: unknown): ActiveRoutingMap | undefined {
@@ -276,6 +349,23 @@ export function getSidebarStateFile(): string {
   return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
 }
 
+export function projectCustodyForSidebar(
+  verdict: CustodyVerdict,
+): SidebarAccountCustody {
+  switch (verdict.kind) {
+    case 'LOCAL':
+      return { state: 'local' }
+    case 'VAULT':
+      return { state: 'vault' }
+    case 'INERT':
+      return { state: 'inert', reason: verdict.reason }
+    case 'NEEDS_LOGIN':
+      return verdict.reason === 'corrupt'
+        ? { state: 'needsLogin', reason: 'corrupt' }
+        : { state: 'needsLogin' }
+  }
+}
+
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   main: { quota: null, killed: false },
   fallbacks: [],
@@ -315,6 +405,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       ...(typeof m.mainAccountId === 'string'
         ? { mainAccountId: m.mainAccountId }
         : {}),
+      ...(() => {
+        const custody = normalizeSidebarCustody(m.custody)
+        return custody ? { custody } : {}
+      })(),
       // Preserve optional backoff fields if present
       ...(typeof m.quotaBackedOff === 'boolean'
         ? { quotaBackedOff: m.quotaBackedOff }
@@ -347,17 +441,21 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
             !Array.isArray(entry) &&
             typeof (entry as Record<string, unknown>).id === 'string',
         )
-        .map((e) => ({
-          id: e.id as string,
-          label: typeof e.label === 'string' ? e.label : undefined,
-          ...(typeof e.accountId === 'string'
-            ? { accountId: e.accountId }
-            : {}),
-          quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
-          killed: typeof e.killed === 'boolean' ? e.killed : false,
-          enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
-          ...resetCreditsField(e.resetCredits),
-        }))
+        .map((e) => {
+          const custody = normalizeSidebarCustody(e.custody)
+          return {
+            id: e.id as string,
+            label: typeof e.label === 'string' ? e.label : undefined,
+            ...(typeof e.accountId === 'string'
+              ? { accountId: e.accountId }
+              : {}),
+            quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
+            killed: typeof e.killed === 'boolean' ? e.killed : false,
+            enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
+            ...resetCreditsField(e.resetCredits),
+            ...(custody ? { custody } : {}),
+          }
+        })
     : []
 
   // activeId — string or undefined
@@ -428,6 +526,27 @@ export function isUsableRoutingEntry(
   )
 }
 
+// The credit budget's own exhaustion signal, shared by admission and sticky
+// migration so both agree on what "spent" means. `reached` is the provider's
+// authoritative boolean — the percentage is only a display approximation — and
+// the check fails open on a missing or lapsed reset exactly like a rate-limit
+// window, so a stale or corrupt reading never blocks.
+export function spendControlExhaustedResetAt(
+  quota: AccountQuota | null | undefined,
+  now = Date.now(),
+): { resetsAt: string; resetAtMs: number } | undefined {
+  const spendControl = quota?.spendControl
+  if (
+    spendControl?.reached !== true ||
+    typeof spendControl.resetsAt !== 'string'
+  ) {
+    return undefined
+  }
+  const resetAtMs = Date.parse(spendControl.resetsAt)
+  if (!Number.isFinite(resetAtMs) || resetAtMs <= now) return undefined
+  return { resetsAt: spendControl.resetsAt, resetAtMs }
+}
+
 // Earliest future reset among the quota's exhausted windows, or undefined when
 // no present window is exhausted. Every present window is evaluated — matching
 // the admission policy, which rejects an account when ANY live window is below
@@ -453,6 +572,12 @@ export function exhaustedQuotaResetAt(
     if (!earliest || resetAtMs < earliest.resetAtMs) {
       earliest = { resetsAt: window.resetsAt, resetAtMs }
     }
+  }
+  // The credit budget is a third axis on its own reset clock (a month, not
+  // 5h/7d), judged by the same shared signal sticky migration uses.
+  const spendReset = spendControlExhaustedResetAt(quota, now)
+  if (spendReset && (!earliest || spendReset.resetAtMs < earliest.resetAtMs)) {
+    earliest = spendReset
   }
   return earliest
 }
@@ -1004,6 +1129,9 @@ function mergeQuotaByWindow(
     incoming.checkedAt,
     existing.checkedAt,
   )
+  const spendControl = existingSnapshotIsFresher
+    ? (existing.spendControl ?? incoming.spendControl)
+    : (incoming.spendControl ?? existing.spendControl)
   let checkedAt: number | undefined
   for (const stamp of [
     finiteWindowCheckedAt(primary),
@@ -1017,6 +1145,7 @@ function mergeQuotaByWindow(
     ...incoming,
     primary,
     secondary,
+    ...(spendControl !== undefined ? { spendControl } : {}),
     checkedAt: checkedAt ?? incoming.checkedAt,
   }
 }

@@ -4,6 +4,7 @@ import {
   beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
+  claustrumMode,
   completeDeviceAuth,
   extractAccountId,
   flowCleanup,
@@ -59,6 +60,12 @@ export interface AuthMethodDependencies {
   readStoreIds: typeof readStoreIds
   openBrowser(url: string): boolean | undefined | Promise<boolean | undefined>
   now(): number
+  custodyQuotaDeps: Pick<
+    RefreshAllQuotaDeps,
+    | 'isFallbackRefreshInert'
+    | 'resolveFallbackAccess'
+    | 'reportCustodyAuthFailure'
+  >
 }
 
 export interface CreateAuthMethodsOptions {
@@ -186,6 +193,7 @@ export function createAuthMethods({
     readStoreIds: dependencies?.readStoreIds ?? readStoreIds,
     openBrowser: dependencies?.openBrowser ?? openBrowserForMenu,
     now: dependencies?.now ?? Date.now,
+    custodyQuotaDeps: dependencies?.custodyQuotaDeps ?? {},
   }
 
   const readAuth = async (): Promise<AuthDetails> =>
@@ -249,6 +257,13 @@ export function createAuthMethods({
   }
 
   const addAccount = async () => {
+    const storage = await deps.loadAccounts(getPaths())
+    if (claustrumMode(storage) === 'claustrum') {
+      console.log(
+        'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
+      )
+      return
+    }
     const account = await runOwnedLogin()
     let selfFallback = false
     await deps.mutateAccounts((current) => {
@@ -337,6 +352,7 @@ export function createAuthMethods({
       whamFn: whamUsageFn,
       respectBackoff: false,
       readSidebarState: async () => ({ main: {}, fallbacks: [] }),
+      ...deps.custodyQuotaDeps,
     })
     printQuotaResults(results)
   }
