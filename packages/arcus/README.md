@@ -56,3 +56,12 @@ bun run publish:arcus   # uploads to GitHub Releases and stages to Arcus manifes
 ## Submodule Prohibition
 
 Projects distributing via Arcus must **NOT** add the `arcus` repository as a git submodule. Direct writes to the Arcus repository from consuming projects are strictly prohibited. All updates to the publisher tooling are managed through `arcus install arcus-publisher`.
+
+## How Release Versions Are Handled in Arcus
+
+- Semver Parity: Package versions must strictly match upstream semver (e.g. `0.9.0`). Dash-number suffixes (e.g. `-1`, `-2`) are reserved in SemVer 2.0.0 for prerelease/beta builds and MUST NOT be used for internal fork revisions or Arcus releases unless upstream itself publishes a prerelease.
+- Monotonic Sequence Increments: All internal releases, fork updates, packaging fixes, and republished distributions are tracked via monotonic integer sequence numbers allocated by the Arcus gateway (`arcus manifest allocate-sequence`).
+- Distribution Layout: All artifacts are strictly organized under `dist/<version>/<sequence>/<package>/` (e.g. `dist/0.9.0/8/opencode-openai-auth/` and `dist/0.9.0/8/pi-openai-auth/`).
+- Canonical Arcus CLI Commands:
+  * `arcus publish submit [bundle_dir] [--wait]` (submits an immutable release bundle over authenticated HTTPS)
+  * `arcus publish status <submission_id>` (queries verification diagnostics and hydration status)
