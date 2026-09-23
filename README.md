@@ -54,13 +54,13 @@ bun run build   # output: packages/opencode/dist/index.js
 
 **3. After any code change:**
 
-- Run (from `packages/opencode/`)
+- Run (from `packages/opencode/`):
 
 ```bash
-`bun run build` 
+bun run build
 ```
 
-- Restart OpenCode.
+- Restart OpenCode:
 
 ```bash
 rm -rf ~/.cache/opencode
