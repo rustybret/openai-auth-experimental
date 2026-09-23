@@ -1,0 +1,9 @@
+{
+  "$schema": "https://arcus.rustybret.com/schemas/arcus-project.schema.json",
+  "package_id": "pi-openai-auth",
+  "software_type": "source_snapshot",
+  "source_id": "arcus",
+  "channel": "stable",
+  "gateway": "https://arcus-auth.rustybret.com",
+  "format": "tar.gz"
+}

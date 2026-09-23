@@ -16,11 +16,20 @@ describe('openai-auth arcus packaging & sync', () => {
     expect(pkg.scripts['fork-sync']).toBe('bash scripts/fork-sync.sh')
     expect(pkg.scripts['sync:fork']).toBe('bash scripts/fork-sync.sh')
     expect(pkg.scripts['build:arcus']).toBe(
-      'bun run build && bash scripts/pack-arcus.sh',
+      'bun run build && bash scripts/pack-all-arcus.sh',
     )
-    expect(pkg.scripts['package:arcus']).toBe('bash scripts/pack-arcus.sh')
-    expect(pkg.scripts['pack:arcus']).toBe('bash scripts/pack-arcus.sh')
-    expect(pkg.scripts['publish:arcus']).toBe('bash scripts/publish-arcus.sh')
+    expect(pkg.scripts['package:arcus']).toBe('bash scripts/pack-all-arcus.sh')
+    expect(pkg.scripts['pack:arcus']).toBe('bash scripts/pack-all-arcus.sh')
+    expect(pkg.scripts['pack:opencode']).toBe(
+      'bash scripts/pack-opencode-arcus.sh',
+    )
+    expect(pkg.scripts['pack:pi']).toBe('bash scripts/pack-pi-arcus.sh')
+    expect(pkg.scripts['publish:arcus']).toBe(
+      'bash scripts/publish-all-arcus.sh',
+    )
+    expect(pkg.scripts['publish:suite']).toBe(
+      'bash scripts/publish-all-arcus.sh',
+    )
     expect(pkg.scripts['validate:arcus']).toBe('bash scripts/validate-arcus.sh')
     expect(pkg.scripts['sign:arcus']).toBe('bash scripts/sign-arcus.sh')
     expect(pkg.scripts['migrate:arcus']).toBe('bash scripts/migrate-arcus.sh')
@@ -48,11 +57,24 @@ describe('openai-auth arcus packaging & sync', () => {
     expect(piPkg.scripts.prepublishOnly).toBeUndefined()
   })
 
-  it('ships executable scripts for fork-sync and Arcus v2 pipeline', () => {
+  it('ships executable scripts for fork-sync and Arcus v3 suite packaging', () => {
     expect(existsSync(resolve(repoRoot, 'scripts/fork-sync.sh'))).toBe(true)
     expect(existsSync(resolve(repoRoot, 'scripts/fork-sync-exclusions'))).toBe(
       true,
     )
+    expect(existsSync(resolve(repoRoot, 'scripts/pack-all-arcus.sh'))).toBe(
+      true,
+    )
+    expect(
+      existsSync(resolve(repoRoot, 'scripts/pack-opencode-arcus.sh')),
+    ).toBe(true)
+    expect(existsSync(resolve(repoRoot, 'scripts/pack-pi-arcus.sh'))).toBe(true)
+    expect(existsSync(resolve(repoRoot, 'scripts/publish-all-arcus.sh'))).toBe(
+      true,
+    )
+    expect(
+      existsSync(resolve(repoRoot, 'scripts/lib/verify-release-set.mjs')),
+    ).toBe(true)
     expect(existsSync(resolve(repoRoot, 'scripts/pack-arcus.sh'))).toBe(true)
     expect(existsSync(resolve(repoRoot, 'scripts/publish-arcus.sh'))).toBe(true)
     expect(existsSync(resolve(repoRoot, 'scripts/validate-arcus.sh'))).toBe(
@@ -68,24 +90,35 @@ describe('openai-auth arcus packaging & sync', () => {
     ).toBe(false)
   })
 
-  it('produces a valid Arcus v2 release envelope and legacy v1 manifest', () => {
-    const v1Path = resolve(repoRoot, 'dist-arcus/arcus-manifest.json')
-    if (existsSync(v1Path)) {
-      const manifest = JSON.parse(readFileSync(v1Path, 'utf-8'))
-      expect(manifest.harness).toBe('opencode')
-      expect(manifest.plugin?.type).toBe('opencode-plugin')
-      expect(manifest.plugin?.name).toBe('@cortexkit/opencode-openai-auth')
-      expect(manifest.plugin?.entrypoints?.server).toBe('dist/index.js')
-    }
-
-    const v2Path = resolve(repoRoot, 'dist-arcus/releases/0.6.4.json')
-    if (existsSync(v2Path)) {
-      const envelope = JSON.parse(readFileSync(v2Path, 'utf-8'))
-      expect(envelope.signed?.schema_version).toBe(2)
+  it('produces valid Arcus release envelopes under tidy dist/<version>/<sequence>/ hierarchy', () => {
+    const opencodeEnv = resolve(
+      repoRoot,
+      'dist/0.9.0-2/7/opencode-openai-auth/releases/opencode-openai-auth-0.9.0-2-7.json',
+    )
+    if (existsSync(opencodeEnv)) {
+      const envelope = JSON.parse(readFileSync(opencodeEnv, 'utf-8'))
       expect(envelope.signed?.kind).toBe('release')
       expect(envelope.signed?.package_id).toBe('opencode-openai-auth')
-      expect(envelope.signed?.version).toBe('0.6.4')
-      expect(envelope.signed?.sequence).toBeGreaterThanOrEqual(1)
+      expect(envelope.signed?.sequence).toBe(7)
+      expect(envelope.signatures?.length).toBeGreaterThanOrEqual(1)
+      expect(Object.keys(envelope.signed?.targets || {})).toEqual([
+        'darwin-arm64',
+        'darwin-x64',
+        'linux-arm64',
+        'linux-x64',
+        'windows-x64',
+      ])
+    }
+
+    const piEnv = resolve(
+      repoRoot,
+      'dist/0.9.0-2/7/pi-openai-auth/releases/pi-openai-auth-0.9.0-2-7.json',
+    )
+    if (existsSync(piEnv)) {
+      const envelope = JSON.parse(readFileSync(piEnv, 'utf-8'))
+      expect(envelope.signed?.kind).toBe('release')
+      expect(envelope.signed?.package_id).toBe('pi-openai-auth')
+      expect(envelope.signed?.sequence).toBe(7)
       expect(envelope.signatures?.length).toBeGreaterThanOrEqual(1)
       expect(Object.keys(envelope.signed?.targets || {})).toEqual([
         'darwin-arm64',

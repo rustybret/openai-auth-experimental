@@ -1,0 +1,13 @@
+{
+  "$schema": "https://arcus.rustybret.com/schemas/arcus-project.schema.json",
+  "package_id": "opencode-openai-auth",
+  "software_type": "opencode-plugin",
+  "source_id": "arcus",
+  "channel": "stable",
+  "gateway": "https://arcus-auth.rustybret.com",
+  "format": "tar.gz",
+  "plugin": {
+    "package_name": "@cortexkit/opencode-openai-auth",
+    "strip_components": 1
+  }
+}
