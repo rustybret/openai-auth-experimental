@@ -28,12 +28,12 @@ This will:
 
 ## Packaging & Publishing
 
-The repository follows the canonical Arcus distribution contract:
-Release artifacts reside under `dist/<version>/<sequence>/<package>/`.
+The repository follows the canonical Arcus sequence-first distribution contract:
+Release artifacts reside under `dist/<sequence>/<package>/<version>/`.
 
 ### 1. Package Suite
 ```sh
-bun run pack:arcus      # packages all components to dist/<version>/<sequence>/
+bun run pack:arcus      # packages all components to dist/<sequence>/<package>/<version>/
 bun run pack:opencode   # packages opencode-openai-auth
 bun run pack:pi         # packages pi-openai-auth
 ```
@@ -46,7 +46,7 @@ bun run publish:arcus   # uploads to GitHub Releases and stages to Arcus manifes
 ### 3. Gateway Submission Commands
 - **Submit Release Bundle**:
   ```sh
-  arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com
+  arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com [--wait]
   ```
 - **Query Submission Diagnostics & Status**:
   ```sh
@@ -57,11 +57,12 @@ bun run publish:arcus   # uploads to GitHub Releases and stages to Arcus manifes
 
 Projects distributing via Arcus must **NOT** add the `arcus` repository as a git submodule. Direct writes to the Arcus repository from consuming projects are strictly prohibited. All updates to the publisher tooling are managed through `arcus install arcus-publisher`.
 
-## How Release Versions Are Handled in Arcus
+## How Release Versions & Sequences Are Handled in Arcus
 
-- Semver Parity: Package versions must strictly match upstream semver (e.g. `0.9.0`). Dash-number suffixes (e.g. `-1`, `-2`) are reserved in SemVer 2.0.0 for prerelease/beta builds and MUST NOT be used for internal fork revisions or Arcus releases unless upstream itself publishes a prerelease.
-- Monotonic Sequence Increments: All internal releases, fork updates, packaging fixes, and republished distributions are tracked via monotonic integer sequence numbers allocated by the Arcus gateway (`arcus manifest allocate-sequence`).
-- Distribution Layout: All artifacts are strictly organized under `dist/<version>/<sequence>/<package>/` (e.g. `dist/0.9.0/8/opencode-openai-auth/` and `dist/0.9.0/8/pi-openai-auth/`).
-- Canonical Arcus CLI Commands:
-  * `arcus publish submit [bundle_dir] [--wait]` (submits an immutable release bundle over authenticated HTTPS)
-  * `arcus publish status <submission_id>` (queries verification diagnostics and hydration status)
+1. **SemVer Parity with Upstream**: Package versions must strictly match upstream semver (e.g. `0.9.0`). Dash-number suffixes (e.g. `-1`, `-2`) are reserved in SemVer 2.0.0 for prerelease/beta builds and MUST NOT be used for internal fork revisions or Arcus releases unless upstream itself publishes a prerelease. Version is a display and compatibility artifact.
+2. **Unified Suite Sequence Numbers**: For multi-component suites, all modules share a unified suite sequence calculated as `suite_seq = max(all suite package sequences) + 1`. This locks compatibility and eliminates per-component drift.
+3. **Monotonic Progression**: Anti-rollback rules enforce `requested.sequence > installed.sequence`. Sequences must strictly increment up and never reset to 1.
+4. **Sequence-First Layout**: All artifacts are organized under `dist/<sequence>/<package>/<version>/` (e.g. `dist/8/opencode-openai-auth/0.9.0/` and `dist/8/pi-openai-auth/0.9.0/`). A single directory `dist/<sequence>/` represents the complete, immutable release set for that suite sequence.
+5. **Canonical Arcus CLI Commands**:
+   * `arcus publish submit [bundle_dir] [--wait]` (submits an immutable release bundle over authenticated HTTPS)
+   * `arcus publish status <submission_id>` (queries verification diagnostics and hydration status)

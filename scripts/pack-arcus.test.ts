@@ -90,10 +90,10 @@ describe('openai-auth arcus packaging & sync', () => {
     ).toBe(false)
   })
 
-  it('produces valid Arcus release envelopes under tidy dist/<version>/<sequence>/ hierarchy', () => {
+  it('produces valid Arcus release envelopes under sequence-first dist/<sequence>/<package>/<version>/ hierarchy', () => {
     const opencodeEnv = resolve(
       repoRoot,
-      'dist/0.9.0/8/opencode-openai-auth/releases/opencode-openai-auth-0.9.0-8.json',
+      'dist/8/opencode-openai-auth/0.9.0/releases/opencode-openai-auth-0.9.0-8.json',
     )
     if (existsSync(opencodeEnv)) {
       const envelope = JSON.parse(readFileSync(opencodeEnv, 'utf-8'))
@@ -112,7 +112,7 @@ describe('openai-auth arcus packaging & sync', () => {
 
     const piEnv = resolve(
       repoRoot,
-      'dist/0.9.0/8/pi-openai-auth/releases/pi-openai-auth-0.9.0-8.json',
+      'dist/8/pi-openai-auth/0.9.0/releases/pi-openai-auth-0.9.0-8.json',
     )
     if (existsSync(piEnv)) {
       const envelope = JSON.parse(readFileSync(piEnv, 'utf-8'))

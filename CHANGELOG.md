@@ -1,13 +1,6 @@
 # Changelog
 
-## v0.9.0-2 — 2026-09-22
-
-### [Arcus/Internal Modifications]
-- Dependency alignment: updated `@cortexkit/subc-client` to `^0.13.1` across core and opencode packages to sync with subconscious subc crate and CortexKit shared transport protocols.
-- Toolchain synchronization: refreshed lockfile with latest toolchain and plugin dependencies.
-- Arcus publication: released v0.9.0-2 and submitted submission bundle to Arcus gateway.
-
-## v0.9.0-1 — 2026-09-20
+## v0.9.0 — 2026-09-22
 
 ### [Upstream Changes]
 - Merged upstream `v0.9.0`:
@@ -15,10 +8,11 @@
   - Subc client and claustrum mode enhancements.
 
 ### [Arcus/Internal Modifications]
-- Dependency alignment: bumped `@cortexkit/subc-client` to `^0.13.1` across core and opencode packages to sync with subconscious subc crate and CortexKit shared transport protocols.
+- Versioning policy alignment: strictly match upstream semver `0.9.0` (dash-number versions reserved for upstream prereleases); internal fork and Arcus releases track exclusively via monotonic sequence increments (Sequence 8).
+- Canonical Arcus release layout: adopted sequence-first directory hierarchy `dist/<sequence>/<package>/<version>/` with suite sequence synchronized across all components (`suite_seq = max(all suite sequences) + 1`).
+- Dependency alignment: updated `@cortexkit/subc-client` to `^0.13.1` across core and opencode packages to sync with subconscious subc crate and CortexKit shared transport protocols.
 - Web search replay fix: guarantee `action.type` (`"search"`) in `web_search_call` replay to prevent OpenAI `AI_APICallError: Missing required parameter: 'input[...].action.type'` schema rejection.
 - Arcus v3 publisher transition: adopted canonical `packages/arcus/` toolchain layout, gateway sequence auto-allocation, and removed git submodules.
-- Fork synchronization: synchronized with upstream `v0.9.0` under `<upstream_semver>-<fork_revision>` standard (`0.9.0-1`).
 
 ## v0.8.0-1 — 2026-09-17
 

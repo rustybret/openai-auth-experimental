@@ -57,21 +57,42 @@ if [ -z "$VERSION" ]; then
 fi
 
 if [ -z "$SEQUENCE" ]; then
-  SEQUENCE=$(arcus manifest allocate-sequence --gateway https://arcus-auth.rustybret.com --package-id opencode-openai-auth --json 2>/dev/null | jq -r '.sequence' 2>/dev/null || echo "1")
+  printf "pack-all-arcus: resolving unified suite sequence across all components...\n"
+  MAX_OBSERVED=0
+  for PKG in opencode-openai-auth pi-openai-auth; do
+    RAW_JSON=$(arcus manifest allocate-sequence --gateway https://arcus-auth.rustybret.com --package-id "$PKG" --json 2>/dev/null || true)
+    PKG_OBSERVED=$(echo "$RAW_JSON" | jq -r '.observed_max_sequence // 0' 2>/dev/null || echo "0")
+    if [ "$PKG_OBSERVED" = "null" ] || [ -z "$PKG_OBSERVED" ]; then PKG_OBSERVED=0; fi
+    # Fallback to local manifest check if gateway was unavailable
+    if [ "$PKG_OBSERVED" -eq 0 ] && [ -d "${REPO_ROOT}/../arcus/manifests/v3/${PKG}/releases" ]; then
+      LOCAL_MAX=$(find "${REPO_ROOT}/../arcus/manifests/v3/${PKG}/releases" -name "*.json" 2>/dev/null | while read -r f; do
+        jq -r '.sequence // 0' "$f" 2>/dev/null || true
+      done | sort -n | tail -n 1)
+      if [ -n "$LOCAL_MAX" ] && [ "$LOCAL_MAX" -gt "$PKG_OBSERVED" ]; then
+        PKG_OBSERVED="$LOCAL_MAX"
+      fi
+    fi
+    printf "  - %s: max observed sequence = %s\n" "$PKG" "$PKG_OBSERVED"
+    if [ "$PKG_OBSERVED" -gt "$MAX_OBSERVED" ]; then
+      MAX_OBSERVED="$PKG_OBSERVED"
+    fi
+  done
+  SEQUENCE=$((MAX_OBSERVED + 1))
+  printf "  -> synchronized suite sequence: %s (max observed %s + 1)\n" "$SEQUENCE" "$MAX_OBSERVED"
 fi
 
-RELEASE_ROOT="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}"
+RELEASE_ROOT="${REPO_ROOT}/dist/${SEQUENCE}"
 
 printf "=====================================================================\n"
 printf "pack-all-arcus: openai-auth Suite Arcus Packaging\n"
 printf "  version:  %s\n" "$VERSION"
-printf "  sequence: %s (shared)\n" "$SEQUENCE"
-printf "  output:   dist/%s/%s/<component>/\n" "$VERSION" "$SEQUENCE"
+printf "  sequence: %s (suite-wide synchronized)\n" "$SEQUENCE"
+printf "  output:   dist/%s/<component>/%s/\n" "$SEQUENCE" "$VERSION"
 printf "=====================================================================\n"
 
 # --- 0. Clean the target release directory ---
 if [ "$NO_CLEAN" -eq 0 ] && [ -z "$ONLY_COMPONENT" ] && [ -d "$RELEASE_ROOT" ]; then
-  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s/%s\n" "$VERSION" "$SEQUENCE"
+  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s\n" "$SEQUENCE"
   rm -rf "$RELEASE_ROOT"
 fi
 

@@ -93,10 +93,19 @@ const swept = []
 for (const [component, policy] of Object.entries(COMPONENTS)) {
   if (only && only !== component) continue
 
-  const dir = join(root, component)
+  let dir = join(root, component)
   if (!existsSync(dir)) {
     failures.push(`${component}: component directory missing`)
     continue
+  }
+
+  // Support sequence-first layout: dist/<sequence>/<component>/<version>/
+  const versionSubdirs = readdirSync(dir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && /^[0-9]/.test(d.name))
+    .map((d) => d.name)
+  if (versionSubdirs.length > 0) {
+    versionSubdirs.sort()
+    dir = join(dir, versionSubdirs[versionSubdirs.length - 1])
   }
 
   checked.push(component)

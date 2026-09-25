@@ -23,24 +23,24 @@ if [ -z "$VERSION" ]; then
   VERSION=$(node -e 'console.log(require("./packages/opencode/package.json").version)')
 fi
 
-DIST_VERSION_DIR="${REPO_ROOT}/dist/${VERSION}"
+DIST_DIR="${REPO_ROOT}/dist"
 
-if [ ! -d "$DIST_VERSION_DIR" ]; then
-  printf "error: no packaged components found under %s\n" "$DIST_VERSION_DIR" >&2
+if [ ! -d "$DIST_DIR" ]; then
+  printf "error: no packaged components found under %s\n" "$DIST_DIR" >&2
   printf "hint: run \"bun run pack:arcus\" first.\n" >&2
   exit 1
 fi
 
 printf "=====================================================================\n"
 printf "publish-all-arcus: Publishing openai-auth Suite (%s)\n" "$VERSION"
-printf "Reading packages from: %s\n" "$DIST_VERSION_DIR"
+printf "Reading packages from: %s\n" "$DIST_DIR"
 printf "=====================================================================\n"
 
 # Locate all release envelopes
-ENVELOPES=$(find "$DIST_VERSION_DIR" -name "*.json" | grep "/releases/" | grep -v ".index-policy.json" | sort)
+ENVELOPES=$(find "$DIST_DIR" -name "*.json" 2>/dev/null | grep "/releases/" | grep -v ".index-policy.json" | sort)
 
 if [ -z "$ENVELOPES" ]; then
-  printf "error: no release envelopes found under %s\n" "$DIST_VERSION_DIR" >&2
+  printf "error: no release envelopes found under %s\n" "$DIST_DIR" >&2
   exit 1
 fi
 
@@ -48,13 +48,15 @@ GITHUB_REPO="rustybret/openai-auth-experimental"
 
 for env_file in $ENVELOPES; do
   comp_dir="$(dirname "$(dirname "$env_file")")"
-  comp_name="$(basename "$comp_dir")"
+  comp_name="$(jq -r '.package_id // empty' "$env_file" 2>/dev/null || basename "$(dirname "$comp_dir")")"
+  pkg_ver="$(jq -r '.version // empty' "$env_file" 2>/dev/null || echo "$VERSION")"
+  pkg_seq="$(jq -r '.sequence // empty' "$env_file" 2>/dev/null || echo "1")"
   env_name="$(basename "$env_file")"
   release_id="${env_name%.json}"
 
-  printf "\n>>> Processing component: %s (release: %s)...\n" "$comp_name" "$release_id"
+  printf "\n>>> Processing component: %s (version: %s, sequence: %s)...\n" "$comp_name" "$pkg_ver" "$pkg_seq"
 
-  TAG="v${VERSION}"
+  TAG="v${pkg_ver}"
 
   # 1. GitHub release asset upload
   if [ "$DRY_RUN" -eq 1 ]; then

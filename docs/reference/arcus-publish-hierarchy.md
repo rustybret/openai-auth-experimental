@@ -16,32 +16,43 @@ The unified Arcus packaging pipeline establishes a deterministic contract. Every
 
 ## The Directory Contract
 
-All release artifacts reside under a single, deterministic directory hierarchy rooted at `dist/`. The root `.gitignore` ignores `dist/`. No other `dist-*` directories exist or are permitted.
+All release artifacts reside under a single, deterministic, sequence-first directory hierarchy rooted at `dist/`. The root `.gitignore` ignores `dist/`. No other `dist-*` directories exist or are permitted.
 
 ### Structure
 
 ```text
 dist/
-└── <version>/
-    └── <sequence>/
-        ├── opencode-openai-auth/
-        │   ├── releases/
-        │   │   ├── opencode-openai-auth-<version>-<sequence>.json
-        │   │   └── opencode-openai-auth-<version>-<sequence>.index-policy.json
-        │   ├── opencode-openai-auth-<version>-<target>.tar.gz
-        │   ├── opencode-openai-auth-<version>-<target>-content.zip
-        │   ├── opencode-openai-auth-<version>-<target>.pwr
-        │   ├── pack-report.json
-        │   └── cortexkit-opencode-openai-auth-<version>.tgz
-        └── pi-openai-auth/
+└── <sequence>/
+    ├── opencode-openai-auth/
+    │   └── <version>/
+    │       ├── submission.json
+    │       ├── pack-report.json
+    │       ├── release.json
+    │       ├── releases/
+    │       │   ├── opencode-openai-auth-<version>-<sequence>.json
+    │       │   └── opencode-openai-auth-<version>-<sequence>.index-policy.json
+    │       ├── opencode-openai-auth-<version>-<target>.tar.gz
+    │       ├── opencode-openai-auth-<version>-<target>-content.zip
+    │       ├── opencode-openai-auth-<version>-<target>.pwr
+    │       └── cortexkit-opencode-openai-auth-<version>.tgz
+    └── pi-openai-auth/
+        └── <version>/
+            ├── submission.json
+            ├── pack-report.json
+            ├── release.json
             ├── releases/
             │   ├── pi-openai-auth-<version>-<sequence>.json
             │   └── pi-openai-auth-<version>-<sequence>.index-policy.json
             ├── pi-openai-auth-<version>-<target>.tar.gz
             ├── pi-openai-auth-<version>-<target>-content.zip
-            ├── pi-openai-auth-<version>-<target>.pwr
-            └── pack-report.json
+            └── pi-openai-auth-<version>-<target>.pwr
 ```
+
+### Why Sequence-First Organization is Superior
+1. **Sequence is the True Immutable Timeline**: Filesystem sorting by `<sequence>` directly reflects the release timeline and catalog promotion order, whereas sorting by SemVer breaks when components have different version cadences.
+2. **Whole-Submission Atomic Staging**: A single folder (`dist/<sequence>/`) contains the complete immutable set of packages and descriptors that ship together in that suite release.
+3. **Zero Ambiguity**: When Arcus intake tools ingest or audit submission bundles, there is zero confusion about which version belongs to which sequence.
+4. **Self-Contained Submission Bundles**: Each component folder (`dist/<sequence>/<package>/<version>/`) carries its own `submission.json` and release envelope, making it directly consumable by `arcus publish submit` or intake automation.
 
 ### Target Coverage per Component
 
@@ -56,14 +67,31 @@ Shipping fewer than all five targets is a defect, as a user on a missing platfor
 
 ---
 
+## Suite Sequence Synchronization & Anti-Rollback
+
+Arcus client anti-rollback rules are evaluated per-package:
+$$\text{requested.sequence} > \text{installed.sequence}$$
+
+Arcus requires strict monotonicity ($> \text{current}$); it does not require $+1$ increments, making sequence jumps valid.
+
+For multi-component suites, all modules share a unified suite sequence calculated as:
+$$\text{suite\_seq} = \max(\text{all suite package sequences}) + 1$$
+
+### Benefits:
+- **Compatibility Lock**: Immediate proof that `opencode-openai-auth` and `pi-openai-auth` originated from the exact same unified suite build.
+- **Eliminates Sequence Drift**: Components do not develop skewed, mismatched sequence numbers.
+- **Never Resets**: Sequence numbers strictly increment up over time and never reset to 1 across releases or upstream syncs.
+
+---
+
 ## Pipeline Lifecycle & Commands
 
 ### 1. Master Packaging: `scripts/pack-all-arcus.sh`
-Packages both components under a unified version and sequence directory:
+Packages all components under the unified sequence-first hierarchy (`dist/<sequence>/<component>/<version>/`):
 ```bash
 bun run pack:arcus
 # Or with explicit flags:
-bash scripts/pack-all-arcus.sh --version 0.9.0-2 --sequence 7
+bash scripts/pack-all-arcus.sh --version 0.9.0 --sequence 8
 ```
 
 ### 2. Individual Component Packaging
@@ -85,7 +113,7 @@ Fails closed if:
 ```bash
 bun run publish:arcus
 ```
-Publishes all components under `dist/<version>/<sequence>/`:
+Publishes all components under `dist/<sequence>/`:
 - Creates GitHub Release tag `v<version>` on `rustybret/openai-auth-experimental`.
 - Uploads platform archives, content zips, and Wharf signatures.
 - Stages signed envelopes to Arcus manifests in `/Volumes/Topper2TB/Git/arcus/manifests/v3/`.
@@ -94,7 +122,7 @@ Publishes all components under `dist/<version>/<sequence>/`:
 ### 5. Arcus Gateway Commands (Arcus v3 CLI)
 - **Submit Release Bundle**:
   ```bash
-  arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com
+  arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com [--wait]
   ```
   Submits an immutable release bundle to the gateway for automated testing and hydration.
 - **Query Submission Status**:
@@ -103,11 +131,13 @@ Publishes all components under `dist/<version>/<sequence>/`:
   ```
   Queries verification diagnostics and hydration outcome of a submission.
 
-### How Release Versions Are Handled in Arcus
+---
 
-- Semver Parity: Package versions must strictly match upstream semver (e.g. `0.9.0`). Dash-number suffixes (e.g. `-1`, `-2`) are reserved in SemVer 2.0.0 for prerelease/beta builds and MUST NOT be used for internal fork revisions or Arcus releases unless upstream itself publishes a prerelease.
-- Monotonic Sequence Increments: All internal releases, fork updates, packaging fixes, and republished distributions are tracked via monotonic integer sequence numbers allocated by the Arcus gateway (`arcus manifest allocate-sequence`).
-- Distribution Layout: All artifacts are strictly organized under `dist/<version>/<sequence>/<package>/` (e.g. `dist/0.9.0/8/opencode-openai-auth/` and `dist/0.9.0/8/pi-openai-auth/`).
-- Canonical Arcus CLI Commands:
+## How Release Versions Are Handled in Arcus
+
+- **SemVer Parity**: Package versions must strictly match upstream semver (e.g. `0.9.0`). Dash-number suffixes (e.g. `-1`, `-2`) are reserved in SemVer 2.0.0 for prerelease/beta builds and MUST NOT be used for internal fork revisions or Arcus releases unless upstream itself publishes a prerelease.
+- **Monotonic Sequence Increments**: All internal releases, fork updates, packaging fixes, and republished distributions are tracked via monotonic integer sequence numbers allocated by the Arcus gateway (`arcus manifest allocate-sequence`).
+- **Distribution Layout**: All artifacts are strictly organized under sequence-first layout: `dist/<sequence>/<package>/<version>/` (e.g. `dist/8/opencode-openai-auth/0.9.0/` and `dist/8/pi-openai-auth/0.9.0/`).
+- **Canonical Arcus CLI Commands**:
   * `arcus publish submit [bundle_dir] [--wait]` (submits an immutable release bundle over authenticated HTTPS)
   * `arcus publish status <submission_id>` (queries verification diagnostics and hydration status)

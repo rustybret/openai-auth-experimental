@@ -41,7 +41,7 @@ if [ -z "$SEQUENCE" ]; then
   SEQUENCE=$(arcus manifest allocate-sequence --gateway https://arcus-auth.rustybret.com --package-id pi-openai-auth --json 2>/dev/null | jq -r '.sequence' 2>/dev/null || echo "1")
 fi
 
-OUTPUT_DIR="${REPO_ROOT}/dist/${VERSION}/${SEQUENCE}/pi-openai-auth"
+OUTPUT_DIR="${REPO_ROOT}/dist/${SEQUENCE}/pi-openai-auth/${VERSION}"
 
 if [ "$NO_CLEAN" -eq 0 ] && [ -d "$OUTPUT_DIR" ]; then
   rm -rf "$OUTPUT_DIR"
@@ -54,6 +54,8 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   printf "pack-pi-arcus: building pi extension dists...\n"
   bun run --cwd "${REPO_ROOT}/packages/pi" build
 fi
+
+RELEASE_ID="pi-openai-auth-${VERSION}-${SEQUENCE}"
 
 printf "pack-pi-arcus: staging clean payload...\n"
 TMP_STAGING=$(mktemp -d "${TMPDIR:-/tmp}/pi-pack.XXXXXX")
@@ -87,5 +89,32 @@ sh "${REPO_ROOT}/packages/arcus/toolchain/scripts/pack-arcus.sh" "$@"
 if [ -d "${OUTPUT_DIR}/payload" ]; then
   rm -rf "${OUTPUT_DIR}/payload"
 fi
+
+# Ensure release.json symlink exists for direct bundle intake
+if [ -f "${OUTPUT_DIR}/releases/${RELEASE_ID}.json" ] && [ ! -f "${OUTPUT_DIR}/release.json" ]; then
+  ln -sf "releases/${RELEASE_ID}.json" "${OUTPUT_DIR}/release.json"
+fi
+
+# Generate submission.json for self-contained intake
+CREATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+cat <<EOF > "${OUTPUT_DIR}/submission.json"
+{
+  "schema_version": 1,
+  "package_id": "pi-openai-auth",
+  "release_id": "${RELEASE_ID}",
+  "version": "${VERSION}",
+  "sequence": ${SEQUENCE},
+  "sequence_source": "suite",
+  "created_at": "${CREATED_AT}",
+  "toolchain_version": "0.4.0",
+  "publisher_key_id": "fc7b2603635dc23aa87223cc3cf9395cef2f9e630a951d7da22803649b1fdac8"
+}
+EOF
+
+# Compatibility symlink for legacy dist/arcus intake paths
+LEGACY_ARCUS_DIR="${REPO_ROOT}/dist/arcus/${RELEASE_ID}"
+mkdir -p "${REPO_ROOT}/dist/arcus"
+rm -rf "$LEGACY_ARCUS_DIR"
+ln -sfn "$OUTPUT_DIR" "$LEGACY_ARCUS_DIR"
 
 find "$OUTPUT_DIR" -name '.DS_Store' -type f -delete 2>/dev/null || true
