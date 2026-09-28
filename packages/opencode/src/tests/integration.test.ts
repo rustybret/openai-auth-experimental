@@ -16,7 +16,6 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-
 import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
@@ -47,6 +46,7 @@ import {
   enrollmentManifest,
   makeSentinelAccount,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -364,7 +364,7 @@ describe('integration: HTTP quota push', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -781,7 +781,7 @@ describe('integration: killswitch enforcement', () => {
     process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
       FLOOR_SIDEBAR_STATE_FILE
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2231,7 +2231,7 @@ describe('integration: WS quota push', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2548,7 +2548,7 @@ describe('integration: 429 → reactive fallback', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2785,7 +2785,7 @@ describe('integration: 429 → reactive fallback', () => {
       },
     )
     globalThis.fetch = originalFetch
-    delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+    restoreEnv('CLAUSTRUM_OPENCODE_HANDLES')
   })
 })
 
@@ -2822,7 +2822,7 @@ describe('integration: active fallback routing', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -7105,6 +7105,74 @@ describe('integration: active fallback routing', () => {
     }
   })
 
+  it('registers no tools of its own', async () => {
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    try {
+      expect(hooks.tool).toBeUndefined()
+    } finally {
+      await hooks.dispose?.()
+    }
+  })
+
+  it('adds no hosted search tool and leaves other search tools on the wire', async () => {
+    // Search comes from other plugins' function tools, whatever they are named.
+    // The request must reach the backend with them intact and with no native
+    // `web_search` added.
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let sent: Record<string, unknown> | undefined
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (isResponsesSend(url) && typeof init?.body === 'string')
+          sent = JSON.parse(init.body)
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'session-id': 'sess-search-tools',
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          ],
+          tools: [
+            { type: 'function', name: 'read', parameters: {} },
+            { type: 'function', name: 'web_search', parameters: {} },
+            {
+              type: 'function',
+              name: 'websearch_web_search_exa',
+              parameters: {},
+            },
+          ],
+        }),
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    if (!sent) throw new Error('no request reached the responses endpoint')
+    const tools = sent.tools as Array<Record<string, unknown>>
+    // The Codex request rewrite adds `strict: false` to each function tool, so
+    // this confirms the request was rewritten rather than passed along unchanged.
+    expect(tools.every((tool) => tool.strict === false)).toBe(true)
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'read',
+      'web_search',
+      'websearch_web_search_exa',
+    ])
+    expect(tools.some((tool) => tool.type === 'web_search')).toBe(false)
+  })
   it('rewrites an eligible HTTP body for Responses Lite', async () => {
     const captured = await captureResponsesLiteHttpRequest(
       'gpt-5.6-sol',
@@ -8139,7 +8207,7 @@ describe('integration: no real config read', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -8256,7 +8324,7 @@ describe('integration: models cost-zeroing', () => {
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
     resetModelCostsForTest()
   })
