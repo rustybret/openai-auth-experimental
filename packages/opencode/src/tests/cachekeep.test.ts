@@ -15,6 +15,7 @@ import {
 } from '../core/cachekeep'
 import { CodexAuthPlugin } from '../index'
 import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
+import { rpcServerRegistry } from './fixtures/rpc-registry'
 
 function fakeLogger() {
   return {
@@ -2619,10 +2620,7 @@ describe('RPC server dispose', () => {
         files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
       ).toBe(true)
 
-      const rpcGlobal = globalThis as {
-        __openaiAuthRpcServers?: Map<string, unknown>
-      }
-      expect(rpcGlobal.__openaiAuthRpcServers?.size ?? 0).toBeGreaterThan(0)
+      expect(rpcServerRegistry()?.size ?? 0).toBeGreaterThan(0)
 
       await plugin.dispose?.()
 
@@ -2630,7 +2628,7 @@ describe('RPC server dispose', () => {
       expect(
         files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
       ).toBe(false)
-      expect(rpcGlobal.__openaiAuthRpcServers?.size ?? 0).toBe(0)
+      expect(rpcServerRegistry()?.size ?? 0).toBe(0)
     } finally {
       process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
     }
