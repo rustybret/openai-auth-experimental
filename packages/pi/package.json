@@ -37,7 +37,7 @@
     "types": "tsc"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "0.2.4",
+    "@cortexkit/common-auth": "0.2.9",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "peerDependencies": {
