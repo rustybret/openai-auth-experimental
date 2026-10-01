@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { writeJsonAtomic } from './atomic-write'
+import {
+  acquireRefreshFileLock,
+  writeJsonAtomic,
+} from '@cortexkit/common-auth/fs'
 import {
   buildQuotaOperationError,
   buildRefreshOperationError,
@@ -38,7 +41,6 @@ import type {
 } from './provider.ts'
 import { PRIMARY, SECONDARY } from './provider.ts'
 import { quotaWindowResetIsPast } from './quota-manager.ts'
-import { acquireRefreshFileLock } from './refresh-file-lock'
 
 const logR = createLogger('refresh')
 const logA = createLogger('accounts')
@@ -207,7 +209,15 @@ export function isValidApiBaseURL(value: string | undefined) {
 // Storage types
 // ---------------------------------------------------------------------------
 
-export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
+/**
+ * `ordered` is the shared command menu's name for plain roster order; it is
+ * written only from that menu, which needs a migrated install.
+ */
+export type RoutingMode =
+  | 'ordered'
+  | 'main-first'
+  | 'fallback-first'
+  | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w', number>
@@ -217,6 +227,35 @@ export type KillswitchConfig = {
   enabled?: boolean
   main?: KillswitchThresholds
   accounts?: Record<string, KillswitchThresholds>
+  /**
+   * `KILLSWITCH_FLOORS_SCHEMA` once the block holds explicit per-account
+   * floors; see that constant for how the two formats differ.
+   */
+  schema?: string
+}
+
+/**
+ * Marks a killswitch block written in the shared command menu's vocabulary:
+ * `accounts.<id>.<window>` is that account's minimum percent left for the
+ * window, a window without a value has no floor, an account without an entry
+ * has none at all, and there is no `main` block (the main account is row
+ * `main`). An unmarked block keeps the older meaning: an account without an
+ * entry inherits `main`, a missing window falls back to the default, and
+ * `5h`/`1w` alias `primary`/`secondary`.
+ */
+export const KILLSWITCH_FLOORS_SCHEMA = 'floors-v1'
+
+/** The cache keep-warm settings; see `cacheKeepSettings`. */
+export type CacheKeepSettings = {
+  enabled?: boolean
+  subagents?: boolean
+  sustain?: boolean
+  /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
+   *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
+  startHour?: number
+  /** Clock-hour window end (0-23, exclusive) — must differ from startHour
+   *  to be honored; an unset or equal hour falls back to "always warm". */
+  endHour?: number
 }
 
 export interface ResetInFlight {
@@ -284,17 +323,9 @@ export type AccountStorage = {
   logging?: {
     level?: string
   }
-  cachekeep?: {
-    enabled?: boolean
-    subagents?: boolean
-    sustain?: boolean
-    /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
-     *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
-    startHour?: number
-    /** Clock-hour window end (0-23, exclusive) — must differ from startHour
-     *  to be honored; an unset or equal hour falls back to "always warm". */
-    endHour?: number
-  }
+  /** The older name of `cacheKeep`; read only until a settings write renames it. */
+  cachekeep?: CacheKeepSettings
+  cacheKeep?: CacheKeepSettings
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string
   claustrum?: {
@@ -367,6 +398,22 @@ export type AccountManagerOptions = {
   // Required because an omitted policy reader silently re-enables local refresh;
   // anthropic-auth incident 1 demonstrated that optional custody wiring fails open.
   custody: AccountManagerCustodyOptions
+  /**
+   * Asked before every background refresh pass; true skips the pass. A host
+   * whose accounts moved into a shared account pool refreshes them there, and
+   * this keeps the per-account background refresh off those rows.
+   */
+  backgroundRefreshPaused?: () => boolean | Promise<boolean>
+}
+
+export type RefreshAccountOptions = {
+  /** Refresh even when the token is not yet due. */
+  force?: boolean
+  /**
+   * The row is being refreshed as the main account while the main slot holds
+   * the pool placeholder, so the main-row shield does not apply.
+   */
+  asPoolMain?: boolean
 }
 
 export type AccountRefreshError = {
@@ -742,6 +789,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     logging: isRecord(value.logging) ? value.logging : undefined,
     cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
+    cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     mainAccountId:
       typeof value.mainAccountId === 'string' ? value.mainAccountId : undefined,
     claustrum: normalizeClaustrum(value.claustrum),
@@ -1124,6 +1172,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     killswitch: storage.killswitch,
     logging: storage.logging,
     cachekeep: storage.cachekeep,
+    cacheKeep: storage.cacheKeep,
     mainAccountId: storage.mainAccountId,
     ...(storage.claustrum !== undefined
       ? {
@@ -1142,6 +1191,50 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
+const CREDENTIAL_FIELDS = [
+  'access',
+  'refresh',
+  'expires',
+  'lastRefreshedAt',
+  'lastRefreshError',
+] as const
+
+/**
+ * The incoming account, but with its credential taken from whichever side holds
+ * the newer token, by the same comparison saveAccountState uses.
+ *
+ * A full-store save writes a snapshot the caller loaded some time ago. If a
+ * refresh rotated the token on disk after that load, writing the snapshot's
+ * token back would restore a refresh token the provider has already spent,
+ * and the account would be dead at its next refresh. Everything other than the
+ * credential still comes from the incoming snapshot.
+ *
+ * A custody tombstone is a deliberate retirement of the credential, not a
+ * token, so an incoming tombstone always wins.
+ */
+function keepNewerCredential(
+  onDisk: FallbackAccount,
+  incoming: FallbackAccount,
+): FallbackAccount {
+  if (!isOAuthAccount(onDisk) || !isOAuthAccount(incoming)) return incoming
+  if (incoming.refresh === custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)) {
+    return incoming
+  }
+  const incomingEntry = accountRuntimeState(incoming) as AccountRuntimeEntry
+  const chosen: AccountRuntimeEntry = { ...incomingEntry }
+  applyNewerTokenState(
+    chosen,
+    accountRuntimeState(onDisk) as AccountRuntimeEntry,
+    incomingEntry,
+  )
+  const result: Record<string, unknown> = { ...incoming }
+  for (const field of CREDENTIAL_FIELDS) {
+    if (field in chosen) result[field] = chosen[field]
+    else delete result[field]
+  }
+  return result as OAuthAccount
+}
+
 function mergeStorageForSave(
   latest: AccountStorage | null,
   incoming: AccountStorage,
@@ -1150,7 +1243,13 @@ function mergeStorageForSave(
 
   const accounts = new Map<string, FallbackAccount>()
   for (const account of latest.accounts) accounts.set(account.id, account)
-  for (const account of incoming.accounts) accounts.set(account.id, account)
+  for (const account of incoming.accounts) {
+    const onDisk = accounts.get(account.id)
+    accounts.set(
+      account.id,
+      onDisk ? keepNewerCredential(onDisk, account) : account,
+    )
+  }
 
   return {
     ...latest,
@@ -1866,7 +1965,8 @@ export async function saveAccountState(
 // Fallback / quota policies
 // ---------------------------------------------------------------------------
 
-function getFallbackStatuses(storage: AccountStorage | null) {
+/** The response statuses that send a request on to the next account. */
+export function getFallbackStatuses(storage: AccountStorage | null) {
   return storage?.fallbackOn?.length ? storage.fallbackOn : DEFAULT_FALLBACK_ON
 }
 
@@ -1950,11 +2050,41 @@ function normalizeKillswitchThresholds(
   }
 }
 
+/**
+ * The cache keep-warm settings under either name. A migrated install renames
+ * `cachekeep` to `cacheKeep` on its first settings write; until then (and on
+ * an install that has not migrated) the older key is the one that exists.
+ */
+export function cacheKeepSettings(
+  storage: Pick<AccountStorage, 'cachekeep' | 'cacheKeep'> | null | undefined,
+): CacheKeepSettings | undefined {
+  return storage?.cacheKeep ?? storage?.cachekeep
+}
+
+/**
+ * A floor read from a block in the shared vocabulary: a missing or
+ * malformed value is no floor, which no remaining percentage falls below.
+ */
+function floorOf(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/**
+ * The minimum percent left an account must keep in each window. `accountId`
+ * undefined is the main account (row `main` on a migrated install).
+ */
 export function getKillswitchThresholdsForAccount(
   storage: AccountStorage | null,
   accountId?: string,
 ): { primary: number; secondary: number } {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
+  if (storage.killswitch.schema === KILLSWITCH_FLOORS_SCHEMA) {
+    const own = storage.killswitch.accounts?.[accountId ?? 'main']
+    return {
+      primary: floorOf(own?.primary),
+      secondary: floorOf(own?.secondary),
+    }
+  }
   if (accountId && storage.killswitch.accounts?.[accountId]) {
     return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])
   }
@@ -2109,7 +2239,7 @@ function refreshEnabled(storage: AccountStorage | null) {
   return storage?.refresh?.enabled !== false
 }
 
-function refreshBeforeExpiryMs(storage: AccountStorage | null) {
+export function refreshBeforeExpiryMs(storage: AccountStorage | null) {
   return (storage?.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
 }
 
@@ -2137,12 +2267,87 @@ function hasUnexpiredAccessToken(account: OAuthAccount, now: number) {
   )
 }
 
-function isMainAccountFallback(storage: AccountStorage, account: OAuthAccount) {
+/**
+ * Whether a roster row holds the same ChatGPT account as OpenCode's main slot
+ * (`mainAccountId`). Such a row is a second copy of main's credential: the
+ * account-pool migration writes main into row `main` and sets `mainAccountId`
+ * while the slot copy is still live. Two places refreshing one rotating refresh
+ * token spend it twice, so a shielded row is neither selected as a fallback
+ * nor refreshed by any background loop; the slot's own refresher owns it.
+ */
+export function isShieldedMainRow(
+  storage: Pick<AccountStorage, 'mainAccountId'> | null | undefined,
+  account: Pick<OAuthAccount, 'accountId'>,
+): boolean {
   return Boolean(
-    storage.mainAccountId &&
+    storage?.mainAccountId &&
       account.accountId &&
       account.accountId === storage.mainAccountId,
   )
+}
+
+/**
+ * Thrown when something asks to refresh a row that `isShieldedMainRow` hides.
+ * Callers that loop over the roster skip such rows before calling refresh; this
+ * is the last guard for any path that did not.
+ */
+export class ShieldedMainRowRefreshError extends Error {
+  constructor(accountId: string) {
+    super(
+      `Refusing to refresh account ${accountId}: it holds the main account's credential while the main slot is live`,
+    )
+    this.name = 'ShieldedMainRowRefreshError'
+  }
+}
+
+/**
+ * The refresh value the account-pool migration writes into OpenCode's `openai`
+ * slot once the main account has moved into the pool row `main`. The full slot
+ * value is `{type:'oauth', access:'', refresh:<this>, expires:0}`. It is not a
+ * credential: it must never be refreshed or sent. It is recognised by an exact
+ * match on the refresh value only, never by prefix, so a future placeholder
+ * version or an unrelated token can never be mistaken for it.
+ */
+export const POOL_MAIN_PLACEHOLDER_REFRESH = 'common-auth-placeholder:v1:openai'
+
+/** Roster id of the row that holds the main account after the pool migration. */
+export const POOL_MAIN_ROW_ID = 'main'
+
+/** Whether a value read from OpenCode's `openai` slot is the pool placeholder. */
+export function isPoolMainPlaceholder(auth: unknown): boolean {
+  return (
+    isRecord(auth) &&
+    auth.type === 'oauth' &&
+    auth.refresh === POOL_MAIN_PLACEHOLDER_REFRESH
+  )
+}
+
+/**
+ * The roster row that serves as the main account while the slot holds the pool
+ * placeholder: the enabled, readable OAuth row with id `main`, if there is one.
+ */
+export function findPoolMainRow(
+  storage: AccountStorage | null | undefined,
+): OAuthAccount | undefined {
+  return storage?.accounts.find(
+    (account): account is OAuthAccount =>
+      account.id === POOL_MAIN_ROW_ID &&
+      account.enabled !== false &&
+      isOAuthAccount(account),
+  )
+}
+
+/** The storage with the pool's main row left out, for fallback selection. */
+export function withoutPoolMainRow<T extends AccountStorage | null | undefined>(
+  storage: T,
+): T {
+  if (!storage) return storage
+  return {
+    ...storage,
+    accounts: storage.accounts.filter(
+      (account) => account.id !== POOL_MAIN_ROW_ID,
+    ),
+  }
 }
 
 function updateStoredAccount(storage: AccountStorage, account: OAuthAccount) {
@@ -2399,6 +2604,7 @@ export class FallbackAccountManager {
 
   startBackgroundRefresh() {
     const run = async () => {
+      if (await this.options.backgroundRefreshPaused?.()) return
       await this.refreshDueAccounts()
       // quota auto-runners are passive-only (gated behind fetchQuotaFn injection)
       if (this.options.fetchQuotaFn) {
@@ -2430,7 +2636,7 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
-      if (isMainAccountFallback(storage, account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       const state = await this.custodyAccountState(account)
       // Custody owns these families; the request resolver decides whether a
       // vault or still-valid local bearer exists before send.
@@ -2597,6 +2803,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
@@ -2640,6 +2847,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
@@ -2688,6 +2896,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
@@ -2728,10 +2937,19 @@ export class FallbackAccountManager {
     return { storage, errors }
   }
 
+  /**
+   * Refresh one roster row's token when it is due (or always, with `force`).
+   *
+   * A row hidden by `isShieldedMainRow` is refused, because its credential is
+   * also live in the main slot. `asPoolMain` lifts that refusal for the one
+   * caller entitled to it: the path serving row `main` as the main account
+   * while the slot holds only the pool placeholder, when no live slot copy
+   * exists for the shield to protect.
+   */
   async refreshAccount(
     account: OAuthAccount,
     storage: AccountStorage,
-    options: { force?: boolean } = {},
+    options: RefreshAccountOptions = {},
   ): Promise<OAuthAccount> {
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
@@ -2755,7 +2973,7 @@ export class FallbackAccountManager {
     account: OAuthAccount,
     storage: AccountStorage,
     previous: OAuthAccount,
-    options: { force?: boolean },
+    options: RefreshAccountOptions,
   ): Promise<OAuthAccount | null> {
     const deadline = Date.now() + FALLBACK_REFRESH_JOIN_WAIT_MS
     while (Date.now() < deadline) {
@@ -2807,10 +3025,21 @@ export class FallbackAccountManager {
     return null
   }
 
+  private assertNotShieldedMainRow(
+    storage: AccountStorage | null,
+    account: OAuthAccount | undefined,
+    options: RefreshAccountOptions,
+  ) {
+    if (options.asPoolMain || !account) return
+    if (isShieldedMainRow(storage, account)) {
+      throw new ShieldedMainRowRefreshError(account.id)
+    }
+  }
+
   private async refreshAccountNow(
     account: OAuthAccount,
     storage: AccountStorage,
-    options: { force?: boolean },
+    options: RefreshAccountOptions,
   ): Promise<OAuthAccount> {
     let latestStorage = await this.load()
     let latestAccount = latestStorage?.accounts.find(
@@ -2820,6 +3049,7 @@ export class FallbackAccountManager {
     // Choke point (initial load): refuse any provider call when the
     // reloaded account is enrolled or tombstoned. The toggle is ignored.
     await this.assertNotCustodyInert(latestAccount)
+    this.assertNotShieldedMainRow(latestStorage, latestAccount, options)
     if (
       latestAccount &&
       !options.force &&
@@ -2860,8 +3090,10 @@ export class FallbackAccountManager {
       )
       // Choke point (under-lock load): a tombstone landing while the lock
       // was contended, or a manifest entry appearing on disk, both abort
-      // the refresh before the provider call.
+      // the refresh before the provider call. The same holds for a shield
+      // that appeared while this process waited.
       await this.assertNotCustodyInert(latestAccount)
+      this.assertNotShieldedMainRow(latestStorage, latestAccount, options)
       if (
         latestAccount &&
         !options.force &&

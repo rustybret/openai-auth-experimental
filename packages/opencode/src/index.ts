@@ -2,11 +2,22 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  type Stats,
   statSync,
   writeFileSync,
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import { parseApplyRequest } from '@cortexkit/common-auth/commands'
+import {
+  adoptRpcServer,
+  type RpcServerAdoption,
+} from '@cortexkit/common-auth/rpc'
+import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
+import {
+  type ResetTargetIdentity,
+  writeSettings,
+} from '@cortexkit/openai-auth-core'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
@@ -16,6 +27,7 @@ import {
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
   CustodyTombstoneRefreshError,
+  cacheKeepSettings,
   claustrumMode,
   codexRefreshFn,
   errorMessage,
@@ -44,6 +56,7 @@ import {
   parseJwtClaims,
   type QuotaEntry,
   QuotaManager,
+  type RefreshAllQuotaResult,
   type RoutingMode,
   refreshAllQuota,
   refreshBackoffActive,
@@ -66,29 +79,26 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import {
-  buildDialogPayload,
-  type CommandContext,
-  MODAL_COMMANDS,
-  OPENAI_ACCOUNT_COMMAND_NAME,
-  OPENAI_CACHEKEEP_COMMAND_NAME,
-  OPENAI_DUMP_COMMAND_NAME,
-  OPENAI_KILLSWITCH_COMMAND_NAME,
-  OPENAI_LOGGING_COMMAND_NAME,
-  OPENAI_QUOTA_COMMAND_NAME,
-  OPENAI_RESET_COMMAND_NAME,
-  OPENAI_ROUTING_COMMAND_NAME,
-  type ResetTargetIdentity,
+  applyOpenAiMenu,
+  menuText,
+  OPENAI_COMMAND_NAME,
+  type OpenCodeMenuContext,
+  openOpenAiMenu,
 } from './commands'
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import { getAccountPaths, getAccountStatePath } from './core/account-paths'
 import {
+  acquireBackgroundRefreshLock,
   BackgroundQuotaRefresh,
+  refreshPoolInBackground,
   refreshQuotaInBackground,
 } from './core/background-quota-refresh'
 import {
   buildKeepwarmCapture,
-  CacheKeepManager,
+  createCacheKeepManager,
   getCacheKeepWindow,
+  type OpenAICacheKeepManager,
+  routedAccountForSession,
 } from './core/cachekeep'
 import {
   type CustodyBootstrap,
@@ -110,11 +120,50 @@ import {
   MAIN_REFRESH_LOCK_NAME,
   releaseCustodyLoginLeaseAfterHostWrite,
 } from './core/custody-transition.ts'
+import { PoolAccountSource } from './core/pool-account-source'
+import {
+  migratedPoolRows,
+  openAccountPool,
+  poolMigrated,
+  poolSettingsLocks,
+} from './core/pool-accounts'
+import {
+  createPoolLifecycle,
+  type PoolLifecycle,
+  type PoolLifecycleDeps,
+} from './core/pool-lifecycle'
+import {
+  findPoolMainRow,
+  isPoolMainPlaceholder,
+  MainAccountInPoolError,
+  type PoolMainAccess,
+  resolvePoolMainAccess,
+  withoutPoolMainRow,
+} from './core/pool-main'
+import {
+  adoptHostSlotLogin,
+  migrateToPool,
+  PoolTransferPendingError,
+  poolTransferPendingInConfigFile,
+} from './core/pool-migration'
+import { observationFromSnapshot } from './core/pool-quota'
+import {
+  type PoolBlockQuotas,
+  type PoolPinPlacement,
+  servePoolRequest,
+} from './core/pool-request'
+import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from './core/pool-routing'
+import { buildPoolSidebarMachineState } from './core/pool-sidebar'
+import {
+  type ProcessHeartbeatHandle,
+  startProcessHeartbeat,
+} from './core/process-heartbeat'
 import {
   decideStickyBreak,
   type StickyBreakDecision,
   selectStickyCandidate,
 } from './core/sticky-routing'
+import { migrationFenceOpen } from './core/version-fence'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
@@ -124,31 +173,37 @@ import {
   isTuiConnected,
   pushNotification,
 } from './rpc/notifications'
-import type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-} from './rpc/protocol'
+import type { ApplyRequest, ApplyResult } from './rpc/protocol'
 import { resolveRpcDir } from './rpc/rpc-dir'
-import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
+import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
+  applyStickyPinOverlay,
   clearSidebarStickyAssignment,
+  createSidebarBookkeepingQueue,
+  createSidebarStateCache,
   exhaustedQuotaResetAt,
   getSidebarState,
   getSidebarStateFile,
+  HOT_PATH_READ_BUDGET_MS,
   hashSidebarSessionId,
   isQuotaExhausted,
+  persistSidebarStickyAssignment,
+  planSidebarStickyAssignmentFromSnapshot,
   projectCustodyForSidebar,
   type QuotaWindow,
+  rememberStickyPin,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
-  resolveSidebarStickyAssignment,
   type SidebarAccountCustody,
+  type SidebarBookkeepingQueue,
   type SidebarMachineState,
+  type SidebarSnapshot,
   type SidebarState,
+  type StickyPinOverlay,
   setSidebarLegacyRouting,
   setSidebarMachineState,
+  settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
 import { stableStringify } from './util/stable-json'
@@ -282,6 +337,20 @@ interface ResetTargetResolverDeps {
     account: OAuthAccount,
     storage: AccountStorage,
   ) => Promise<OAuthAccount>
+  /**
+   * Refresh the pool row `main` while it serves as the main account. Defaults
+   * to refreshFallbackAccount.
+   */
+  refreshPoolMainRow?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<OAuthAccount>
+  /**
+   * On a migrated install, the pool row behind an account key (`main` is row
+   * `main`) and its usable bearer, refreshed through the pool. Undefined when
+   * the install is not migrated; the legacy slot and roster then apply.
+   */
+  poolAccess?: (accountKey: string) => Promise<PoolResetAccess | undefined>
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
   accountStatePath: string
@@ -312,14 +381,139 @@ function resetTargetNeedsRefresh(
   return !access || !expires || expires - now <= refreshBeforeExpiryMs
 }
 
+/** A pool row as the reset-credit resolver sees it; `row` is absent when no row has the id. */
+export interface PoolResetAccess {
+  row?: {
+    id: string
+    type: 'oauth' | 'api'
+    enabled: boolean
+    label?: string
+    identity?: string
+  }
+  token?: string
+}
+
+/** The reset target for a pool row, or the refusal the legacy resolver gives. */
+function poolResetTarget(
+  accountKey: string,
+  pooled: PoolResetAccess,
+): ResetTargetIdentity {
+  const isMain = accountKey === 'main'
+  const row = pooled.row
+  const noToken = () =>
+    new ResetTargetResolutionError(
+      'token_unavailable',
+      isMain
+        ? 'Main OpenAI account has no usable access token.'
+        : `Fallback account ${accountKey} has no usable access token.`,
+    )
+  if (!row) {
+    if (isMain) throw noToken()
+    throw new ResetTargetResolutionError(
+      'unknown_account',
+      `Fallback account ${accountKey} was not found.`,
+    )
+  }
+  if (!row.enabled) {
+    throw new ResetTargetResolutionError(
+      'disabled_account',
+      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is disabled.`,
+    )
+  }
+  if (row.type !== 'oauth') {
+    throw new ResetTargetResolutionError(
+      'non_oauth_account',
+      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is not an OAuth account.`,
+    )
+  }
+  if (!pooled.token) throw noToken()
+  const claims = parseJwtClaims(pooled.token)
+  return {
+    accountKey,
+    label: isMain ? 'Main account' : (row.label ?? accountKey),
+    accessToken: pooled.token,
+    chatgptAccountId:
+      row.identity ?? (claims ? extractAccountIdFromClaims(claims) : undefined),
+  }
+}
+
 export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
+  // The main account while the slot holds the pool placeholder: the pool row
+  // `main`, refreshed and resolved the way a fallback row is, but reported as
+  // the main account.
+  async function resolvePoolMainTarget(): Promise<ResetTargetIdentity> {
+    const storage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
+    const row = findPoolMainRow(storage)
+    if (!storage || !row) {
+      throw new ResetTargetResolutionError(
+        'token_unavailable',
+        'Main OpenAI account has no usable access token.',
+      )
+    }
+    let resolved = row
+    if (
+      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
+      resetTargetNeedsRefresh(
+        resolved.access,
+        resolved.expires,
+        storage,
+        deps.now(),
+      )
+    ) {
+      resolved = await (deps.refreshPoolMainRow ?? deps.refreshFallbackAccount)(
+        resolved,
+        storage,
+      )
+    }
+    const accessResolution = deps.resolveFallbackAccess
+      ? await deps.resolveFallbackAccess(resolved, storage)
+      : resolved.access
+        ? { token: resolved.access, provenance: 'local' as const }
+        : CUSTODY_REFUSE
+    if (
+      accessResolution === CUSTODY_REFUSE ||
+      accessResolution === CUSTODY_EXCLUDED ||
+      !accessResolution.token
+    ) {
+      throw new ResetTargetResolutionError(
+        'token_unavailable',
+        'Main OpenAI account has no usable access token.',
+      )
+    }
+    const claims = parseJwtClaims(accessResolution.token)
+    return {
+      accountKey: 'main',
+      label: 'Main account',
+      accessToken: accessResolution.token,
+      chatgptAccountId:
+        resolved.accountId ??
+        (claims ? extractAccountIdFromClaims(claims) : undefined),
+      onAuthFailure:
+        accessResolution.provenance === 'local'
+          ? undefined
+          : async (status: number) => {
+              await deps.reportAuthFailure?.({
+                handle: accessResolution.provenance.handle,
+                providerStatus: status,
+                recordVersion: accessResolution.provenance.recordVersion,
+              })
+            },
+    }
+  }
+
   return async (accountKey: string): Promise<ResetTargetIdentity> => {
+    const pooled = await deps.poolAccess?.(accountKey)
+    if (pooled) return poolResetTarget(accountKey, pooled)
     if (accountKey === 'main') {
       const storage = await deps.loadAccounts({
         configPath: deps.accountStoragePath,
         statePath: deps.accountStatePath,
       })
       let auth = await deps.getAuth()
+      if (isPoolMainPlaceholder(auth)) return resolvePoolMainTarget()
       if (auth.type !== 'oauth') {
         throw new ResetTargetResolutionError(
           'non_oauth_account',
@@ -329,7 +523,15 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       if (
         resetTargetNeedsRefresh(auth.access, auth.expires, storage, deps.now())
       ) {
-        auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
+        try {
+          auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
+        } catch (error) {
+          // The slot became the placeholder while this refresh waited.
+          if (error instanceof MainAccountInPoolError) {
+            return resolvePoolMainTarget()
+          }
+          throw error
+        }
       }
       if (!auth.access) {
         throw new ResetTargetResolutionError(
@@ -470,6 +672,47 @@ function cleanAbort(): never {
   throw new Error(HANDLED_SENTINEL)
 }
 
+/**
+ * One write of the top-level settings the loader keeps (the main account's
+ * ChatGPT identity, the main-refresh lease and its backoff). On a migrated
+ * install it goes through the pool store's `updateSettings`, which writes
+ * neither the roster nor the state file; before the migration it is the
+ * legacy store's locked read-modify-write, as it always was.
+ *
+ * `holdsMainRefreshLock`: the caller already holds `main-refresh`, the lock a
+ * settings write otherwise takes alongside the store's own.
+ */
+async function writeLoaderSettings(
+  edit: (current: AccountStorage) => void,
+  options: { holdsMainRefreshLock?: boolean } = {},
+): Promise<void> {
+  const paths = getAccountPaths(getConfigPath())
+  if (poolMigrated(paths.configPath)) {
+    await writeSettings(
+      openAccountPool(paths),
+      options.holdsMainRefreshLock ? undefined : poolSettingsLocks(paths),
+      (settings) => edit(settings as unknown as AccountStorage),
+    )
+    return
+  }
+  await mutateAccounts((current) => {
+    edit(current)
+    return current
+  }, paths)
+}
+
+/** The `/openai` context the latest loader run built, for tests. */
+let menuContextForTest: OpenCodeMenuContext | null = null
+
+/**
+ * Test seam: the context the latest loader run gave the `/openai` menu, so a
+ * test of the loader's live gates (keep-warm, sticky pins) can drive them on
+ * an install the menu itself would not open on.
+ */
+export function __menuContextForTest(): OpenCodeMenuContext | null {
+  return menuContextForTest
+}
+
 function jitterMs(baseMs: number) {
   return Math.floor(Math.random() * baseMs)
 }
@@ -480,7 +723,30 @@ export {
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
 
+// The account-pool migration ships switched off in the release that first
+// understands the migrated layout, so every install runs that release (a safe
+// version to go back to) before any credential moves. The next release turns
+// this on; the version fence then waits for every running process to be on
+// it before migrating.
+const POOL_MIGRATION_ENABLED = false
+
 interface CodexAuthPluginOptions {
+  /**
+   * Test seams for the background account-pool migration and adoption
+   * (`core/pool-lifecycle.ts`): its fence, timers, run functions and
+   * per-run dependencies.
+   */
+  poolMigration?: Partial<
+    Pick<
+      PoolLifecycleDeps,
+      'fence' | 'migrate' | 'adopt' | 'timers' | 'random' | 'runDeps' | 'log'
+    >
+  > & {
+    /** Overrides POOL_MIGRATION_ENABLED, so tests can run the migration. */
+    enabled?: boolean
+  }
+  /** Test seam: timer functions for the background quota poller, so a test can fire its tick. */
+  backgroundQuota?: ConstructorParameters<typeof BackgroundQuotaRefresh>[0]
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
@@ -499,7 +765,7 @@ interface CodexAuthPluginOptions {
     /** Test seam: observes a host-write observation deadline warning. */
     warn?: (message: string) => void
     /** Test seam: observes the account lock around custody binding checks. */
-    withFallbackAccountLock?: CommandContext['withFallbackAccountLock']
+    withFallbackAccountLock?: OpenCodeMenuContext['withFallbackAccountLock']
     /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
     authorize?: {
       browser?: () => Promise<{
@@ -1129,7 +1395,7 @@ export async function CodexAuthPlugin(
   // Command context holder — filled by the auth loader on first run.
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
-  let cmdCtx: CommandContext | null = null
+  let cmdCtx: OpenCodeMenuContext | null = null
   const hostAuth = input.client.auth as unknown as {
     all(): Promise<Record<string, unknown>>
     get(input: { path: { id: string } }): Promise<unknown>
@@ -1138,15 +1404,69 @@ export async function CodexAuthPlugin(
       body: { type: 'oauth'; access: string; refresh: string; expires: number }
     }): Promise<unknown>
   }
-  const ownedCacheKeepManagers = new Map<string, CacheKeepManager>()
-  const ownedRpcServers = new Map<string, RpcServerHandle>()
+  const ownedCacheKeepManagers = new Map<string, OpenAICacheKeepManager>()
+  const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
+  // Sticky-balanced session-to-account pins this process placed and is using,
+  // whose writes may not have reached the sidebar file yet (see
+  // StickyPinOverlayEntry). Kept here rather than in the loader so session
+  // deletion and dispose can reach them.
+  const stickyPinOverlay: StickyPinOverlay = new Map()
+  let stickyPinOverlayFile: string | undefined
+  // Background writer for the sidebar updates requests make (routing display,
+  // pushed quota, sticky pins); the loader installs one per run.
+  let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
   // vendored client and clear the custody tick timer after the loader has
   // returned. Built unconditionally so a custody-disabled process still has
   // a runtime to dispose (no-op tick + close).
   let custodyRuntimeRef: CustodyRuntime | undefined
+  // This instance's entry in the per-process heartbeat directory, written by
+  // the first loader run and dropped on dispose.
+  let processHeartbeat: Promise<ProcessHeartbeatHandle> | undefined
+  // The account pool as the request path's source of accounts once the
+  // install is migrated; the loader installs one per run.
+  let poolAccountSource: PoolAccountSource | undefined
+  // Background account-pool migration and adoption of later host-slot
+  // logins. Needs the host slot's full adapter (get, set and all); a client
+  // without it (some embedders and tests) runs without the pool migration.
+  const { enabled: poolMigrationEnabled, ...poolMigrationDeps } =
+    options.poolMigration ?? {}
+  const poolLifecycle: PoolLifecycle | undefined =
+    (poolMigrationEnabled ?? POOL_MIGRATION_ENABLED) &&
+    typeof (hostAuth as Partial<typeof hostAuth>).get === 'function' &&
+    typeof (hostAuth as Partial<typeof hostAuth>).all === 'function'
+      ? createPoolLifecycle({
+          paths: () => getAccountPaths(getConfigPath()),
+          slot: {
+            get: (request) => hostAuth.get(request),
+            set: (request) => hostAuth.set(request as never),
+            all: () => hostAuth.all(),
+          },
+          version: PackageVersion,
+          ...poolMigrationDeps,
+          // After a migration or an adoption run the pool may hold a row this
+          // process has never polled (or the install just turned migrated).
+          // Re-reading it now starts those first quota polls at once, so an
+          // account is not refused for unknown quota until a request happens
+          // to notice the change. Never awaited by the run.
+          migrate: async (deps) => {
+            const outcome = await (poolMigrationDeps.migrate ?? migrateToPool)(
+              deps,
+            )
+            void poolAccountSource?.load()
+            return outcome
+          },
+          adopt: async (deps) => {
+            const outcome = await (
+              poolMigrationDeps.adopt ?? adoptHostSlotLogin
+            )(deps)
+            void poolAccountSource?.load()
+            return outcome
+          },
+        })
+      : undefined
   // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
   // allowing the runtime path to open a second Claustrum connection.
   const custodyBootstrap: CustodyBootstrap = {}
@@ -1284,17 +1604,13 @@ export async function CodexAuthPlugin(
   // one loader disposing or re-starting never stops or overwrites another's
   // background refresh (a module-level singleton let the last loader win and
   // let any disposal kill the shared poller).
-  const backgroundQuotaRefresh = new BackgroundQuotaRefresh()
+  const backgroundQuotaRefresh = new BackgroundQuotaRefresh(
+    options.backgroundQuota,
+  )
 
   let loaderGetAuth:
     | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
     | undefined
-  const custodyQuotaDepsForAuthMenu: Pick<
-    Parameters<typeof refreshAllQuota>[0],
-    | 'isFallbackRefreshInert'
-    | 'resolveFallbackAccess'
-    | 'reportCustodyAuthFailure'
-  > = {}
   const authMethods = createAuthMethods({
     client: input.client,
     getAuth: async () => loaderGetAuth?.(),
@@ -1311,7 +1627,9 @@ export async function CodexAuthPlugin(
             ),
           }
         : {}),
-      custodyQuotaDeps: custodyQuotaDepsForAuthMenu,
+    },
+    onMainSlotWritten: async () => {
+      await poolLifecycle?.requestAdoption()
     },
   })
   const wrapCustodyAuthorize =
@@ -1346,12 +1664,16 @@ export async function CodexAuthPlugin(
                     ? { access: auth.access, refresh: auth.refresh }
                     : undefined
                 },
-                onObserved: ({ access, refresh }) =>
-                  recordVerifiedInProcessMainLogin({
+                onObserved: ({ access, refresh }) => {
+                  // The host has written this login into its slot; on a
+                  // migrated install it moves into the pool (not awaited).
+                  void poolLifecycle?.requestAdoption()
+                  return recordVerifiedInProcessMainLogin({
                     type: 'oauth',
                     access,
                     refresh,
-                  }),
+                  })
+                },
                 release: () => mutex.release(),
                 warn: (message) =>
                   custodyOptions?.warn?.(message) ??
@@ -1402,14 +1724,17 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      poolLifecycle?.dispose()
+      poolAccountSource?.dispose()
       backgroundQuotaRefresh.stop()
+      sidebarBookkeeping?.stop()
       custodyRuntimeRef?.dispose()
       activeFallbackManager?.stopBackgroundRefresh()
       activeFallbackManager = undefined
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
       const cacheKeepGlobal = globalThis as {
-        __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
+        __openaiAuthCacheKeepManagers?: Map<string, OpenAICacheKeepManager>
       }
       for (const [key, manager] of ownedCacheKeepManagers) {
         if (
@@ -1421,16 +1746,16 @@ export async function CodexAuthPlugin(
       }
       ownedCacheKeepManagers.clear()
 
-      const rpcGlobal = globalThis as {
-        __openaiAuthRpcServers?: Map<string, RpcServerHandle>
-      }
-      for (const [key, rpcServer] of ownedRpcServers) {
-        if (rpcGlobal.__openaiAuthRpcServers?.get(key) === rpcServer) {
-          await rpcServer.stop().catch(() => {})
-          rpcGlobal.__openaiAuthRpcServers.delete(key)
-        }
+      // Release stops a server only while it is still the registered one, so
+      // a replaced instance cannot stop its successor's server.
+      for (const adoption of ownedRpcServers.values()) {
+        await adoption.release().catch(() => {})
       }
       ownedRpcServers.clear()
+
+      const heartbeat = processHeartbeat
+      processHeartbeat = undefined
+      await (await heartbeat)?.release()
     },
     async event(input) {
       if (input.event.type !== 'session.deleted') return
@@ -1440,6 +1765,11 @@ export async function CodexAuthPlugin(
         cmdCtx?.cacheKeepManager?.remove(meta.threadID)
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
+      // A pin still waiting to be written would otherwise land after the
+      // removal below and resurrect the deleted session's entry.
+      const deletedSessionHash = hashSidebarSessionId(info.id)
+      stickyPinOverlay.delete(deletedSessionHash)
+      sidebarBookkeeping?.cancel(`pin:${deletedSessionHash}`)
       if (sidebarStateFileForEvents) {
         const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
           ?.accounts
@@ -1572,6 +1902,15 @@ export async function CodexAuthPlugin(
       provider: 'openai',
       async loader(getAuth) {
         loaderGetAuth = getAuth
+        processHeartbeat ??= startProcessHeartbeat({
+          version: PackageVersion,
+          logger: createLogger('heartbeat'),
+        })
+        await processHeartbeat
+        // The account-pool migration waits for the heartbeat: it is how this
+        // process shows up to another one's version fence. Never awaited
+        // here, and it cannot throw.
+        poolLifecycle?.start()
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
@@ -1618,29 +1957,51 @@ export async function CodexAuthPlugin(
             }
           | undefined
 
+        // The newest store snapshot this loader has read. It is the answer when
+        // a request's read overruns its budget, and what background sidebar
+        // writes describe, so neither has to read the store again.
+        let lastRequestStorage = storage
+
+        // The store read on the request path. An unchanged config file costs
+        // one stat. A changed one is read without any lock (loadAccounts only
+        // reads), waiting at most HOT_PATH_READ_BUDGET_MS before going ahead
+        // with the last snapshot; the read then finishes in the background and
+        // serves the next request. A read that fails within the budget still
+        // fails the request, as an unreadable store always has.
         async function loadRequestAccounts() {
           const path = getConfigPath()
+          let stat: Stats | undefined
           try {
-            const stat = statSync(path)
-            if (
-              requestStorageCache?.path === path &&
-              requestStorageCache.mtimeMs === stat.mtimeMs &&
-              requestStorageCache.size === stat.size
-            ) {
-              return requestStorageCache.storage
-            }
-            const next = await loadAccounts(getAccountPaths(path))
-            requestStorageCache = {
-              path,
-              mtimeMs: stat.mtimeMs,
-              size: stat.size,
-              storage: next,
-            }
-            return next
+            stat = statSync(path)
           } catch {
-            requestStorageCache = undefined
-            return loadAccounts(getAccountPaths(path))
+            stat = undefined
           }
+          if (
+            stat &&
+            requestStorageCache?.path === path &&
+            requestStorageCache.mtimeMs === stat.mtimeMs &&
+            requestStorageCache.size === stat.size
+          ) {
+            return requestStorageCache.storage
+          }
+          if (!stat) requestStorageCache = undefined
+          const read = loadAccounts(getAccountPaths(path)).then((next) => {
+            if (stat) {
+              requestStorageCache = {
+                path,
+                mtimeMs: stat.mtimeMs,
+                size: stat.size,
+                storage: next,
+              }
+            }
+            lastRequestStorage = next
+            return next
+          })
+          return settleWithinBudget(
+            read,
+            HOT_PATH_READ_BUDGET_MS,
+            () => lastRequestStorage,
+          )
         }
 
         function invalidateRequestStorageCache() {
@@ -1662,10 +2023,9 @@ export async function CodexAuthPlugin(
             // Authoritative RMW: a stale saveAccounts here would union this
             // loader's snapshot back over disk and could resurrect a
             // concurrently-removed account (and its secrets in the state file).
-            await mutateAccounts((current) => {
+            await writeLoaderSettings((current) => {
               current.mainAccountId = liveAccountId
-              return current
-            }, getAccountPaths(getConfigPath()))
+            })
             storage.mainAccountId = liveAccountId
             invalidateRequestStorageCache()
           }
@@ -1701,6 +2061,74 @@ export async function CodexAuthPlugin(
         })
         let currentMainIdentity: string | undefined
         let mainIdentityGeneration = 0
+
+        // On a migrated install (the slot holds the pool placeholder and the
+        // config carries `openaiAuthPool.migratedAt`) requests are served from
+        // the account pool through this source; see core/pool-request.ts. On
+        // any other install it only reads the config once here and stays
+        // idle. The first read is awaited because the loader is not the
+        // request path; it also starts every row's first quota poll.
+        poolAccountSource?.dispose()
+        const poolSource = new PoolAccountSource({
+          paths: () => getAccountPaths(getConfigPath()),
+          refreshProvider: async (credential) => {
+            const tokens = await codexRefreshFn({
+              refreshToken: credential.refresh,
+              fetchImpl: fetch,
+              now: Date.now,
+            })
+            const identity = extractAccountId({
+              id_token: '',
+              access_token: tokens.access,
+              refresh_token: tokens.refresh,
+            })
+            return { ...tokens, ...(identity ? { identity } : {}) }
+          },
+          pullQuota: async (request) => {
+            const credential = request.credential
+            if (credential.type !== 'oauth' || !credential.access)
+              throw new Error('the row holds no access token to poll with')
+            const snapshot = await whamUsageFn({
+              accessToken: credential.access,
+              fetchImpl: fetch,
+              now: Date.now,
+              ...(request.identity ? { accountId: request.identity } : {}),
+              accountKey: request.id,
+              logger: logQ,
+            })
+            // The pool's quota map keeps the windows and the credit budget
+            // but not the reset-credit count, which only this poll reports.
+            // The in-memory quota cache keeps the whole reading, the way a
+            // legacy poll leaves it, for the sidebar's reset credits and the
+            // reset-credit routing tie-break.
+            const checkedAt = Date.now()
+            const entry = {
+              quota: snapshot,
+              refreshAfter: checkedAt + 5 * 60 * 1000,
+              checkedAt,
+            }
+            if (request.id === 'main') {
+              quotaManager.setMain(
+                credential.access,
+                entry,
+                request.identity,
+                true,
+              )
+            } else {
+              quotaManager.setFallback(
+                request.id,
+                entry,
+                credential.access,
+                true,
+                request.identity,
+              )
+            }
+            return observationFromSnapshot(snapshot, checkedAt, true)
+          },
+          log: createLogger('pool'),
+        })
+        poolAccountSource = poolSource
+        await poolSource.load()
         const fallbackManager = new FallbackAccountManager({
           paths: getAccountPaths(getConfigPath()),
           refreshFn: (opts) =>
@@ -1712,6 +2140,9 @@ export async function CodexAuthPlugin(
           quotaManager,
           custody: { readManifest: readCustodyManifest },
           onFallbackStorageChanged: invalidateRequestStorageCache,
+          // On a migrated install the roster rows are pool rows, which the
+          // pool source refreshes; this background refresh must not.
+          backgroundRefreshPaused: () => poolSource.active(),
         })
         // -------------------------------------------------------------------
         // Custody runtime — vendored client, cache, completion sweep, tick.
@@ -1743,10 +2174,9 @@ export async function CodexAuthPlugin(
                 servedMainAccountId &&
                 servedMainAccountId !== storage?.mainAccountId
               ) {
-                await mutateAccounts((current) => {
+                await writeLoaderSettings((current) => {
                   current.mainAccountId = servedMainAccountId
-                  return current
-                }, getAccountPaths(getConfigPath()))
+                })
                 if (storage) storage.mainAccountId = servedMainAccountId
                 custodyBootstrap.mainAccountId = servedMainAccountId
                 invalidateRequestStorageCache()
@@ -1860,11 +2290,6 @@ export async function CodexAuthPlugin(
             recordVersion: params.recordVersion,
           })
         }
-        Object.assign(custodyQuotaDepsForAuthMenu, {
-          isFallbackRefreshInert: isFallbackAccountRefreshInert,
-          resolveFallbackAccess: resolveAccountAccessForCustody,
-          reportCustodyAuthFailure: reportAuthFailureForCustody,
-        })
         function buildRefreshAllQuotaDeps(
           overrides: Partial<
             Pick<
@@ -1878,7 +2303,7 @@ export async function CodexAuthPlugin(
           return {
             getAuth,
             codexRefreshFn,
-            refreshMainWithLease,
+            refreshMainWithLease: refreshMainToken,
             fallbackManager,
             quotaManager,
             loadAccounts,
@@ -1903,14 +2328,46 @@ export async function CodexAuthPlugin(
           }
         }
 
+        // A manual quota check on a migrated install (the `/openai` menu's quota check, the
+        // reset command's precondition): polls the named rows, or every row,
+        // through the pool source, in the result shape the commands report.
+        async function pollPoolRows(
+          ids?: readonly string[],
+        ): Promise<RefreshAllQuotaResult[]> {
+          const results = await poolSource.pollRows(
+            await loadAccounts(getAccountPaths(getConfigPath())),
+            ids ? { ids } : {},
+          )
+          return results.map((result) => ({
+            account: result.id,
+            ok: result.ok,
+            ...(result.error !== undefined ? { error: result.error } : {}),
+          }))
+        }
+
+        // The bearer for one pool row outside a request (cachekeep, reset
+        // credits): refreshed through the pool source when due, never through
+        // the legacy per-account refresh or the host slot.
+        async function poolRowAccess(id: string) {
+          return poolSource.accessFor(
+            id,
+            await loadAccounts(getAccountPaths(getConfigPath())),
+          )
+        }
+
         // -------------------------------------------------------------------
         // CacheKeepManager — prompt-cache warmer for idle main-agent sessions
         // -------------------------------------------------------------------
         const cacheKeepLogger = createLogger('cachekeep')
-        let cacheKeepEnabled = storage?.cachekeep?.enabled === true
-        let cacheKeepSubagents = storage?.cachekeep?.subagents === true
-        let cacheKeepSustain = storage?.cachekeep?.sustain === true
-        let cacheKeepWindow = getCacheKeepWindow(storage)
+        // Read under either name: a migrated install renames `cachekeep` to
+        // `cacheKeep` on its first settings write.
+        const storedCacheKeep = cacheKeepSettings(storage)
+        let cacheKeepEnabled = storedCacheKeep?.enabled === true
+        let cacheKeepSubagents = storedCacheKeep?.subagents === true
+        let cacheKeepSustain = storedCacheKeep?.sustain === true
+        let cacheKeepWindow = getCacheKeepWindow(
+          storage ? { ...storage, cachekeep: storedCacheKeep } : storage,
+        )
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
           | undefined
@@ -1950,14 +2407,15 @@ export async function CodexAuthPlugin(
         async function updateMainRefreshState(
           update: (storage: AccountStorage) => void,
         ) {
-          // Authoritative RMW under the store lock so persisting the main-refresh
-          // lease can never union a stale account list back over disk (which
-          // would resurrect a concurrently-removed account's secrets in state).
-          await mutateAccounts((current) => {
-            current.refresh = current.refresh ?? {}
-            update(current)
-            return current
-          }, getAccountPaths(getConfigPath()))
+          // Every caller holds `main-refresh` already, so the write must not
+          // take it again.
+          await writeLoaderSettings(
+            (current) => {
+              current.refresh = current.refresh ?? {}
+              update(current)
+            },
+            { holdsMainRefreshLock: true },
+          )
           invalidateRequestStorageCache()
         }
 
@@ -1976,6 +2434,9 @@ export async function CodexAuthPlugin(
               ),
             )
             const latest = await getAuth()
+            // Main moved into the account pool while this process waited.
+            if (isPoolMainPlaceholder(latest))
+              throw new MainAccountInPoolError()
             if (latest.type !== 'oauth' || !latest.access) continue
             const changed =
               latest.access !== previous.access ||
@@ -1998,38 +2459,53 @@ export async function CodexAuthPlugin(
           return null
         }
 
+        // The refresh token in a slot value, or a throw when the value must not
+        // be refreshed: the pool placeholder (main lives in the pool row), a
+        // custody tombstone, or a slot with no refresh token.
+        function refreshableMainToken(auth: {
+          type: string
+          access?: string
+          refresh?: string
+          expires?: number
+        }): string {
+          if (isPoolMainPlaceholder(auth)) throw new MainAccountInPoolError()
+          if (auth.type !== 'oauth') throw new Error('not oauth')
+          if (
+            tombstoned(
+              {
+                id: 'main',
+                type: 'oauth',
+                access: auth.access ?? '',
+                refresh: auth.refresh ?? '',
+                expires: auth.expires ?? 0,
+                addedAt: 0,
+              },
+              CUSTODY_OWNING_PROVIDER,
+            )
+          ) {
+            throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
+          }
+          if (!auth.refresh) {
+            throw new Error('Token refresh failed: missing refresh token')
+          }
+          return auth.refresh
+        }
+
         async function refreshMainWithLease() {
           if (!mainRefreshPromise) {
             mainRefreshPromise = (async () => {
               const freshAuth = await getAuth()
+              const freshRefresh = refreshableMainToken(freshAuth)
               if (freshAuth.type !== 'oauth') throw new Error('not oauth')
-              if (
-                tombstoned(
-                  {
-                    id: 'main',
-                    type: 'oauth',
-                    access: freshAuth.access ?? '',
-                    refresh: freshAuth.refresh ?? '',
-                    expires: freshAuth.expires ?? 0,
-                    addedAt: 0,
-                  },
-                  CUSTODY_OWNING_PROVIDER,
-                )
-              ) {
-                throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
-              }
-              if (!freshAuth.refresh) {
-                throw new Error('Token refresh failed: missing refresh token')
-              }
 
-              const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
+              const freshTokenHash = hashRefreshToken(freshRefresh)
               const latestStorage = await loadAccounts(
                 getAccountPaths(getConfigPath()),
               )
               const mainError = latestStorage?.refresh?.mainLastRefreshError
               if (
                 mainError &&
-                refreshBackoffActive(mainError, freshAuth.refresh, Date.now())
+                refreshBackoffActive(mainError, freshRefresh, Date.now())
               ) {
                 throw new Error(
                   formatRefreshBackoffMessage(mainError, Date.now()),
@@ -2040,7 +2516,7 @@ export async function CodexAuthPlugin(
                 latestStorage?.refresh?.mainRefreshLeaseUntil &&
                 latestStorage.refresh.mainRefreshLeaseUntil > Date.now() &&
                 latestStorage.refresh.mainRefreshLeaseTokenHash ===
-                  refreshTokenHash
+                  freshTokenHash
               ) {
                 const concurrent = await waitForConcurrentMainRefresh(freshAuth)
                 if (concurrent) return concurrent
@@ -2059,10 +2535,75 @@ export async function CodexAuthPlugin(
                 throw new Error('Codex OAuth refresh is already in progress')
               }
 
+              // Read the slot again now that the lock is held. Everything
+              // above ran unlocked, so another process may since have rotated
+              // the token (refreshing the one read earlier would spend a
+              // refresh token that is already spent) or moved main into the
+              // account pool (the slot then holds only the placeholder).
+              let current: {
+                access?: string
+                refresh: string
+                expires?: number
+              }
+              try {
+                const underLock = await getAuth()
+                const underLockRefresh = refreshableMainToken(underLock)
+                if (underLock.type !== 'oauth') throw new Error('not oauth')
+                if (underLockRefresh !== freshRefresh) {
+                  if (
+                    underLock.access &&
+                    (underLock.expires ?? 0) > Date.now()
+                  ) {
+                    logR.debug('main token rotated while awaiting the lock', {
+                      pid: process.pid,
+                    })
+                    await fileLock.release().catch(() => {})
+                    return {
+                      access: underLock.access,
+                      refresh: underLockRefresh,
+                      expires: underLock.expires ?? 0,
+                    }
+                  }
+                  const storageNow = await loadAccounts(
+                    getAccountPaths(getConfigPath()),
+                  )
+                  const currentError = storageNow?.refresh?.mainLastRefreshError
+                  if (
+                    currentError &&
+                    refreshBackoffActive(
+                      currentError,
+                      underLockRefresh,
+                      Date.now(),
+                    )
+                  ) {
+                    throw new Error(
+                      formatRefreshBackoffMessage(currentError, Date.now()),
+                    )
+                  }
+                }
+                current = { ...underLock, refresh: underLockRefresh }
+              } catch (error) {
+                await fileLock.release().catch(() => {})
+                throw error
+              }
+
+              const refreshTokenHash = hashRefreshToken(current.refresh)
               const leaseId = crypto.randomUUID()
               let leaseTokenHash: string | undefined = refreshTokenHash
               try {
                 await updateMainRefreshState((nextStorage) => {
+                  // Checked in the same locked write that sets the lease:
+                  // either the migration's pending record was written first
+                  // and this refresh never starts, or this lease was, and
+                  // the migration sees it and plans again (see the
+                  // lock-order note in core/pool-migration.ts).
+                  if (
+                    poolTransferPendingInConfigFile(
+                      getConfigPath(),
+                      current.refresh,
+                    )
+                  )
+                    throw new PoolTransferPendingError()
                   nextStorage.refresh = nextStorage.refresh ?? {}
                   nextStorage.refresh.mainRefreshLeaseId = leaseId
                   nextStorage.refresh.mainRefreshLeaseUntil =
@@ -2083,7 +2624,7 @@ export async function CodexAuthPlugin(
                 }
 
                 const tokens = await codexRefreshFn({
-                  refreshToken: freshAuth.refresh,
+                  refreshToken: current.refresh,
                   fetchImpl: fetch,
                   now: Date.now,
                 })
@@ -2100,19 +2641,21 @@ export async function CodexAuthPlugin(
                 leaseTokenHash = undefined
                 return tokens
               } catch (error) {
-                if (freshAuth.refresh && !isAuthPersistError(error)) {
-                  await updateMainRefreshState((nextStorage) => {
-                    nextStorage.refresh = nextStorage.refresh ?? {}
-                    nextStorage.refresh.mainLastRefreshError =
-                      buildRefreshOperationError({
-                        error,
-                        now: Date.now(),
-                        refreshToken: freshAuth.refresh ?? '',
-                        previous: nextStorage.refresh.mainLastRefreshError,
-                      })
-                  }).catch(() => {})
+                if (!(error instanceof PoolTransferPendingError)) {
+                  if (!isAuthPersistError(error)) {
+                    await updateMainRefreshState((nextStorage) => {
+                      nextStorage.refresh = nextStorage.refresh ?? {}
+                      nextStorage.refresh.mainLastRefreshError =
+                        buildRefreshOperationError({
+                          error,
+                          now: Date.now(),
+                          refreshToken: current.refresh,
+                          previous: nextStorage.refresh.mainLastRefreshError,
+                        })
+                    }).catch(() => {})
+                  }
+                  throw error
                 }
-                throw error
               } finally {
                 if (leaseTokenHash) {
                   await updateMainRefreshState((nextStorage) => {
@@ -2129,27 +2672,96 @@ export async function CodexAuthPlugin(
                 }
                 await fileLock.release().catch(() => {})
               }
+              // Reached only when a pool transfer covers this token: nothing
+              // was sent, the lock is released (the migration needs it to
+              // write the placeholder), and this waits for the slot to
+              // change. The placeholder there ends the wait with
+              // MainAccountInPoolError, which callers serve from row `main`.
+              const concurrent = await waitForConcurrentMainRefresh(current)
+              if (concurrent) return concurrent
+              throw new Error('Codex OAuth refresh is already in progress')
             })().finally(() => {
               mainRefreshPromise = undefined
             })
           }
           return mainRefreshPromise
         }
+
+        // The main account's credential while the slot holds the pool
+        // placeholder: the pool row `main`, refreshed through the per-row
+        // refresh path. Undefined when that row has no usable token.
+        function resolvePooledMain(
+          currentStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): Promise<PoolMainAccess | undefined> {
+          return resolvePoolMainAccess({
+            storage: currentStorage,
+            now: Date.now,
+            isRefreshInert: isFallbackAccountRefreshInert,
+            refreshAccount: (account, accountStorage) =>
+              fallbackManager.refreshAccount(account, accountStorage, {
+                asPoolMain: true,
+              }),
+            resolveAccess: resolveAccountAccessForCustody,
+            warn: (message, meta) =>
+              logR.warn(message, { pid: process.pid, ...meta }),
+          })
+        }
+
+        async function pooledMainTokens() {
+          const pooled = await resolvePooledMain(
+            await loadAccounts(getAccountPaths(getConfigPath())),
+          )
+          if (!pooled) {
+            throw new Error(
+              'The main OpenAI account has no usable token in the account pool',
+            )
+          }
+          return {
+            access: pooled.token,
+            refresh: pooled.account.refresh,
+            expires: pooled.account.expires ?? 0,
+          }
+        }
+
+        // refreshMainWithLease for callers that only need a working main
+        // token: when main turns out to live in the pool, the pool row's
+        // token is returned instead of an error.
+        async function refreshMainToken() {
+          try {
+            return await refreshMainWithLease()
+          } catch (error) {
+            if (error instanceof MainAccountInPoolError) {
+              return pooledMainTokens()
+            }
+            throw error
+          }
+        }
         const cacheKeepGlobal = globalThis as {
-          __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
+          __openaiAuthCacheKeepManagers?: Map<string, OpenAICacheKeepManager>
         }
         const cacheKeepManagers =
           cacheKeepGlobal.__openaiAuthCacheKeepManagers ?? new Map()
         cacheKeepGlobal.__openaiAuthCacheKeepManagers = cacheKeepManagers
         cacheKeepManagers.get(cacheKeepKey)?.stop()
-        const cacheKeepManager = new CacheKeepManager({
+        const cacheKeepManager = createCacheKeepManager({
           fetchImpl: fetch,
           getMainToken: async () => {
+            // A migrated install's main account is the pool row `main`; the
+            // slot is never read for it.
+            if (await poolSource.active()) {
+              const access = await poolRowAccess('main')
+              if (!access) throw new Error('main pool row has no usable token')
+              return access.token
+            }
             const auth = await getAuth()
+            // Main lives in the pool row; the placeholder is never refreshed.
+            if (isPoolMainPlaceholder(auth)) {
+              return (await pooledMainTokens()).access
+            }
             if (auth.type !== 'oauth') throw new Error('not oauth')
             if (!auth.access || (auth.expires ?? 0) < Date.now()) {
               try {
-                return (await refreshMainWithLease()).access
+                return (await refreshMainToken()).access
               } catch (error) {
                 if (isAuthPersistError(error)) throw error
                 if (auth.access) return auth.access
@@ -2159,6 +2771,12 @@ export async function CodexAuthPlugin(
             return auth.access
           },
           refreshFallback: async (accountId: string) => {
+            if (await poolSource.active()) {
+              // The warmed request recorded the pool row that served it.
+              const access = await poolRowAccess(accountId)
+              if (!access) throw new Error(`no access token for ${accountId}`)
+              return { token: access.token }
+            }
             const fbStorage = await loadRequestAccounts()
             const account = fbStorage
               ? findCachekeepFallbackAccount(fbStorage.accounts, accountId)
@@ -2199,15 +2817,33 @@ export async function CodexAuthPlugin(
             }
           },
           codexResponsesUrl: codexApiEndpoint,
+          // The account the session routes to now: a session moved to another
+          // account is not warmed on the one it left. This process's sticky
+          // pins that are not saved yet are applied, as the router applies
+          // them, so a warm follows the same account choice as a request.
+          activeAccount: async (routingSessionId) =>
+            routedAccountForSession(
+              applyStickyPinOverlay(
+                await sidebarCache.read(),
+                stickyPinOverlay,
+              ),
+              routingSessionId,
+            ),
           logger: cacheKeepLogger,
           now: Date.now,
+          // Read on every call, so changes from the `/openai` Cache section apply live.
           getWindow: () => cacheKeepWindow,
           getSustain: () => cacheKeepSustain,
         })
         cacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
         ownedCacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
 
-        async function pushQuota(
+        // Records a quota snapshot from a response or a WebSocket frame. The
+        // in-memory quota cache, which every routing decision reads, is updated
+        // before this returns; the sidebar copy is written in the background.
+        // Never throws, so the WebSocket frame handler and the request path can
+        // call it without guarding.
+        function pushQuota(
           snapshot: Record<string, unknown>,
           accessToken: string,
           accountId?: string,
@@ -2215,7 +2851,31 @@ export async function CodexAuthPlugin(
           // policy read survives a token refresh but still drops on a switch.
           mainAccountIdentity?: string,
           completeSnapshot = false,
-        ) {
+        ): void {
+          try {
+            recordPushedQuota(
+              snapshot,
+              accessToken,
+              accountId,
+              mainAccountIdentity,
+              completeSnapshot,
+            )
+          } catch (error) {
+            logQ.warn('quota push failed', {
+              pid: process.pid,
+              accountId: accountId ?? 'main',
+              error: errorMessage(error),
+            })
+          }
+        }
+
+        function recordPushedQuota(
+          snapshot: Record<string, unknown>,
+          accessToken: string,
+          accountId: string | undefined,
+          mainAccountIdentity: string | undefined,
+          completeSnapshot: boolean,
+        ): void {
           if (Object.keys(snapshot).length === 0 && !completeSnapshot) return
           const now = Date.now()
           const quota = snapshot as OAuthQuotaSnapshot
@@ -2292,14 +2952,29 @@ export async function CodexAuthPlugin(
             accountId: accountId ?? 'main',
             snapshot: entry.quota,
           })
-          const latestStorage = await loadRequestAccounts()
-          await writeMachineSidebarState(
-            quotaManager,
-            latestStorage,
-            accountId && accountId !== 'main'
-              ? latestStorage?.mainAccountId
-              : resolvedMainIdentity,
+          // On a migrated install the account pool is where routing reads
+          // quota: record the same snapshot against the row that served it
+          // (`main` for the main bucket). A no-op on any other install.
+          poolSource.recordSnapshot(
+            accountId && accountId !== 'main' ? accountId : 'main',
+            snapshot,
+            accessToken,
+            completeSnapshot,
           )
+          const fallbackPush = Boolean(accountId && accountId !== 'main')
+          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () => {
+            // The sidebar state is built when this queued write starts (and
+            // again on a retry), from the in-memory quota cache and the
+            // newest account-store snapshot at that moment.
+            const latestStorage = lastRequestStorage
+            return writeMachineSidebarState(
+              quotaManager,
+              latestStorage,
+              fallbackPush
+                ? latestStorage?.mainAccountId
+                : resolvedMainIdentity,
+            )
+          })
         }
 
         // The pure resolver prefers an admission error's explicit reset and
@@ -2331,7 +3006,7 @@ export async function CodexAuthPlugin(
               // connection's own account, not the shared mutable globals.
               onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
                 const isMainBucket = !accountId || accountId === 'main'
-                void pushQuota(
+                pushQuota(
                   s,
                   accessToken,
                   accountId,
@@ -2360,6 +3035,7 @@ export async function CodexAuthPlugin(
                   explicitResetAt,
                 )
                 quotaManager.markRateLimited(accountKey, resetAt)
+                poolSource.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
                   accountId: accountKey,
@@ -2392,6 +3068,24 @@ export async function CodexAuthPlugin(
           store: Awaited<ReturnType<typeof loadAccounts>>,
           mainAccountIdentity = store?.mainAccountId,
         ) {
+          // A migrated install's accounts are the pool's rows: row `main` is
+          // the main account and the rest follow in roster order, with the
+          // quota the pool holds for each.
+          const pool = await poolSource.current()
+          if (pool.active) {
+            await setSidebarMachineState(
+              buildPoolSidebarMachineState(
+                pool.rows,
+                store,
+                Date.now(),
+                (id) =>
+                  (id === 'main' ? qm.getMain() : qm.getFallback(id))?.quota
+                    ?.resetCreditsAvailable,
+              ),
+              boundSidebarFile,
+            )
+            return
+          }
           if (!store) return
           await setSidebarMachineState(
             buildSidebarMachineState(
@@ -2414,35 +3108,79 @@ export async function CodexAuthPlugin(
           return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 
-        async function writeRequestSidebarRouting(
+        // -------------------------------------------------------------------
+        // Request-path sidebar access. The sidebar file is bookkeeping, so the
+        // request path never waits on its lock: reads come from a cache (one
+        // stat when unchanged, see createSidebarStateCache) and every write is
+        // handed to a background queue that logs a failure once and retries it
+        // until it lands. After a write lands the cache is refreshed so the
+        // next request starts warm.
+        // -------------------------------------------------------------------
+        const sidebarCache = createSidebarStateCache(boundSidebarFile)
+        // Warm the cache so the first request normally finds it filled. A
+        // request that still finds it empty does one bounded lock-free read.
+        void sidebarCache.read()
+        sidebarBookkeeping?.stop()
+        const sidebarBookkeepingQueue = createSidebarBookkeepingQueue({
+          logger: logT,
+          onWritten: () => sidebarCache.refreshInBackground(),
+        })
+        sidebarBookkeeping = sidebarBookkeepingQueue
+        if (stickyPinOverlayFile !== boundSidebarFile) {
+          // Session-to-account pins belong to one sidebar file; clear them when
+          // this loader is bound to a different file.
+          stickyPinOverlay.clear()
+          stickyPinOverlayFile = boundSidebarFile
+        }
+
+        // Records which account served a request, for the sidebar display.
+        // Returns at once; the writes run in the background. `stickyState` is
+        // the request's sidebar snapshot with this process's session-to-account
+        // pins applied, so sticky mode can show a parent session's own pin.
+        function queueRequestSidebarRouting(
           sessionId: string | undefined,
           parentSessionId: string | undefined,
           activeId: string,
           route: RoutingMode,
           accounts: readonly { id: string; enabled?: boolean }[] | undefined,
-        ) {
+          stickyState: SidebarState,
+        ): void {
           const input = { activeId, route, updatedAt: Date.now() }
-          if (sessionId) {
-            await upsertSidebarActiveRouting(
-              { sessionId, ...input },
-              accounts,
-              boundSidebarFile,
+          if (!sessionId) {
+            sidebarBookkeepingQueue.enqueue('routing:legacy', 'routing', () =>
+              setSidebarLegacyRouting(input, boundSidebarFile),
             )
-            if (parentSessionId && parentSessionId !== sessionId) {
-              if (route === 'sticky-balanced') {
-                const parentPinnedId = (await getSidebarState(boundSidebarFile))
-                  .stickyAssignments?.[hashSidebarSessionId(parentSessionId)]
-                  ?.accountId
-                const parentPinIsUsable =
-                  accounts === undefined ||
-                  parentPinnedId === 'main' ||
-                  accounts.some(
-                    (account) =>
-                      account.enabled !== false &&
-                      account.id === parentPinnedId,
-                  )
-                if (!parentPinnedId || !parentPinIsUsable) return
-                await upsertSidebarActiveRouting(
+            return
+          }
+          sidebarBookkeepingQueue.enqueue(
+            `routing:${sessionId}`,
+            'routing',
+            () =>
+              upsertSidebarActiveRouting(
+                { sessionId, ...input },
+                accounts,
+                boundSidebarFile,
+              ),
+          )
+          if (!parentSessionId || parentSessionId === sessionId) return
+          if (route === 'sticky-balanced') {
+            const parentPinnedId =
+              stickyState.stickyAssignments?.[
+                hashSidebarSessionId(parentSessionId)
+              ]?.accountId
+            const parentPinIsUsable =
+              accounts === undefined ||
+              parentPinnedId === 'main' ||
+              accounts.some(
+                (account) =>
+                  account.enabled !== false && account.id === parentPinnedId,
+              )
+            if (!parentPinnedId || !parentPinIsUsable) return
+            sidebarBookkeepingQueue.enqueue(
+              `routing:${parentSessionId}`,
+              'routing',
+              () =>
+                upsertSidebarActiveRouting(
                   {
                     sessionId: parentSessionId,
                     activeId: parentPinnedId,
@@ -2451,18 +3189,20 @@ export async function CodexAuthPlugin(
                   },
                   accounts,
                   boundSidebarFile,
-                )
-                return
-              }
-              await upsertSidebarActiveRouting(
+                ),
+            )
+            return
+          }
+          sidebarBookkeepingQueue.enqueue(
+            `routing:${parentSessionId}`,
+            'routing',
+            () =>
+              upsertSidebarActiveRouting(
                 { sessionId: parentSessionId, ...input },
                 accounts,
                 boundSidebarFile,
-              )
-            }
-            return
-          }
-          await setSidebarLegacyRouting(input, boundSidebarFile)
+              ),
+          )
         }
 
         // -------------------------------------------------------------------
@@ -2473,12 +3213,20 @@ export async function CodexAuthPlugin(
           accountId: string,
           action: () => Promise<T>,
         ): Promise<T> => {
-          const lock = await acquireRefreshFileLock({
-            name: fallbackRefreshLockName(accountId),
-            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-            path: getConfigPath(),
-            renew: true,
-          })
+          // A refresh of the row may hold the lock for a moment; wait for it
+          // as long as a store write would before giving up.
+          const deadline = Date.now() + POOL_LOCK_DEFAULTS.timeoutMs
+          let lock: Awaited<ReturnType<typeof acquireRefreshFileLock>> = null
+          for (;;) {
+            lock = await acquireRefreshFileLock({
+              name: fallbackRefreshLockName(accountId),
+              ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+              path: getConfigPath(),
+              renew: true,
+            })
+            if (lock || Date.now() >= deadline) break
+            await new Promise((resolve) => setTimeout(resolve, 50))
+          }
           if (!lock) throw new Error('Fallback account lock unavailable')
           try {
             return await action()
@@ -2539,16 +3287,46 @@ export async function CodexAuthPlugin(
         }
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
-        cmdCtx = {
-          accountStoragePath: getConfigPath(),
-          accountStatePath: getAccountStatePath(getConfigPath()),
+        const menuPaths = getAccountPaths(getConfigPath())
+        cmdCtx = menuContextForTest = {
+          accountStoragePath: menuPaths.configPath,
+          accountStatePath: menuPaths.statePath,
           packageVersion: PackageVersion,
           quotaManager,
           loadAccounts,
-          client: input.client as CommandContext['client'],
           beginAccountLogin,
           withFallbackAccountLock,
           checkUsableCustodyBinding,
+          // The files this loader run serves, fixed now: the menu works on
+          // them even if another project's run changes the environment.
+          store: () => openAccountPool(menuPaths),
+          // The menu needs the pool; until the install has migrated it shows
+          // only what holds the move back (the version fence's blockers).
+          migration: async () => {
+            if (
+              (await migratedPoolRows(
+                menuPaths,
+                openAccountPool(menuPaths),
+              )) !== undefined
+            )
+              return { migrated: true }
+            const fence = await (
+              poolMigrationDeps.fence ??
+              (() => migrationFenceOpen({ currentVersion: PackageVersion }))
+            )()
+            return {
+              migrated: false,
+              blockers: fence.open
+                ? []
+                : fence.blockers.map((blocker) => ({
+                    pid: blocker.pid,
+                    version: blocker.version,
+                  })),
+            }
+          },
+          // Re-read the pool after a change, so requests route across the
+          // changed rows at once and a newly added row gets its first poll.
+          afterWrite: () => poolSource.load(),
           enterClaustrumMode: async () => {
             const current = await loadAccounts(getAccountPaths(getConfigPath()))
             const accountIds = (current?.accounts ?? [])
@@ -2675,6 +3453,15 @@ export async function CodexAuthPlugin(
             refreshMainWithLease,
             refreshFallbackAccount: (account, currentStorage) =>
               fallbackManager.refreshAccount(account, currentStorage),
+            refreshPoolMainRow: (account, currentStorage) =>
+              fallbackManager.refreshAccount(account, currentStorage, {
+                asPoolMain: true,
+              }),
+            poolAccess: async (accountKey) =>
+              poolSource.rowAccess(
+                accountKey,
+                await loadAccounts(getAccountPaths(getConfigPath())),
+              ),
             loadAccounts,
             accountStoragePath: getConfigPath(),
             accountStatePath: getAccountStatePath(getConfigPath()),
@@ -2697,20 +3484,51 @@ export async function CodexAuthPlugin(
           setCacheKeepWindow: (window) => {
             cacheKeepWindow = window
           },
-          clearStickyRouting: (sessionId) =>
-            clearSidebarStickyAssignment(sessionId, boundSidebarFile),
+          clearStickyRouting: async (sessionId) => {
+            // Drop this process's copy first so neither the next request nor a
+            // pending retry can put the pin back after the file is cleared.
+            const sessionHash = hashSidebarSessionId(sessionId)
+            const hadLocalPin = stickyPinOverlay.delete(sessionHash)
+            sidebarBookkeepingQueue.cancel(`pin:${sessionHash}`)
+            const removedFromFile = await clearSidebarStickyAssignment(
+              sessionId,
+              boundSidebarFile,
+            )
+            return removedFromFile || hadLocalPin
+          },
           getStickyRouting: async (sessionId) =>
             resolveSessionStickyAccount(
-              await getSidebarState(boundSidebarFile),
+              applyStickyPinOverlay(
+                await sidebarCache.read(),
+                stickyPinOverlay,
+              ),
               sessionId,
             ),
           refreshSidebar: async () => {
             const store = await loadAccounts(getAccountPaths(getConfigPath()))
             await writeMachineSidebarState(quotaManager, store)
           },
-          refreshAllQuota: async () =>
-            refreshAllQuota(buildRefreshAllQuotaDeps()),
+          // On a migrated install every row is polled through the pool
+          // source, the same path its background poll takes.
+          refreshAllQuota: async () => {
+            if (await poolSource.active()) {
+              const results = await pollPoolRows()
+              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              return results
+            }
+            return refreshAllQuota(buildRefreshAllQuotaDeps())
+          },
           refreshResetTargetQuota: async (accountKey) => {
+            if (await poolSource.active()) {
+              const [result] = await pollPoolRows([accountKey])
+              return (
+                result ?? {
+                  account: accountKey,
+                  ok: false,
+                  error: 'targeted quota refresh returned no result',
+                }
+              )
+            }
             const results = await refreshAllQuota(
               buildRefreshAllQuotaDeps({ respectBackoff: false }),
               { accountKey },
@@ -2725,40 +3543,29 @@ export async function CodexAuthPlugin(
           },
         }
 
-        let rpcServer: RpcServerHandle | null = null
         if (rpcDir) {
-          const rpcGlobal = globalThis as {
-            __openaiAuthRpcServers?: Map<string, RpcServerHandle>
-          }
-          const rpcServers = rpcGlobal.__openaiAuthRpcServers ?? new Map()
-          rpcGlobal.__openaiAuthRpcServers = rpcServers
-          const existingRpcServer = rpcServers.get(rpcDir.dir)
-          if (existingRpcServer) {
-            await existingRpcServer.stop().catch(() => {})
-            rpcServers.delete(rpcDir.dir)
-          }
+          const activeRpcDir = rpcDir
           try {
-            rpcServer = await startRpcServer({
-              dir: rpcDir.dir,
-              secureDir: rpcDir.secureDir,
-              sweepRoot: rpcDir.sweepRoot,
-              drain: drainNotifications,
-              apply: async (request: ApplyRequest): Promise<ApplyResult> => {
-                const callCtx: CommandContext = {
-                  // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
-                  ...cmdCtx!,
-                  sessionId: request.sessionId,
-                }
-                const payload = await buildDialogPayload(
-                  request.command,
-                  request.arguments,
-                  callCtx,
-                )
-                return { text: payload.text, knobs: payload.knobs }
-              },
-            })
-            rpcServers.set(rpcDir.dir, rpcServer)
-            ownedRpcServers.set(rpcDir.dir, rpcServer)
+            // One server per project directory per process: adopting stops a
+            // server an earlier loader run left for the same directory.
+            const adoption = await adoptRpcServer(
+              RPC_SERVER_REGISTRY_KEY,
+              activeRpcDir.dir,
+              () =>
+                startRpcServer({
+                  dir: activeRpcDir.dir,
+                  secureDir: activeRpcDir.secureDir,
+                  sweepRoot: activeRpcDir.sweepRoot,
+                  drain: drainNotifications,
+                  apply: async (request: unknown): Promise<ApplyResult> => {
+                    const parsed = parseApplyRequest(request)
+                    if (!parsed) throw new Error('not an /openai apply request')
+                    // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before the RPC server starts
+                    return applyOpenAiMenu(cmdCtx!, parsed as ApplyRequest)
+                  },
+                }),
+            )
+            ownedRpcServers.set(activeRpcDir.dir, adoption)
           } catch {
             // RPC is best-effort; the plugin must not fail if the port file
             // can't be written (e.g. missing directory in test environments).
@@ -2914,14 +3721,17 @@ export async function CodexAuthPlugin(
               accountId: keepwarmAccountKey,
             })
             if (keepwarmCapture) {
-              cacheKeepManager.track(
-                keepwarmCapture.sessionKey,
-                keepwarmCapture.bodyText,
-                keepwarmAccountKey,
-                accountId,
-                keepwarmCapture.replayHeaders,
-                keepwarmCapture.isSubagent,
-              )
+              cacheKeepManager.track({
+                sessionKey: keepwarmCapture.sessionKey,
+                bodyText: keepwarmCapture.bodyText,
+                accountId: keepwarmAccountKey,
+                isSubagent: keepwarmCapture.isSubagent,
+                meta: {
+                  replayHeaders: keepwarmCapture.replayHeaders,
+                  chatgptAccountId: accountId,
+                  routingSessionId: sessionID,
+                },
+              })
             }
             return stamp(await websocketFetch(url, requestInit))
           }
@@ -2934,14 +3744,17 @@ export async function CodexAuthPlugin(
           // Keepwarm capture: track every request body for idle
           // prompt-cache warming. Cheap — stores the already-serialized string.
           if (keepwarmCapture) {
-            cacheKeepManager.track(
-              keepwarmCapture.sessionKey,
-              keepwarmCapture.bodyText,
-              keepwarmAccountKey,
-              accountId,
-              keepwarmCapture.replayHeaders,
-              keepwarmCapture.isSubagent,
-            )
+            cacheKeepManager.track({
+              sessionKey: keepwarmCapture.sessionKey,
+              bodyText: keepwarmCapture.bodyText,
+              accountId: keepwarmAccountKey,
+              isSubagent: keepwarmCapture.isSubagent,
+              meta: {
+                replayHeaders: keepwarmCapture.replayHeaders,
+                chatgptAccountId: accountId,
+                routingSessionId: sessionID,
+              },
+            })
           }
 
           logT.debug('HTTP transport', {
@@ -3141,32 +3954,46 @@ export async function CodexAuthPlugin(
         // has one. A known-exhausted quota uses that reset exactly; a transient
         // mid-stream mark takes the sooner of its bounded reset and any cached
         // quota reset so a missing quota snapshot cannot overstate the wait.
+        //
+        // On a migrated install the quotas come from the account pool's rows
+        // (`quotas`), and `quota-unknown` names a request refused because no
+        // account has a quota reading yet; its poll is already running, so
+        // the client is told to come back shortly.
         function killswitchBlockedResponse(
           storage: AccountStorage | null,
           reason:
             | 'killswitch'
             | 'mid-stream-rate-limit'
-            | 'quota-exhausted' = 'killswitch',
+            | 'quota-exhausted'
+            | 'quota-unknown' = 'killswitch',
           markResetAtMs?: number,
+          quotas?: PoolBlockQuotas,
         ): Response {
           const now = Date.now()
-          const mainQuota = quotaManager.getMain()?.quota
-          const fallbackAccounts = (storage?.accounts ?? [])
-            .filter(
-              (a): a is OAuthAccount =>
-                a.enabled !== false && isOAuthAccount(a),
-            )
-            .map((a) => ({
-              accountId: a.id,
-              quota: quotaManager.getFallback(a.id)?.quota,
-            }))
+          const mainQuota = quotas ? quotas.main : quotaManager.getMain()?.quota
+          const fallbackAccounts = quotas
+            ? quotas.fallbacks
+            : (storage?.accounts ?? [])
+                .filter(
+                  (a): a is OAuthAccount =>
+                    a.enabled !== false && isOAuthAccount(a),
+                )
+                .map((a) => ({
+                  accountId: a.id,
+                  quota: quotaManager.getFallback(a.id)?.quota,
+                }))
           let retryAfter = killswitchRetryAfterSeconds(
             mainQuota,
             fallbackAccounts,
             now,
             storage,
           )
-          if (reason === 'quota-exhausted' && markResetAtMs !== undefined) {
+          if (reason === 'quota-unknown') {
+            retryAfter = POOL_QUOTA_UNKNOWN_RETRY_SECONDS
+          } else if (
+            reason === 'quota-exhausted' &&
+            markResetAtMs !== undefined
+          ) {
             retryAfter = Math.max(1, Math.ceil((markResetAtMs - now) / 1000))
           } else if (
             reason === 'mid-stream-rate-limit' &&
@@ -3185,7 +4012,9 @@ export async function CodexAuthPlugin(
               ? `OpenAI rate limit reached — retrying on another account. Retry in ${mins}m ${secs}s.`
               : reason === 'quota-exhausted'
                 ? `OpenAI quota exhausted — retrying on another account. Retry in ${mins}m ${secs}s.`
-                : `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`
+                : reason === 'quota-unknown'
+                  ? `OpenAI quota is not known yet for any available account; checking it now. Retry in ${mins}m ${secs}s.`
+                  : `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`
           return new Response(
             JSON.stringify({
               error: {
@@ -3437,13 +4266,27 @@ export async function CodexAuthPlugin(
           return quotaManager.isRateLimited(stickyRateLimitKey(candidate))
         }
 
-        async function resolveStickyRouteCandidate(input: {
+        // Places or keeps the session's pin and returns the candidate to send
+        // with. The decision is made in memory from the request's sidebar
+        // snapshot plus this process's own recent pins, exactly as the locked
+        // file merge would make it; the pin and its pending-bytes entry are
+        // then written in the background.
+        //
+        // Accepted trade-off: another process's placements reach this one
+        // only through the snapshot, so a session placed elsewhere in the last
+        // moment may not yet count toward pending bytes here, and a pin
+        // another process wrote that the snapshot has not seen is picked up
+        // on the next refresh. Placement is load balancing, not a correctness
+        // boundary, so slightly stale weights are preferable to a turn that
+        // waits on (or fails with) the sidebar lock.
+        function resolveStickyRouteCandidate(input: {
           sessionId: string
           requestBytes: number
           candidates: readonly StickyRouteCandidate[]
+          sidebarSnapshot: SidebarSnapshot
           excludeAccountIds?: readonly string[]
           now: number
-        }): Promise<StickyRouteCandidate | undefined> {
+        }): StickyRouteCandidate | undefined {
           const eligibleCandidates = input.candidates.filter(
             (candidate) => !isStickyRouteCandidateRateLimited(candidate),
           )
@@ -3453,55 +4296,94 @@ export async function CodexAuthPlugin(
               candidate,
             ]),
           )
-          const quotaCheckedAtByAccount = Object.fromEntries(
-            eligibleCandidates.map((candidate) => [
-              candidate.accountId,
-              candidate.quotaCheckedAt,
-            ]),
-          )
-          const wireAccountIdByAccount = Object.fromEntries(
-            eligibleCandidates.map((candidate) => [
-              candidate.accountId,
-              candidate.wireAccountId,
-            ]),
-          )
           const excluded = new Set(input.excludeAccountIds)
-          let placement:
+          const assignment = placeStickyPin({
+            sessionId: input.sessionId,
+            requestBytes: input.requestBytes,
+            sidebarSnapshot: input.sidebarSnapshot,
+            now: input.now,
+            validPinnedAccountIds: [...candidatesById.keys()],
+            excludeAccountIds: input.excludeAccountIds ?? [],
+            quotaCheckedAtByAccount: Object.fromEntries(
+              eligibleCandidates.map((candidate) => [
+                candidate.accountId,
+                candidate.quotaCheckedAt,
+              ]),
+            ),
+            wireAccountIdByAccount: Object.fromEntries(
+              eligibleCandidates.map((candidate) => [
+                candidate.accountId,
+                candidate.wireAccountId,
+              ]),
+            ),
+            select: (pendingBytes) => {
+              const eligible = eligibleCandidates.filter(
+                (candidate) => !excluded.has(candidate.accountId),
+              )
+              if (eligible.length === 0) return undefined
+              // Undefined when the killswitch blocks every candidate. The
+              // caller then has no pin to send with and answers with the
+              // shared `killswitchBlockedResponse`, as the ordered modes do.
+              return selectStickyCandidate({
+                candidates: eligible,
+                pendingBytes,
+                requestBytes: input.requestBytes,
+                now: input.now,
+                onEmptyWeightedSet: () => {
+                  logA.debug(
+                    'sticky routing: no fresh weighted candidates; using configured order',
+                  )
+                },
+              })
+            },
+            persist: true,
+          })
+          return assignment
+            ? candidatesById.get(assignment.accountId)
+            : undefined
+        }
+
+        // The session pin ledger, shared by the legacy and the account-pool
+        // request paths: decides the session's pin from the request's
+        // sidebar snapshot plus this process's own recent pins (see
+        // resolveStickyRouteCandidate above for the trade-off), and with
+        // `persist` records a new or refreshed pin in the background.
+        // Without `persist` nothing is recorded: the pool path uses that to
+        // serve one request elsewhere while the session keeps its pin.
+        function placeStickyPin(
+          input: Omit<PoolPinPlacement, 'select'> & {
+            sidebarSnapshot: SidebarSnapshot
+            select: (pendingBytes: ReadonlyMap<string, number>) =>
+              | {
+                  accountId: string
+                  quotaCheckedAt?: number
+                  source: 'weighted' | 'mode-fallback'
+                }
+              | undefined
+          },
+        ) {
+          // Assigned inside `choose`; the assertion keeps TypeScript from
+          // narrowing it to `undefined` across that synchronous callback.
+          let placement = undefined as
             | {
                 accountId: string
                 source: 'weighted' | 'mode-fallback'
                 pendingBytes: number
               }
             | undefined
-          const assignment = await resolveSidebarStickyAssignment(
+          const validPinnedAccountIds = input.validPinnedAccountIds
+          const plan = planSidebarStickyAssignmentFromSnapshot(
+            applyStickyPinOverlay(input.sidebarSnapshot, stickyPinOverlay),
             {
               sessionId: input.sessionId,
               requestBytes: input.requestBytes,
               now: input.now,
-              validPinnedAccountIds: [...candidatesById.keys()],
+              validPinnedAccountIds,
               excludeAccountIds: input.excludeAccountIds,
-              quotaCheckedAtByAccount,
-              wireAccountIdByAccount,
+              quotaCheckedAtByAccount: input.quotaCheckedAtByAccount,
+              wireAccountIdByAccount: input.wireAccountIdByAccount,
               choose: (pendingBytes) => {
-                const eligible = eligibleCandidates.filter(
-                  (candidate) => !excluded.has(candidate.accountId),
-                )
-                if (eligible.length === 0) return undefined
-                const selected = selectStickyCandidate({
-                  candidates: eligible,
-                  pendingBytes,
-                  requestBytes: input.requestBytes,
-                  now: input.now,
-                  onEmptyWeightedSet: () => {
-                    logA.debug(
-                      'sticky routing: no fresh weighted candidates; using configured order',
-                    )
-                  },
-                })
-                // Every candidate killed by the killswitch filter. The caller
-                // will translate the placed-pin absence into the shared
-                // `killswitchBlockedResponse`, the same shape the ordered
-                // modes produce.
+                const selected = input.select(pendingBytes)
                 if (!selected) return undefined
                 placement = {
                   accountId: selected.accountId,
@@ -3511,8 +4393,9 @@ export async function CodexAuthPlugin(
                 return selected
               },
             },
-            boundSidebarFile,
           )
+          const assignment = plan.assignment
+          if (!input.persist) return assignment
           if (placement && assignment?.accountId === placement.accountId) {
             logA.debug('sticky routing: placed session pin', {
               pid: process.pid,
@@ -3523,9 +4406,30 @@ export async function CodexAuthPlugin(
               pendingBytes: placement.pendingBytes,
             })
           }
+          if (assignment && plan.next !== undefined) {
+            const sessionHash = hashSidebarSessionId(input.sessionId)
+            const entry = rememberStickyPin(
+              stickyPinOverlay,
+              sessionHash,
+              assignment,
+            )
+            sidebarBookkeepingQueue.enqueue(
+              `pin:${sessionHash}`,
+              'sticky-pin',
+              async () => {
+                await persistSidebarStickyAssignment(
+                  {
+                    sessionId: input.sessionId,
+                    assignment,
+                    validPinnedAccountIds,
+                  },
+                  boundSidebarFile,
+                )
+                entry.persistedAt = Date.now()
+              },
+            )
+          }
           return assignment
-            ? candidatesById.get(assignment.accountId)
-            : undefined
         }
 
         async function usableFallbackCandidates(
@@ -3626,13 +4530,13 @@ export async function CodexAuthPlugin(
           return selection.retained
         }
 
-        async function pushFailedFallbackQuota(
+        function pushFailedFallbackQuota(
           response: Response,
           candidate: FallbackCandidate,
         ) {
           try {
             const snapshot = normalizeQuotaHeaders(response.headers)
-            await pushQuota(
+            pushQuota(
               snapshot as Record<string, unknown>,
               candidate.access,
               candidate.quotaAccountId,
@@ -3711,7 +4615,7 @@ export async function CodexAuthPlugin(
                 activeId: candidate.keepwarmAccountKey,
               }
             }
-            await pushFailedFallbackQuota(response, candidate)
+            pushFailedFallbackQuota(response, candidate)
             // This fallback failed — discard its body and try the next.
             response.body?.cancel().catch(() => {})
           }
@@ -3785,7 +4689,7 @@ export async function CodexAuthPlugin(
               void fallbackManager.markUsed(candidate.fallback)
               return { response, ...lastQuotaTarget }
             }
-            await pushFailedFallbackQuota(response, candidate)
+            pushFailedFallbackQuota(response, candidate)
           }
 
           // All fallbacks exhausted. Return the last response — its body is
@@ -3814,22 +4718,54 @@ export async function CodexAuthPlugin(
           // Immediate: show persisted quota so the sidebar isn't blank
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
-          // Background: refresh from the API, then the sidebar shows fresh numbers
-          void refreshAllQuota(
-            buildRefreshAllQuotaDeps({ respectBackoff: true }),
-          ).catch((error) =>
-            logQ.warn('boot quota seed failed', {
-              pid: process.pid,
-              error: errorMessage(error),
-            }),
-          )
+          // Background: refresh from the API, then the sidebar shows fresh
+          // numbers. A migrated install skips it: the pool source's load
+          // above already polls every pool row, and the legacy seed would
+          // refresh and poll the same rows a second way.
+          if (!(await poolSource.active())) {
+            void refreshAllQuota(
+              buildRefreshAllQuotaDeps({ respectBackoff: true }),
+            ).catch((error) =>
+              logQ.warn('boot quota seed failed', {
+                pid: process.pid,
+                error: errorMessage(error),
+              }),
+            )
+          }
         }
 
         backgroundQuotaRefresh.start(
           async () => {
+            // A migrated install refreshes and polls its pool rows through
+            // the pool source, under the same cross-process lease; the
+            // legacy pass below would read the same rows as a main slot
+            // plus fallbacks.
+            if (await poolSource.active()) {
+              const polled = await refreshPoolInBackground(
+                poolSource,
+                await loadAccounts(getAccountPaths(getConfigPath())),
+                () => acquireBackgroundRefreshLock(getConfigPath()),
+              )
+              if (polled.length > 0) {
+                await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              }
+              const failures = polled.filter((result) => !result.ok)
+              if (failures.length > 0) {
+                logQ.warn(
+                  'background pool quota poll completed with failures',
+                  {
+                    pid: process.pid,
+                    failures,
+                  },
+                )
+              }
+              return
+            }
             const results = await refreshQuotaInBackground(
               buildRefreshAllQuotaDeps({
-                readSidebarState: () => getSidebarState(boundSidebarFile),
+                // Reading through the request cache keeps it fresh on every
+                // background tick as well.
+                readSidebarState: async () => (await sidebarCache.read()).state,
               }),
             )
             const failures = results.filter((result) => !result.ok)
@@ -3847,6 +4783,95 @@ export async function CodexAuthPlugin(
             })
           },
         )
+
+        // -------------------------------------------------------------------
+        // The request path of a migrated install: every account, main
+        // included, is an account-pool row (see core/pool-request.ts). The
+        // transport, quota recording, pin ledger and refusal shapes are the
+        // ones the legacy path below uses.
+        // -------------------------------------------------------------------
+        async function servePooled(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+          reqStorage: Awaited<ReturnType<typeof loadAccounts>>,
+          sessionId: string | undefined,
+          parentSessionId: string | undefined,
+          generation: number,
+        ): Promise<Response> {
+          const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
+          const mainRow = poolSource
+            .peek()
+            .rows.find((row) => row.id === 'main')
+          if (generation === mainIdentityGeneration) {
+            currentMainIdentity = mainRow?.identity
+          }
+          const sidebarSnapshot = await sidebarCache.get()
+          const { response, servedId } = await servePoolRequest({
+            source: poolSource,
+            storage: reqStorage,
+            mode,
+            sessionId,
+            body: typeof init?.body === 'string' ? init.body : undefined,
+            replayable: isReplayableRequest(requestInput, init),
+            now: Date.now,
+            send: (row, token) =>
+              sendWithAccessToken(
+                requestInput,
+                init,
+                token,
+                row.identity,
+                row.id,
+              ),
+            recordQuota: (served, row, token) => {
+              try {
+                pushQuota(
+                  normalizeQuotaHeaders(served.headers) as Record<
+                    string,
+                    unknown
+                  >,
+                  token,
+                  row.id === 'main' ? undefined : row.id,
+                  row.id === 'main' ? row.identity : undefined,
+                  isCompleteQuotaHeaderFrame(served.headers),
+                )
+              } catch {
+                // Quota push is advisory; preserve the provider response.
+              }
+            },
+            placePin: (placement) =>
+              placeStickyPin({ ...placement, sidebarSnapshot }),
+            blocked: (block, quotas) =>
+              block.reason === 'no-credential'
+                ? new Response(null, { status: 401 })
+                : killswitchBlockedResponse(
+                    reqStorage,
+                    block.reason,
+                    block.resetAtMs,
+                    quotas,
+                  ),
+            resetCredits: (id) =>
+              resetCreditsApplicable(
+                id === 'main'
+                  ? quotaManager.peekMainForPolicy(mainRow?.identity)?.quota
+                  : quotaManager.peekFallbackForPolicy(id)?.quota,
+              ),
+            isAbort: (error) =>
+              (error instanceof DOMException && error.name === 'AbortError') ||
+              Boolean(
+                (init?.signal as AbortSignal | undefined | null)?.aborted,
+              ),
+            log: logA,
+          })
+          queueRequestSidebarRouting(
+            sessionId,
+            parentSessionId,
+            servedId,
+            mode,
+            reqStorage?.accounts,
+            applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+          )
+          return response
+        }
 
         // -------------------------------------------------------------------
         // Fetch override that selects the active account, refreshes if
@@ -3873,14 +4898,67 @@ export async function CodexAuthPlugin(
             const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
             init = await materializeRequestInit(requestInput, init)
+            // A migrated install whose slot holds the pool placeholder is
+            // served from the account pool. A real login in the slot (not yet
+            // adopted) and a custody install keep the path below.
+            if (
+              isPoolMainPlaceholder(currentAuth) &&
+              claustrumMode(reqStorage) !== 'claustrum' &&
+              (await poolSource.current()).active
+            ) {
+              return servePooled(
+                requestInput,
+                init,
+                reqStorage,
+                sidebarSessionId,
+                sidebarParentSessionId,
+                myGeneration,
+              )
+            }
             const mainCustodyOwned =
               recognizedMainTombstone &&
               claustrumMode(reqStorage) === 'claustrum'
             let primaryAccess = ''
             let primaryProvenance: VaultProvenance | undefined
+            // True when main has no credential to send: custody refused it, or
+            // main lives in the account pool and its row has no usable token.
+            // Main is then skipped and the fallbacks serve.
             let mainCustodyRefused = false
+            // Set when the slot holds the account-pool placeholder, so main is
+            // the pool row `main` (and that row is not also a fallback).
+            let pooledMain: PoolMainAccess | undefined
+            let mainInPool = isPoolMainPlaceholder(currentAuth)
+            // A real credential in the slot of a migrated install is a later
+            // login: this request serves it as always, and it is adopted into
+            // the pool in the background.
+            if (
+              poolLifecycle?.migrated() &&
+              !mainInPool &&
+              currentAuth.refresh?.trim() &&
+              classifyMainAuthSlot(currentAuth).kind === 'real'
+            )
+              poolLifecycle.noticeRealSlot(currentAuth.refresh)
+            const usePooledMain = async (storage = reqStorage) => {
+              mainInPool = true
+              pooledMain = await resolvePooledMain(storage)
+              if (pooledMain) {
+                primaryAccess = pooledMain.token
+                primaryProvenance =
+                  pooledMain.provenance === 'local'
+                    ? undefined
+                    : pooledMain.provenance
+              } else {
+                primaryAccess = ''
+                mainCustodyRefused = true
+                logA.warn('main account in the pool has no usable token', {
+                  pid: process.pid,
+                })
+              }
+            }
 
-            if (mainCustodyOwned) {
+            if (mainInPool) {
+              await usePooledMain()
+            } else if (mainCustodyOwned) {
               const access = await resolveMainAccessForCustody(reqStorage)
               if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
                 mainCustodyRefused = true
@@ -3909,11 +4987,26 @@ export async function CodexAuthPlugin(
                   currentAuth.expires = refreshed.expires
                 } catch (error) {
                   if (isAuthPersistError(error)) throw error
-                  // Use stale token on refresh failure
+                  // Main moved into the account pool while this request
+                  // waited; serve it from there. The store read at the
+                  // start of the request predates the move (row `main` may
+                  // not have existed yet), so it is read again.
+                  if (error instanceof MainAccountInPoolError) {
+                    await usePooledMain(
+                      await loadAccounts(getAccountPaths(getConfigPath())),
+                    )
+                  }
+                  // Otherwise use the stale token on refresh failure.
                 }
               }
-              primaryAccess = currentAuth.access ?? ''
+              if (!mainInPool) primaryAccess = currentAuth.access ?? ''
             }
+            // The fallback roster for this request. While main is the pool
+            // row `main`, that row is main and must not be tried again as a
+            // fallback.
+            const fallbackStorage = mainInPool
+              ? withoutPoolMainRow(reqStorage)
+              : reqStorage
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
@@ -3924,7 +5017,8 @@ export async function CodexAuthPlugin(
             // main-account SWITCH (a loader that outlives a re-auth would
             // otherwise judge account B by account A's cached quota).
             const mainAccountIdentity =
-              authWithAccount.accountId ??
+              pooledMain?.account.accountId ??
+              (mainInPool ? undefined : authWithAccount.accountId) ??
               (primaryAccess
                 ? extractAccountIdFromClaims(
                     parseJwtClaims(primaryAccess) ?? {},
@@ -3934,14 +5028,11 @@ export async function CodexAuthPlugin(
               currentMainIdentity = mainAccountIdentity
             }
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
-            // One shared sidebar read per request: admission decisions for main
-            // and the fallbacks must all judge the same snapshot.
-            let requestSidebarStatePromise: Promise<SidebarState> | undefined
-            const requestSidebarState = () => {
-              requestSidebarStatePromise ??= getSidebarState(boundSidebarFile)
-              return requestSidebarStatePromise
-            }
-            const sidebarState = await requestSidebarState()
+            // One shared sidebar snapshot per request: admission decisions for
+            // main and the fallbacks must all judge the same snapshot. It comes
+            // from the cache and never waits on the sidebar lock.
+            const sidebarSnapshot = await sidebarCache.get()
+            const sidebarState = sidebarSnapshot.state
 
             if (
               mode === 'sticky-balanced' &&
@@ -3951,17 +5042,18 @@ export async function CodexAuthPlugin(
             ) {
               const requestBytes = Buffer.byteLength(init.body, 'utf8')
               const stickyRoster = await buildStickyRouteRoster({
-                storage: reqStorage,
+                storage: fallbackStorage,
                 sidebarState,
                 primaryAccess,
                 mainAccountIdentity,
                 mainCustodyRefused,
                 primaryProvenance,
               })
-              let stickyCandidate = await resolveStickyRouteCandidate({
+              let stickyCandidate = resolveStickyRouteCandidate({
                 sessionId: sidebarSessionId,
                 requestBytes,
                 candidates: stickyRoster,
+                sidebarSnapshot,
                 now: Date.now(),
               })
 
@@ -3978,10 +5070,11 @@ export async function CodexAuthPlugin(
                       reqStorage,
                     )
                 if (preSendBreak.action === 'migrate') {
-                  const replacement = await resolveStickyRouteCandidate({
+                  const replacement = resolveStickyRouteCandidate({
                     sessionId: sidebarSessionId,
                     requestBytes,
                     candidates: stickyRoster,
+                    sidebarSnapshot,
                     excludeAccountIds: [stickyCandidate.accountId],
                     now: Date.now(),
                   })
@@ -4006,13 +5099,13 @@ export async function CodexAuthPlugin(
                   stickyCandidate.provenance,
                 )
 
-                const pushStickyQuota = async (
+                const pushStickyQuota = (
                   response: Response,
                   candidate: StickyRouteCandidate,
                 ) => {
                   try {
                     const snapshot = normalizeQuotaHeaders(response.headers)
-                    await pushQuota(
+                    pushQuota(
                       snapshot as Record<string, unknown>,
                       candidate.access,
                       candidate.accountId === 'main'
@@ -4028,7 +5121,7 @@ export async function CodexAuthPlugin(
                   }
                 }
 
-                await pushStickyQuota(stickyResponse, stickyCandidate)
+                pushStickyQuota(stickyResponse, stickyCandidate)
                 const responseBreak = stickyBreakDecision(
                   stickyCandidate,
                   sidebarState,
@@ -4044,10 +5137,11 @@ export async function CodexAuthPlugin(
                   retryableStickyFailure &&
                   responseBreak.action === 'migrate'
                 ) {
-                  const replacement = await resolveStickyRouteCandidate({
+                  const replacement = resolveStickyRouteCandidate({
                     sessionId: sidebarSessionId,
                     requestBytes,
                     candidates: stickyRoster,
+                    sidebarSnapshot,
                     excludeAccountIds: [stickyCandidate.accountId],
                     now: Date.now(),
                   })
@@ -4070,7 +5164,7 @@ export async function CodexAuthPlugin(
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement
-                    await pushStickyQuota(stickyResponse, stickyCandidate)
+                    pushStickyQuota(stickyResponse, stickyCandidate)
                   }
                 }
 
@@ -4082,13 +5176,14 @@ export async function CodexAuthPlugin(
                   // awaited on the request path.
                   void fallbackManager.markUsed(stickyCandidate.fallback)
                 }
-                await writeRequestSidebarRouting(
+                queueRequestSidebarRouting(
                   sidebarSessionId,
                   sidebarParentSessionId,
                   stickyCandidate.accountId,
                   mode,
                   reqStorage?.accounts,
-                ).catch(() => {})
+                  applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+                )
                 return stickyResponse
               }
             }
@@ -4114,7 +5209,7 @@ export async function CodexAuthPlugin(
               | undefined
             const requestFallbackSelection = () => {
               fallbackSelectionPromise ??= usableFallbackCandidates(
-                reqStorage,
+                fallbackStorage,
                 sidebarState,
               )
               return fallbackSelectionPromise
@@ -4278,7 +5373,7 @@ export async function CodexAuthPlugin(
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
-                await pushQuota(
+                pushQuota(
                   snapshot as Record<string, unknown>,
                   fallbackQuotaAccess,
                   fallbackQuotaAccountId,
@@ -4286,7 +5381,7 @@ export async function CodexAuthPlugin(
                   isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               } else {
-                await pushQuota(
+                pushQuota(
                   snapshot as Record<string, unknown>,
                   primaryAccess,
                   undefined,
@@ -4298,13 +5393,14 @@ export async function CodexAuthPlugin(
               // Quota push is best-effort — never break the response
             }
 
-            await writeRequestSidebarRouting(
+            queueRequestSidebarRouting(
               sidebarSessionId,
               sidebarParentSessionId,
               servedActiveId,
               mode,
               reqStorage?.accounts,
-            ).catch(() => {})
+              applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+            )
             return finalResponse
           },
         }
@@ -4335,44 +5431,10 @@ export async function CodexAuthPlugin(
       })
       config.command = {
         ...(config.command ?? {}),
-        [OPENAI_QUOTA_COMMAND_NAME]: {
-          template: OPENAI_QUOTA_COMMAND_NAME,
+        [OPENAI_COMMAND_NAME]: {
+          template: OPENAI_COMMAND_NAME,
           description:
-            'Show current OpenAI Codex OAuth quota usage for all accounts.',
-        },
-        [OPENAI_ACCOUNT_COMMAND_NAME]: {
-          template: OPENAI_ACCOUNT_COMMAND_NAME,
-          description:
-            'Manage OpenAI accounts — add, switch, remove, or reorder.',
-        },
-        [OPENAI_ROUTING_COMMAND_NAME]: {
-          template: OPENAI_ROUTING_COMMAND_NAME,
-          description:
-            'Show or change OpenAI account routing between main-first, fallback-first, and sticky-balanced.',
-        },
-        [OPENAI_KILLSWITCH_COMMAND_NAME]: {
-          template: OPENAI_KILLSWITCH_COMMAND_NAME,
-          description:
-            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
-        },
-        [OPENAI_DUMP_COMMAND_NAME]: {
-          template: OPENAI_DUMP_COMMAND_NAME,
-          description:
-            'Show or toggle OpenAI Codex request dump capture for debugging.',
-        },
-        [OPENAI_LOGGING_COMMAND_NAME]: {
-          template: OPENAI_LOGGING_COMMAND_NAME,
-          description:
-            'Show or change the plugin log level (error, warn, info, debug, trace).',
-        },
-        [OPENAI_CACHEKEEP_COMMAND_NAME]: {
-          template: OPENAI_CACHEKEEP_COMMAND_NAME,
-          description:
-            'Keep Codex prompt cache alive during idle by shadow-replaying the last request.',
-        },
-        [OPENAI_RESET_COMMAND_NAME]: {
-          template: OPENAI_RESET_COMMAND_NAME,
-          description: 'Spend one reset credit on an exhausted Codex account.',
+            'OpenAI accounts: quota, routing, limits, cache keep-warm, diagnostics and reset credits.',
         },
       }
     },
@@ -4383,12 +5445,10 @@ export async function CodexAuthPlugin(
     }) => {
       createLogger('commands').info('command hook entered', {
         command: input.command,
-        arguments: input.arguments,
-        modal: MODAL_COMMANDS.includes(input.command as CommandModalName),
         hasCmdCtx: cmdCtx !== null,
         pid: process.pid,
       })
-      if (!MODAL_COMMANDS.includes(input.command as CommandModalName)) return
+      if (input.command !== OPENAI_COMMAND_NAME) return
       if (!cmdCtx) {
         createLogger('commands').warn('command rejected: context not loaded', {
           command: input.command,
@@ -4400,29 +5460,12 @@ export async function CodexAuthPlugin(
         )
         cleanAbort()
       }
-      const command = input.command as CommandModalName
-      // Build a PER-INVOCATION context that threads this request's session id and
-      // notifier. Mutating the shared cmdCtx would race across concurrent sessions:
-      // the detached add-flow snapshots ctx.sessionId only after an await, so a
-      // second session's modal command in that window could misroute the first
-      // session's OAuth feedback. A per-call copy is never mutated by another turn.
-      const callCtx: CommandContext = {
-        // biome-ignore lint/style/noNonNullAssertion: guarded above (cleanAbort throws when cmdCtx is null)
-        ...cmdCtx!,
-        sessionId: input.sessionID,
-        notify: (payload) => {
-          pushNotification(payload, input.sessionID)
-        },
-      }
-      const payload = await buildDialogPayload(
-        command,
-        input.arguments,
-        callCtx,
-      )
+      // biome-ignore lint/style/noNonNullAssertion: guarded above (cleanAbort throws when cmdCtx is null)
+      const payload = await openOpenAiMenu(cmdCtx!, input.sessionID)
       if (isTuiConnected(input.sessionID)) {
         pushNotification(payload, input.sessionID)
       } else {
-        await sendIgnoredMessage(input.sessionID, payload.text)
+        await sendIgnoredMessage(input.sessionID, menuText(payload.menu))
       }
       cleanAbort()
     },
