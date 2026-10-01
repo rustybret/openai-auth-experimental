@@ -4,7 +4,7 @@
 // Pi hands every `openai-codex` request to this extension with the access
 // token of Pi's own login. That login is routed as row `main`
 // (`main-account.ts`); the rows of Pi's account pool (`pool-source.ts`) are
-// the fallbacks. Each request is routed by the mode `/openai-routing` set
+// the fallbacks. Each request is routed by the mode the `/openai` menu set
 // (`pool-request.ts`) and sent through pi-ai's Codex stream with the chosen
 // account's token in place of Pi's: pi-ai derives the `chatgpt-account-id`
 // header from that token, so the token is the whole credential.
@@ -16,10 +16,13 @@
 // Quota is recorded from every HTTP response's `x-codex-*` headers and from
 // every `codex.rate_limits` WebSocket frame, against the account whose token
 // produced it.
+//
+// Once Pi is connected to the Claustrum vault (`/openai` > Vault), the OpenAI
+// accounts the vault serves it are routed beside these (`vault.ts` in the
+// core): each attempt on one sends with the token the vault serves for it.
 
 import { statSync } from 'node:fs'
-import type { PoolRow } from '@cortexkit/common-auth/store'
-import type { CommandContext } from '@cortexkit/openai-auth-core'
+import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
@@ -29,10 +32,19 @@ import {
   loadAccounts,
   normalizeQuotaHeaders,
   normalizeWsFrame,
-  type QuotaManager,
+  type OAuthQuotaSnapshot,
+  OpenAiVault,
+  type RefreshAllQuotaResult,
   type RoutingMode,
+  vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
+import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
+import {
+  FORMER_MAIN_ID,
+  POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
+  type PoolBlock,
+} from '@cortexkit/openai-auth-core/pool-routing'
 import type {
   Api,
   AssistantMessage,
@@ -42,22 +54,14 @@ import type {
   Model,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
-import { piCommandAccountPool } from './pool-accounts.ts'
-import { observationFromSnapshot, windowsFromQuotaMap } from './pool-quota.ts'
 import {
   type RouteAccount,
   type RouteAttempt,
   routablePoolRows,
   routePiRequest,
 } from './pool-request.ts'
-import {
-  FORMER_MAIN_ID,
-  POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
-  type PoolBlock,
-} from './pool-routing.ts'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { placePiStickyPin } from './routing.ts'
 
@@ -78,9 +82,7 @@ type StreamSimple = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream
 
-type RefreshAllQuotaResults = Awaited<
-  ReturnType<NonNullable<CommandContext['refreshAllQuota']>>
->
+type RefreshAllQuotaResults = RefreshAllQuotaResult[]
 
 export interface PiOpenAIRuntimeDeps {
   /** Sends one attempt of a request: pi-ai's Codex stream. */
@@ -95,7 +97,12 @@ export interface PiOpenAIRuntimeDeps {
   now?: () => number
   firstReadingWaitMs?: number
   readBudgetMs?: number
+  /** Replaces Pi's connection to the Claustrum vault (tests); by default its files live next to the account files. */
+  vault?: OpenAiVault
 }
+
+/** How many vault tokens are remembered, so a WebSocket frame finds its account. */
+const VAULT_TOKENS_KEPT = 64
 
 /** An attempt as the router sees it, with the events it produced so far. */
 interface StreamAttempt extends RouteAttempt {
@@ -149,11 +156,11 @@ export function blockedMessage(block: PoolBlock): string {
     case 'quota-exhausted':
       return `Every OpenAI account has used up its quota.${reset}`
     case 'killswitch':
-      return 'Every OpenAI account is below its killswitch quota floor (see `/openai-routing`).'
+      return 'Every OpenAI account is below its killswitch quota floor (see the Limits section of `/openai`).'
     case 'mid-stream-rate-limit':
       return `Every OpenAI account is rate-limited.${reset}`
     case 'no-credential':
-      return 'No OpenAI account holds a usable sign-in. Sign in with `/login` or add an account with `/openai-account add`.'
+      return 'No OpenAI account holds a usable sign-in. Sign in with `/login` or add an account with `/openai`.'
   }
 }
 
@@ -169,7 +176,17 @@ function bearerOf(headers: Record<string, string>): string | undefined {
 export class PiOpenAIRuntime {
   readonly main: PiMainAccount
   readonly pool: PiPoolSource
+  readonly vault: OpenAiVault
   private readonly deps: PiOpenAIRuntimeDeps
+  /**
+   * The vault account (and the account the vault served it for) behind each
+   * recent vault token, newest last, so a rate-limit frame arriving on a
+   * WebSocket opened with one is recorded against that account.
+   */
+  private readonly vaultTokens = new Map<
+    string,
+    { id: string; accountIdentity?: string }
+  >()
   private readonly now: () => number
   private readonly paths: () => AccountPaths
   private storageCache:
@@ -234,10 +251,24 @@ export class PiOpenAIRuntime {
         return { snapshot, observation }
       },
     })
+    this.vault =
+      deps.vault ??
+      new OpenAiVault({
+        host: 'pi',
+        stateDir: vaultStateDir(this.paths().statePath),
+        reservedRouteIds: () => this.pool.peek().rows.map((row) => row.id),
+        fetchImpl,
+        now: this.now,
+      })
   }
 
-  /** Reads the pool once, which starts every row's first quota poll. Never rejects. */
+  /**
+   * Reads the pool once, which starts every row's first quota poll, and
+   * starts the vault's background poll of Pi's vault accounts. Never
+   * rejects.
+   */
   start(): Promise<void> {
+    this.vault.start()
     return this.pool.load().then(
       () => {},
       () => {},
@@ -284,12 +315,20 @@ export class PiOpenAIRuntime {
   // Accounts
   // -------------------------------------------------------------------------
 
-  /** The accounts one request may be sent with: Pi's login, then the pool rows. */
+  /**
+   * The accounts one request may be sent with: Pi's login, then the pool
+   * rows, then the vault's accounts. A login or row signing in as a ChatGPT
+   * account the vault holds is left out: the vault owns that account.
+   */
   private accounts(storage: AccountStorage | null): RouteAccount[] {
     const out: RouteAccount[] = []
     const mainToken = this.main.currentToken()
     const mainIdentity = this.main.currentIdentity()
-    if (mainToken) {
+    const vaultIdentities = this.vault.identities()
+    if (
+      mainToken &&
+      !(mainIdentity !== undefined && vaultIdentities.has(mainIdentity))
+    ) {
       const quota = this.main.quotaMap()
       out.push({
         id: FORMER_MAIN_ID,
@@ -299,14 +338,31 @@ export class PiOpenAIRuntime {
       })
     }
     const view = this.pool.peek()
-    if (!view.active) return out
     const now = this.now()
-    for (const row of routablePoolRows(view.rows, storage, now, mainIdentity)) {
+    if (view.active) {
+      for (const row of routablePoolRows(
+        view.rows,
+        storage,
+        now,
+        mainIdentity,
+        vaultIdentities,
+      )) {
+        out.push({
+          id: row.id,
+          token: this.pool.usableToken(row, now),
+          ...(row.identity ? { identity: row.identity } : {}),
+          ...(row.quota !== undefined ? { quota: row.quota } : {}),
+        })
+      }
+    }
+    for (const route of this.vault.routes()) {
       out.push({
-        id: row.id,
-        token: this.pool.usableToken(row, now),
-        ...(row.identity ? { identity: row.identity } : {}),
-        ...(row.quota !== undefined ? { quota: row.quota } : {}),
+        id: route.id,
+        token: undefined,
+        kind: route.kind,
+        vault: true,
+        ...(route.identity ? { identity: route.identity } : {}),
+        ...(route.quota !== undefined ? { quota: route.quota } : {}),
       })
     }
     return out
@@ -318,7 +374,21 @@ export class PiOpenAIRuntime {
 
   private requestPull(id: string): void {
     if (id === FORMER_MAIN_ID) this.main.requestReading()
+    else if (this.vault.owns(id)) this.vault.requestReading(id)
     else this.pool.requestReading(id)
+  }
+
+  private rememberVaultToken(
+    token: string,
+    entry: { id: string; accountIdentity?: string },
+  ): void {
+    this.vaultTokens.delete(token)
+    this.vaultTokens.set(token, entry)
+    while (this.vaultTokens.size > VAULT_TOKENS_KEPT) {
+      const oldest = this.vaultTokens.keys().next().value
+      if (oldest === undefined) break
+      this.vaultTokens.delete(oldest)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -333,7 +403,10 @@ export class PiOpenAIRuntime {
     const parsed = new Headers(headers)
     const snapshot = normalizeQuotaHeaders(parsed) as Record<string, unknown>
     const complete = isCompleteQuotaHeaderFrame(parsed)
-    if (accountId === FORMER_MAIN_ID)
+    const vaultEntry = this.vaultTokens.get(token)
+    if (vaultEntry?.id === accountId)
+      void this.vault.recordSnapshot(accountId, snapshot, complete, vaultEntry)
+    else if (accountId === FORMER_MAIN_ID)
       this.main.record(snapshot, token, complete)
     else this.pool.recordSnapshot(accountId, snapshot, token, complete)
   }
@@ -346,6 +419,11 @@ export class PiOpenAIRuntime {
    */
   recordRateLimitFrame(token: string, snapshot: Record<string, unknown>): void {
     if (this.main.record(snapshot, token, true)) return
+    const vaultEntry = this.vaultTokens.get(token)
+    if (vaultEntry) {
+      void this.vault.recordSnapshot(vaultEntry.id, snapshot, true, vaultEntry)
+      return
+    }
     const row = this.pool.rowForToken(token)
     if (row) this.pool.recordSnapshot(row.id, snapshot, token, true)
   }
@@ -447,8 +525,12 @@ export class PiOpenAIRuntime {
               .filter((row): row is PoolRow => row !== undefined),
           ),
         requestPull: (id) => this.requestPull(id),
-        send: (account, token) =>
-          this.attempt(model, context, options, account.id, token),
+        send: (account) =>
+          account.vault
+            ? this.vaultAttempt(model, context, options, account.id)
+            : account.token
+              ? this.attempt(model, context, options, account.id, account.token)
+              : Promise.resolve(undefined),
         placePin: placePiStickyPin,
       })
     let result = await run()
@@ -512,34 +594,57 @@ export class PiOpenAIRuntime {
     }
   }
 
+  /**
+   * One attempt on a vault account, with the token the vault serves for it.
+   * The vault sees the attempt's HTTP status, so a 401 is retried once with
+   * a newer version of the same login and otherwise reported to the vault.
+   * Undefined when the vault refused to serve before anything was sent.
+   */
+  private async vaultAttempt(
+    model: Model<Api>,
+    context: Context,
+    options: SimpleStreamOptions | undefined,
+    accountId: string,
+  ): Promise<StreamAttempt | undefined> {
+    let last: StreamAttempt | undefined
+    const response = await this.vault.send(
+      accountId,
+      async (token, attempt) => {
+        this.rememberVaultToken(token, {
+          id: accountId,
+          ...(attempt.accountIdentity !== undefined
+            ? { accountIdentity: attempt.accountIdentity }
+            : {}),
+        })
+        // An attempt the vault retries is dropped unread: it ended without
+        // streaming, so nothing of it reached Pi.
+        last = await this.attempt(model, context, options, accountId, token)
+        return new Response(null, { status: last.status ?? 200 })
+      },
+      { site: 'model', ...(options?.signal ? { signal: options.signal } : {}) },
+    )
+    return response ? last : undefined
+  }
+
   // -------------------------------------------------------------------------
   // Commands
   // -------------------------------------------------------------------------
 
-  /** What `/openai-account` and `/openai-quota` read and change on the pool. */
+  /** What `/openai` reads and changes on the pool. */
   commandSupport(): PiPoolCommands {
     return {
       observeLogin: (token) => this.main.observeToken(token),
-      accountPool: piCommandAccountPool({
-        paths: this.paths,
-        store: () => this.pool.poolStore(),
-        poolRows: async () => {
-          const view = await this.pool.load()
-          return view.active ? view.rows : undefined
-        },
-        main: () => ({
-          present: this.main.currentToken() !== undefined,
-          identity: this.main.currentIdentity(),
-        }),
-        afterWrite: () => this.pool.load(),
-      }),
-      poolActive: async () => (await this.pool.load()).active,
-      seedQuota: (manager) => this.seedQuota(manager),
+      store: () => this.pool.poolStore(),
+      mainIdentity: () => this.main.currentIdentity(),
+      mainQuota: () => this.main.quotaSnapshot(),
+      reload: () => this.pool.load(),
+      vault: this.vault,
       refreshAllQuota: async () => {
         const storage = await this.storage()
-        const [main, rows] = await Promise.all([
+        const [main, rows, vaultRows] = await Promise.all([
           this.main.currentToken() ? this.main.pollNow() : undefined,
           this.pool.pollRows(storage),
+          this.vault.pollStale(0),
         ])
         const results: RefreshAllQuotaResults = []
         if (main)
@@ -548,7 +653,7 @@ export class PiOpenAIRuntime {
             ok: main.ok,
             ...(main.error ? { error: main.error } : {}),
           })
-        for (const row of rows)
+        for (const row of [...rows, ...vaultRows])
           results.push({
             account: row.id,
             ok: row.ok,
@@ -558,57 +663,22 @@ export class PiOpenAIRuntime {
       },
     }
   }
-
-  /** Fills a command's quota manager with Pi's login and every pool row. */
-  private seedQuota(manager: QuotaManager): void {
-    const now = this.now()
-    const token = this.main.currentToken()
-    const mainQuota = this.main.quotaSnapshot()
-    if (token && mainQuota) {
-      manager.setMain(
-        token,
-        { quota: mainQuota, refreshAfter: now, checkedAt: now },
-        this.main.currentIdentity(),
-        true,
-      )
-    }
-    const view = this.pool.peek()
-    if (!view.active) return
-    for (const row of view.rows) {
-      if (row.type !== 'oauth') continue
-      const polled = this.pool.polledSnapshot(row.id)
-      const windows = windowsFromQuotaMap(row.quota)
-      if (!windows && !polled) continue
-      manager.setFallback(
-        row.id,
-        {
-          quota: {
-            ...(polled?.resetCreditsAvailable !== undefined
-              ? { resetCreditsAvailable: polled.resetCreditsAvailable }
-              : {}),
-            ...(polled?.spendControl
-              ? { spendControl: polled.spendControl }
-              : {}),
-            ...windows,
-          },
-          refreshAfter: now,
-          checkedAt: now,
-        },
-        undefined,
-        true,
-        row.identity,
-      )
-    }
-  }
 }
 
-/** The pool-backed parts of the Pi commands. */
+/** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
   /** Takes the token Pi holds for its login now, as a request would. */
   observeLogin: (token: string | undefined) => void
-  accountPool: NonNullable<CommandContext['accountPool']>
-  /** Whether the pool serves this install (the commands then show its rows). */
-  poolActive: () => Promise<boolean>
-  seedQuota: (manager: QuotaManager) => void
-  refreshAllQuota: NonNullable<CommandContext['refreshAllQuota']>
+  /** The store Pi's pool rows live in. */
+  store: () => PoolStore
+  /** The ChatGPT account Pi's own login signs in with, when known. */
+  mainIdentity: () => string | undefined
+  /** The last quota reading of Pi's own login, which is not a pool row. */
+  mainQuota: () => OAuthQuotaSnapshot | undefined
+  /** Re-reads the pool, so requests route across changed rows at once. */
+  reload: () => Promise<unknown>
+  /** Polls the quota of Pi's login, every pool row and every vault account now. */
+  refreshAllQuota: () => Promise<RefreshAllQuotaResults>
+  /** Pi's connection to the Claustrum vault (the Vault section). */
+  vault: OpenAiVault
 }

@@ -16,6 +16,14 @@
     "./tui-support": {
       "types": "./src/tui-support.ts",
       "import": "./src/tui-support.ts"
+    },
+    "./pool-quota": {
+      "types": "./src/pool-quota.ts",
+      "import": "./src/pool-quota.ts"
+    },
+    "./pool-routing": {
+      "types": "./src/pool-routing.ts",
+      "import": "./src/pool-routing.ts"
     }
   },
   "scripts": {
@@ -24,10 +32,8 @@
     "typecheck": "tsc",
     "types": "tsc"
   },
-  "dependencies": {
-    "@cortexkit/claustrum-client": "^0.4.0"
-  },
   "devDependencies": {
+    "@cortexkit/claustrum-client": "0.5.0",
     "@cortexkit/common-auth": "0.2.9"
   }
 }

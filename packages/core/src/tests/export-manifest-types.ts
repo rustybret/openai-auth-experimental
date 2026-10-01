@@ -10,13 +10,23 @@
  */
 
 import type {
-  CommandContext,
-  HostCommandBodies,
-  HostCommandBody,
+  AccountRules,
+  MenuLoginDeps,
+  MenuLoginFlow,
+  MenuMigrationState,
+  MigrationBlocker,
+  OpenAiMenuOptions,
+  ResetCreditsDeps,
+  ResetStepResult,
   ApplyRequest as RootApplyRequest,
   ApplyResult as RootApplyResult,
-  CommandModalName as RootCommandModalName,
+  CacheKeepManager as RootCacheKeepManager,
+  NotifyPayload as RootNotifyPayload,
   OpenDialogPayload as RootOpenDialogPayload,
+  ResetTargetIdentity as RootResetTargetIdentity,
+  RpcNotification as RootRpcNotification,
+  SessionSectionDeps,
+  VaultSectionDeps,
 } from '../index.ts'
 import type {
   AccountBase,
@@ -36,7 +46,7 @@ import type {
   BeginAccountLoginOptions,
   BeginAccountLoginResult,
   CacheKeepManager,
-  CommandModalName,
+  CacheKeepSettings,
   DeviceAuthInit,
   FallbackAccount,
   IdTokenClaims,
@@ -45,8 +55,10 @@ import type {
   KillswitchConfig,
   KillswitchThresholds,
   Level,
+  NotifyPayload,
   OAuthAccount,
   OAuthQuotaSnapshot,
+  OpenAiVaultOptions,
   OpenDialogPayload,
   PendingOAuth,
   PkceCodes,
@@ -85,16 +97,31 @@ import type {
   SidebarQuotaReading,
   SidebarQuotaSnapshot,
   TokenResponse,
+  VaultHost,
+  VaultPaths,
+  VaultRoute,
+  VaultStatus,
+  VaultWaitOptions,
 } from '../internal.ts'
 
 type RootSurface = {
+  accountRules: AccountRules
   applyRequest: RootApplyRequest
   applyResult: RootApplyResult
-  commandContext: CommandContext
-  commandModalName: RootCommandModalName
-  hostCommandBodies: HostCommandBodies
-  hostCommandBody: HostCommandBody
+  cacheKeepManager: RootCacheKeepManager
+  menuLoginDeps: MenuLoginDeps
+  menuLoginFlow: MenuLoginFlow
+  menuMigrationState: MenuMigrationState
+  migrationBlocker: MigrationBlocker
+  notifyPayload: RootNotifyPayload
+  openAiMenuOptions: OpenAiMenuOptions
   openDialogPayload: RootOpenDialogPayload
+  resetCreditsDeps: ResetCreditsDeps
+  resetStepResult: ResetStepResult
+  resetTargetIdentity: RootResetTargetIdentity
+  rpcNotification: RootRpcNotification
+  sessionSectionDeps: SessionSectionDeps
+  vaultSectionDeps: VaultSectionDeps
 }
 
 type InternalSurface = {
@@ -115,7 +142,8 @@ type InternalSurface = {
   beginAccountLoginOptions: BeginAccountLoginOptions
   beginAccountLoginResult: BeginAccountLoginResult
   cacheKeepManager: CacheKeepManager
-  commandModalName: CommandModalName
+  cacheKeepSettings: CacheKeepSettings
+  notifyPayload: NotifyPayload
   deviceAuthInit: DeviceAuthInit
   fallbackAccount: FallbackAccount
   idTokenClaims: IdTokenClaims
@@ -126,6 +154,7 @@ type InternalSurface = {
   level: Level
   oauthAccount: OAuthAccount
   oauthQuotaSnapshot: OAuthQuotaSnapshot
+  openAiVaultOptions: OpenAiVaultOptions
   openDialogPayload: OpenDialogPayload
   pendingOAuth: PendingOAuth
   pkceCodes: PkceCodes
@@ -164,6 +193,11 @@ type InternalSurface = {
   sidebarQuotaReading: SidebarQuotaReading
   sidebarQuotaSnapshot: SidebarQuotaSnapshot
   tokenResponse: TokenResponse
+  vaultHost: VaultHost
+  vaultPaths: VaultPaths
+  vaultRoute: VaultRoute
+  vaultStatus: VaultStatus
+  vaultWaitOptions: VaultWaitOptions
 }
 
 // Referencing both aliases is what makes an unused-name error impossible to
