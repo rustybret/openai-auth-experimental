@@ -8,7 +8,7 @@
 // back what it wrote and that the settings write does not wait for the
 // `main-refresh` lock the refresh already holds.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -29,6 +29,7 @@ import {
   readJson,
   seedPool,
 } from './fixtures/pool-install.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -42,8 +43,16 @@ let configFile: string
 let stateFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
+
+// These cases intentionally observe the uninjectable four-second concurrent
+// refresh wait. Bun's five-second default leaves only one second for fixture
+// setup and scheduling stalls; budget that real wait without weakening it.
+const CONCURRENT_REFRESH_TEST_TIMEOUT_MS = 20_000
 
 beforeEach(() => {
+  scope.capturePluginWork()
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-main-refresh-'))
   configFile = join(configDir, 'openai-auth.json')
   stateFile = join(configDir, 'openai-auth-state.json')
@@ -61,17 +70,19 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  await new Promise((resolve) => setTimeout(resolve, 50))
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  delete process.env.NODE_ENV
-  rmSync(configDir, { recursive: true, force: true })
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    delete process.env.NODE_ENV
+    rmSync(configDir, { recursive: true, force: true })
+  })
 })
 
 type Slot = { type: 'oauth'; access: string; refresh: string; expires: number }
@@ -92,10 +103,11 @@ async function loadFetch(slot: () => Slot) {
     (async () => ({ ...slot() })) as never,
     { id: 'openai', label: 'OpenAI', models: [] } as never,
   )
-  return (loaded as Record<string, unknown>).fetch as (
+  const fetchOverride = (loaded as Record<string, unknown>).fetch as (
     url: string,
     init?: RequestInit,
   ) => Promise<Response>
+  return scope.wrap(fetchOverride)
 }
 
 function request(): RequestInit {
@@ -157,18 +169,23 @@ describe('slot refresh behind a pending-transfer record', () => {
     ).toBeUndefined()
   })
 
-  it('a recent record keeps the refresh standing down', async () => {
-    seedWithRecord(Date.now())
-    const wire = installWire()
-    const fetchOverride = await loadFetch(() => expiredLogin)
+  it(
+    'a recent record keeps the refresh standing down',
+    async () => {
+      seedWithRecord(Date.now())
+      const wire = installWire()
+      const fetchOverride = await loadFetch(() => expiredLogin)
 
-    await fetchOverride('https://api.openai.com/v1/responses', request())
+      await fetchOverride('https://api.openai.com/v1/responses', request())
 
-    expect(wire.refreshTokens).toEqual([])
-    expect(
-      (readJson(configFile).openaiAuthPool as Record<string, unknown>).pending,
-    ).toBeDefined()
-  })
+      expect(wire.refreshTokens).toEqual([])
+      expect(
+        (readJson(configFile).openaiAuthPool as Record<string, unknown>)
+          .pending,
+      ).toBeDefined()
+    },
+    CONCURRENT_REFRESH_TEST_TIMEOUT_MS,
+  )
 })
 
 describe('slot refresh on a migrated install', () => {
@@ -224,26 +241,30 @@ describe('slot refresh on a migrated install', () => {
     expect(wire.refreshTokens).toEqual(['attempt'])
   })
 
-  it('a live lease another process holds on the slot token makes this one stand down', async () => {
-    seedPool({ configFile, stateFile }, [{ id: 'fb1' }], {
-      refresh: {
-        refreshBeforeExpiryMinutes: 5,
-        mainRefreshLeaseId: 'other-process',
-        mainRefreshLeaseUntil: Date.now() + HOUR,
-        mainRefreshLeaseTokenHash: hashRefreshToken(expiredLogin.refresh),
-      },
-    })
-    const wire = installWire()
-    const fetchOverride = await loadFetch(() => expiredLogin)
+  it(
+    'a live lease another process holds on the slot token makes this one stand down',
+    async () => {
+      seedPool({ configFile, stateFile }, [{ id: 'fb1' }], {
+        refresh: {
+          refreshBeforeExpiryMinutes: 5,
+          mainRefreshLeaseId: 'other-process',
+          mainRefreshLeaseUntil: Date.now() + HOUR,
+          mainRefreshLeaseTokenHash: hashRefreshToken(expiredLogin.refresh),
+        },
+      })
+      const wire = installWire()
+      const fetchOverride = await loadFetch(() => expiredLogin)
 
-    const started = performance.now()
-    await fetchOverride('https://api.openai.com/v1/responses', request())
+      const started = performance.now()
+      await fetchOverride('https://api.openai.com/v1/responses', request())
 
-    expect(wire.refreshTokens).toEqual([])
-    // It saw the lease before taking the lock and waited for the other
-    // process's result (4s) before falling back to the stale token, rather
-    // than taking the lock and failing on a lease it could not read.
-    expect(performance.now() - started).toBeGreaterThanOrEqual(3_900)
-    expect(wire.sends).toEqual(['Bearer later-login-access'])
-  })
+      expect(wire.refreshTokens).toEqual([])
+      // It saw the lease before taking the lock and waited for the other
+      // process's result (4s) before falling back to the stale token, rather
+      // than taking the lock and failing on a lease it could not read.
+      expect(performance.now() - started).toBeGreaterThanOrEqual(3_900)
+      expect(wire.sends).toEqual(['Bearer later-login-access'])
+    },
+    CONCURRENT_REFRESH_TEST_TIMEOUT_MS,
+  )
 })

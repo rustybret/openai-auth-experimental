@@ -7,7 +7,7 @@
 // These tests drive the plugin's real fetch override against that layout in
 // all three routing modes, the way integration.test.ts drives a legacy one.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,6 +25,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -56,8 +57,94 @@ let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const heldLocks: Array<{ release(): Promise<void> }> = []
+const scope = createRequestTestScope()
+const it = (
+  name: string,
+  body: () => unknown | Promise<unknown>,
+  timeout?: number,
+) =>
+  scope.it(
+    name,
+    async () => {
+      try {
+        await body()
+      } finally {
+        for (const release of releasePolls.splice(0)) release()
+      }
+    },
+    timeout,
+  )
+const releasePolls: Array<() => void> = []
+
+type Phase = { name: string; offsetMs: number; durationMs?: number }
+let phaseClock:
+  | { step<T>(name: string, run: () => T): T; report(reason: string): void }
+  | undefined
+
+// Retain nested phases so a stuck request identifies its last wire or sidebar
+// operation, not just the outer fetch. Ordinary successful tests stay silent.
+function phaseIt(name: string, body: () => Promise<void>) {
+  return scope.it(name, async () => {
+    const started = performance.now()
+    const phases: Phase[] = []
+    const clock = {
+      step<T>(step: string, run: () => T): T {
+        const start = performance.now()
+        const phase: Phase = { name: step, offsetMs: start - started }
+        phases.push(phase)
+        const finish = () => {
+          phase.durationMs = performance.now() - start
+        }
+        try {
+          const result = run()
+          if (result instanceof Promise) return result.finally(finish) as T
+          finish()
+          return result
+        } catch (error) {
+          finish()
+          throw error
+        }
+      },
+      report(reason: string) {
+        const elapsedMs = performance.now() - started
+        console.error(
+          JSON.stringify({
+            test: name,
+            reason,
+            elapsedMs,
+            phases: phases.map((phase) => ({
+              ...phase,
+              durationMs: phase.durationMs ?? elapsedMs - phase.offsetMs,
+              inFlight: phase.durationMs === undefined,
+            })),
+          }),
+        )
+      },
+    }
+    phaseClock = clock
+    const deadline = setTimeout(
+      () => clock.report('body exceeded 5000 ms'),
+      5_000,
+    )
+    try {
+      await body()
+      if (performance.now() - started >= 5_000)
+        clock.report('slow body completed')
+    } catch (error) {
+      clock.report('body failed')
+      throw error
+    } finally {
+      clearTimeout(deadline)
+    }
+  })
+}
+
+function phase<T>(name: string, run: () => T): T {
+  return phaseClock ? phaseClock.step(name, run) : run()
+}
 
 beforeEach(() => {
+  scope.capturePluginWork()
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-request-'))
   configFile = join(configDir, 'openai-auth.json')
   stateFile = join(configDir, 'openai-auth-state.json')
@@ -70,23 +157,28 @@ beforeEach(() => {
   process.env.OPENCODE_CONFIG_DIR = configDir
   originalFetch = globalThis.fetch
   hooks = undefined
+  phaseClock = undefined
 })
 
 afterEach(async () => {
   for (const lock of heldLocks.splice(0)) await lock.release()
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  // Background pool writes may still be landing; give them a moment so they
-  // never write into the next test's files.
-  await new Promise((resolve) => setTimeout(resolve, 50))
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  delete process.env.NODE_ENV
-  rmSync(configDir, { recursive: true, force: true })
+  for (const release of releasePolls.splice(0)) release()
+  await scope.teardown(
+    async () => {
+      await hooks?.dispose?.()
+      globalThis.fetch = originalFetch
+      await drainSidebarWrites()
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      restoreEnv('OPENCODE_CONFIG_DIR')
+      delete process.env.NODE_ENV
+      rmSync(configDir, { recursive: true, force: true })
+    },
+    () => phaseClock?.report('request scope teardown: body still in flight'),
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -280,6 +372,14 @@ interface Wire {
   refreshTokens: string[]
 }
 
+// Unknown-quota fixtures hold polls only until teardown, rather than leaving
+// immortal promises behind when an assertion or a test timeout ends the body.
+function heldUsagePoll() {
+  const gate = Promise.withResolvers<Response>()
+  releasePolls.push(() => gate.resolve(new Response('', { status: 503 })))
+  return () => gate.promise
+}
+
 /** Replace the network. Model requests answer `respond`; quota polls `usage`. */
 function installWire(
   options: {
@@ -312,10 +412,12 @@ function installWire(
         : new Response(usageBody(10), { status: 200 })
     }
     if (target.includes('/responses')) {
-      wire.sends.push(bearer)
-      return options.respond
-        ? options.respond(bearer)
-        : new Response('{}', { status: 200, headers: quotaHeaders(42) })
+      return phase(`wire send ${wire.sends.length + 1}: ${bearer}`, () => {
+        wire.sends.push(bearer)
+        return options.respond
+          ? options.respond(bearer)
+          : new Response('{}', { status: 200, headers: quotaHeaders(42) })
+      })
     }
     return new Response('unavailable', { status: 503 })
   }) as unknown as typeof globalThis.fetch
@@ -345,20 +447,27 @@ type FetchOverride = (
 async function loadFetch(
   experimentalWebSockets = false,
 ): Promise<FetchOverride> {
-  hooks = await CodexAuthPlugin(mockPluginInput(), { experimentalWebSockets })
+  hooks = await phase('plugin initialization', () =>
+    CodexAuthPlugin(mockPluginInput(), { experimentalWebSockets }),
+  )
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
-  const loaded = await authHook.loader(
-    (async () => ({ ...PLACEHOLDER })) as never,
-    { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
-      NonNullable<(typeof authHook)['loader']>
-    >[1],
+  const loaded = await phase('auth loader', () =>
+    authHook.loader!(
+      (async () => ({ ...PLACEHOLDER })) as never,
+      { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
+        NonNullable<(typeof authHook)['loader']>
+      >[1],
+    ),
   )
   const fetchOverride = (loaded as Record<string, unknown>).fetch as
     | FetchOverride
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return fetchOverride
+  let call = 0
+  return scope.wrap((url, init) =>
+    phase(`fetchOverride ${++call}`, () => fetchOverride(url, init)),
+  )
 }
 
 const URL_RESPONSES = 'https://api.openai.com/v1/responses'
@@ -378,8 +487,10 @@ function request(sessionId?: string): RequestInit {
 }
 
 async function sidebar(): Promise<SidebarState> {
-  await drainSidebarWrites()
-  return normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+  return phase('sidebar read (including drainSidebarWrites)', async () => {
+    await drainSidebarWrites()
+    return normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+  })
 }
 
 function pinOf(state: SidebarState, sessionId: string) {
@@ -460,6 +571,7 @@ describe('unknown quota on a migrated install', () => {
       const gate = new Promise<void>((resolve) => {
         release = resolve
       })
+      releasePolls.push(release)
       const wire = installWire({
         usage: async () => {
           await gate
@@ -505,7 +617,7 @@ describe('unknown quota on a migrated install', () => {
       { id: 'main' },
       { id: 'fallback-1', quota: healthy() },
     ])
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request())
@@ -537,7 +649,7 @@ describe('unknown quota on a migrated install', () => {
         },
       }),
     )
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request('s-detour'))
@@ -551,7 +663,7 @@ describe('unknown quota on a migrated install', () => {
     // Same placeholder slot and rows, but never migrated: the legacy path
     // serves main from row `main` without any quota reading.
     seedLegacy('main-first', ['main', 'fallback-1'])
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request())
@@ -708,6 +820,7 @@ describe('exhaustion and the credit budget on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('the killswitch on a migrated install', () => {
+  const it = phaseIt
   const killswitch = { killswitch: { enabled: true } }
 
   for (const mode of MODES) {
@@ -756,6 +869,80 @@ describe('the killswitch on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('sticky-balanced on a migrated install', () => {
+  const it = phaseIt
+  it('drains a timed-out sticky body before restoring fetch, naming its owner', async () => {
+    seedPool(
+      'sticky-balanced',
+      [
+        { id: 'main', quota: healthy() },
+        { id: 'fallback-1', quota: healthy() },
+      ],
+      { killswitch: { enabled: true } },
+    )
+    let used = 42
+    const wire = installWire({
+      respond: (b) =>
+        new Response('{}', {
+          status: 200,
+          headers: quotaHeaders(b === bearer('main') ? used : 42),
+        }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const wireFetch = globalThis.fetch
+    const fetchOverride = await loadFetch()
+    const interrupted = createRequestTestScope()
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const draining = Promise.withResolvers<void>()
+    const owner =
+      'moves a pin off a row that falls below the killswitch threshold'
+    let bodyError: unknown
+    const body = interrupted
+      .run(owner, async () => {
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+        used = 98
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+        entered.resolve()
+        await resume.promise
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+      })
+      .catch((error: unknown) => {
+        bodyError = error
+      })
+    await entered.promise
+    // Model Bun starting afterEach while the timed-out callback is suspended.
+    // The barrier fixes the ordering without relying on machine load or timers.
+    const teardown = interrupted
+      .teardown(
+        async () => {
+          globalThis.fetch = originalFetch
+        },
+        () => draining.resolve(),
+      )
+      .catch((error: unknown) => error)
+    try {
+      await draining.promise
+      resume.resolve()
+      await body
+      const error = await teardown
+      expect(bodyError).toBeUndefined()
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe(
+        `Request work outlived test: ${owner}`,
+      )
+      expect(wire.sends).toEqual([
+        bearer('main'),
+        bearer('main'),
+        bearer('fallback-1'),
+      ])
+    } finally {
+      resume.resolve()
+      await body
+      await teardown
+      globalThis.fetch = wireFetch
+    }
+  })
+
   it('keeps a session on its row across requests', async () => {
     seedPool('sticky-balanced', [
       { id: 'main', quota: healthy() },

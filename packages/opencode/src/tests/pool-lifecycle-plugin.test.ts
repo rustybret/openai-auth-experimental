@@ -1,7 +1,7 @@
 // The plugin running the account-pool migration and later adoptions in the
 // background: through its real loader, fetch override and auth methods,
 // against a legacy install on disk and a file-backed OpenCode login slot.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -19,6 +19,7 @@ import {
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import type { PoolLifecycleDeps } from '../core/pool-lifecycle.ts'
+import * as poolMigrationSteps from '../core/pool-migration.ts'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
@@ -30,6 +31,7 @@ import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -47,8 +49,12 @@ let stateFile: string
 let slot: HostSlotAdapter
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
+const releaseMigrations: Array<() => void> = []
 
 beforeEach(() => {
+  scope.capturePluginWork()
   dir = mkdtempSync(join(tmpdir(), 'oai-pool-lifecycle-'))
   configFile = join(dir, 'openai-auth.json')
   stateFile = join(dir, 'openai-auth-state.json')
@@ -76,17 +82,21 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  restoreEnv('XDG_STATE_HOME')
-  restoreEnv('XDG_DATA_HOME')
-  delete process.env.NODE_ENV
+  for (const release of releaseMigrations.splice(0)) release()
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    restoreEnv('XDG_STATE_HOME')
+    restoreEnv('XDG_DATA_HOME')
+    delete process.env.NODE_ENV
+  })
 })
 
 function deferred<T = void>() {
@@ -236,6 +246,7 @@ function pluginInput(): PluginInput {
 function parkAt(step: PoolMigrationStep) {
   const reached = deferred()
   const release = deferred()
+  releaseMigrations.push(() => release.resolve())
   let parked = false
   return {
     reached: reached.promise,
@@ -272,7 +283,7 @@ async function loadPlugin(poolMigration: PoolOptions = {}, extra = {}) {
     init?: RequestInit,
   ) => Promise<Response>
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return { fetchOverride, methods: authHook.methods }
+  return { fetchOverride: scope.wrap(fetchOverride), methods: authHook.methods }
 }
 
 function send(
@@ -305,8 +316,7 @@ describe('the migration after the loader starts', () => {
     const { fetchOverride } = await loadPlugin({ enabled: false })
     const before = readFileSync(configFile, 'utf8')
     expect((await send(fetchOverride)).status).toBe(200)
-    // Long enough for a background run to have written its record.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await scope.settlePluginWork()
     expect(isPoolPlaceholder(await slotValue())).toBe(false)
     expect(readFileSync(configFile, 'utf8')).toBe(before)
     expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
@@ -379,8 +389,22 @@ describe('the migration after the loader starts', () => {
       runDeps: { onStep: park.onStep },
     })
     await park.reached
+    const pendingChecked = deferred()
+    const check = poolMigrationSteps.poolTransferPendingInConfigFile
+    const checkSpy = spyOn(
+      poolMigrationSteps,
+      'poolTransferPendingInConfigFile',
+    ).mockImplementation((...args) => {
+      const result = check(...args)
+      if (result) pendingChecked.resolve()
+      return result
+    })
     const pending = send(fetchOverride)
-    await Bun.sleep(400)
+    try {
+      await pendingChecked.promise
+    } finally {
+      checkSpy.mockRestore()
+    }
     // The pending record names the slot's token: nothing refreshed it.
     const refreshedDuringTransfer = [...wire.refreshTokens]
     park.release()
@@ -483,6 +507,9 @@ describe('adoption beside the Claustrum vault', () => {
       await seedLegacy()
       installWire({ usage: true })
       const seen: Array<boolean | undefined> = []
+      const connectionEntered = deferred()
+      const connectionRelease = deferred()
+      releaseMigrations.push(() => connectionRelease.resolve())
       await loadPlugin(
         {
           adopt: async (deps) => {
@@ -494,10 +521,11 @@ describe('adoption beside the Claustrum vault', () => {
           vault: {
             stateDir,
             connectionFile: () => daemon.connectionFile,
-            // The vault connection opens a second late, so its first roster
-            // read ends well after the migration reaches its adoption.
+            // Hold roster discovery until the loader has returned. Adoption
+            // must not use an empty vault roster just because loading is done.
             connectScoped: async () => {
-              await Bun.sleep(1_000)
+              connectionEntered.resolve()
+              await connectionRelease.promise
               return connectClaustrumScopedClient({
                 connectionFile: daemon.connectionFile,
                 projectRoot: dir,
@@ -508,6 +536,9 @@ describe('adoption beside the Claustrum vault', () => {
           },
         },
       )
+      await connectionEntered.promise
+      expect(seen).toEqual([])
+      connectionRelease.resolve()
       await waitFor(async () => seen.length > 0, 'the first adoption')
       expect(seen[0]).toBe(true)
     } finally {

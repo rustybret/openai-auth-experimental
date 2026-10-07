@@ -7,7 +7,7 @@
 // declined-account interlock, one owner per ChatGPT account, the host-slot
 // guard, and what an install still holds from the removed handle-mode
 // custody.
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -44,6 +44,7 @@ import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { createAuthMethods } from '../auth/methods'
 import { applyOpenAiMenu } from '../commands'
 import { __menuContextForTest } from '../index.ts'
+import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import {
   HOUR,
   installWire,
@@ -58,6 +59,7 @@ import {
   type Wire,
   waitFor,
 } from './fixtures/pool-install'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env'
 
 /** The network, with the main row's quota polls reading it exhausted. */
@@ -69,7 +71,6 @@ function wireWithExhaustedMain(): Wire {
       }),
   })
 }
-
 const ENROLLMENT_TOKEN = '01'.repeat(32)
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')
 
@@ -79,8 +80,14 @@ let stateDir: string
 let daemon: MockDaemon | undefined
 let hooks: Hooks | undefined
 let originalFetch: typeof globalThis.fetch
+const scope = createRequestTestScope()
+const test = scope.it
+const clock = createFailurePhaseClock()
+const phaseIt = (name: string, body: () => Promise<void>) =>
+  scope.it(name, () => clock.run(name, body))
 
 beforeEach(() => {
+  scope.capturePluginWork()
   dir = mkdtempSync(join(tmpdir(), 'openai-vault-'))
   files = {
     configFile: join(dir, 'openai-auth.json'),
@@ -93,18 +100,22 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  await hooks?.dispose?.()
-  hooks = undefined
-  await daemon?.stop()
-  daemon = undefined
-  globalThis.fetch = originalFetch
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  rmSync(dir, { recursive: true, force: true })
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    hooks = undefined
+    await daemon?.stop()
+    daemon = undefined
+    globalThis.fetch = originalFetch
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    rmSync(dir, { recursive: true, force: true })
+  })
 })
 
 async function startDaemon(credentials: Record<string, MockCredential> = {}) {
-  daemon = await startMockDaemon({ directory: dir, credentials })
+  daemon = await clock.phase('mock daemon listen', () =>
+    startMockDaemon({ directory: dir, credentials }),
+  )
   return daemon
 }
 
@@ -124,22 +135,24 @@ function enroll(host: 'opencode' | 'pi' = 'opencode') {
 async function plugin(slot: Record<string, unknown> = { ...PLACEHOLDER }) {
   const running = daemon
   if (!running) throw new Error('start the daemon first')
-  hooks = await loadPlugin(
-    {
-      vault: {
-        stateDir,
-        connectionFile: () => running.connectionFile,
-        pollIntervalMs: 0,
+  hooks = await clock.phase('plugin and auth loader', () =>
+    loadPlugin(
+      {
+        vault: {
+          stateDir,
+          connectionFile: () => running.connectionFile,
+          pollIntervalMs: 0,
+        },
       },
-    },
-    slot,
+      slot,
+    ),
   )
   const vault = __menuContextForTest()?.vault
   if (!vault) throw new Error('the loader built no vault')
   // The first roster, and a quota reading for every vault account, so
   // admission has something to judge.
-  await vault.refresh()
-  await vault.pollStale(0)
+  await clock.phase('vault roster refresh', () => vault.refresh())
+  await clock.phase('vault quota poll', () => vault.pollStale(0))
   return { hooks, vault }
 }
 
@@ -158,7 +171,7 @@ function request(
   fetchImpl: typeof globalThis.fetch,
   sessionId?: string,
 ): Promise<Response> {
-  return fetchImpl('https://api.openai.com/v1/responses', {
+  return scope.wrap(fetchImpl)('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -296,6 +309,136 @@ describe('enrollment', () => {
       'oauth:openai:work',
     ])
     vault.close()
+  })
+})
+
+describe('auth account menu with vault accounts', () => {
+  async function menu(keys: string[], vault: OpenAiVault) {
+    const scripted = scriptedTerminal(keys)
+    const methods = createAuthMethods({
+      client: { auth: { set: async () => {} } } as never,
+      getAuth: async () => ({ ...PLACEHOLDER }),
+      getPaths: () => ({
+        configPath: files.configFile,
+        statePath: files.stateFile,
+      }),
+      vault,
+      dependencies: {
+        terminal: scripted.terminal,
+        migrationBlockers: async () => [],
+      },
+    })
+    await (
+      methods[0] as {
+        authorize: (inputs: Record<string, string>) => Promise<unknown>
+      }
+    ).authorize({})
+    return scripted.written()
+  }
+
+  async function setup() {
+    const running = await startDaemon({
+      'oauth:openai:main': vaultLogin('chatgpt-main'),
+      'oauth:openai:ufuk': vaultLogin('chatgpt-ufuk'),
+      'oauth:openai:work': vaultLogin('chatgpt-work'),
+    })
+    seedPool(files, [{ id: 'main' }, { id: 'ufuk' }, { id: 'local' }])
+    enroll()
+    const vault = new OpenAiVault({
+      host: 'opencode',
+      stateDir,
+      connectionFile: () => running.connectionFile,
+      pollIntervalMs: 0,
+    })
+    await vault.refresh()
+    const ufuk = vault
+      .snapshot()
+      ?.rows.find((row) => row.accountIdentity === 'chatgpt-ufuk')
+    if (!ufuk) throw new Error('missing vault ufuk account')
+    await vault.decline(ufuk.routeId)
+    return { vault, running }
+  }
+
+  test('auth menu header lists vault accounts and marks shadowed local rows', async () => {
+    const { vault } = await setup()
+    try {
+      const printed = await menu(['\u001b'], vault)
+      for (const row of vault.snapshot()?.rows ?? []) {
+        expect(printed).toContain(
+          `Vault ${row.label}: ${row.enabled ? 'enabled' : 'declined'}`,
+        )
+      }
+      expect(printed).toContain(
+        'main: main, enabled, set aside (the vault serves this account)',
+      )
+      expect(printed).toContain(
+        'ufuk: ufuk, enabled, set aside (the vault serves this account)',
+      )
+      expect(printed).toContain('local: local, enabled')
+    } finally {
+      vault.close()
+    }
+  })
+
+  test('auth menu Check quotas polls vault accounts into roster and skips shadowed locals', async () => {
+    const wire = installWire({
+      usage: () => new Response(usageBody(37), { status: 200 }),
+    })
+    const { vault, running } = await setup()
+    try {
+      const gets = running.gets.length
+      const beforeConfig = readJson(files.configFile)
+      const beforeState = readFileSync(files.stateFile, 'utf8')
+      const printed = await menu([...Array(4).fill(DOWN), ENTER], vault)
+      expect(wire.polls.sort()).toEqual(
+        [
+          'Bearer local-token',
+          `Bearer ${chatgptAccessToken('chatgpt-main')}`,
+          `Bearer ${chatgptAccessToken('chatgpt-work')}`,
+        ].sort(),
+      )
+      expect(running.gets.length - gets).toBe(2)
+      for (const row of vault.snapshot()?.rows ?? []) {
+        expect(printed).toContain(`Vault ${row.label}:`)
+        if (row.enabled) {
+          expect(row.quota?.limits).toContainEqual(
+            expect.objectContaining({ usedPercent: 37 }),
+          )
+        } else expect(row.quota).toBeUndefined()
+      }
+      expect(printed).toContain('63% left')
+      expect(printed).toContain(
+        'quota check skipped: account is not enabled and active',
+      )
+      expect(readJson(files.configFile).accounts).toEqual(beforeConfig.accounts)
+      expect(readFileSync(files.stateFile, 'utf8')).toBe(beforeState)
+      expect(wire.refreshTokens).toEqual([])
+    } finally {
+      vault.close()
+    }
+  })
+
+  test('auth menu Check quotas reports an unreachable vault without crashing', async () => {
+    installWire()
+    const { vault, running } = await setup()
+    try {
+      await running.stop()
+      daemon = undefined
+      rmSync(running.connectionFile)
+      vault.close()
+      const offline = new OpenAiVault({
+        host: 'opencode',
+        stateDir,
+        connectionFile: () => running.connectionFile,
+        pollIntervalMs: 0,
+      })
+      const printed = await menu([...Array(4).fill(DOWN), ENTER], offline)
+      offline.close()
+      expect(printed).toContain('Claustrum vault unreachable:')
+      expect(printed).toContain('local: local, enabled')
+    } finally {
+      vault.close()
+    }
   })
 })
 
@@ -497,10 +640,9 @@ describe('routing', () => {
       () => (wire.polls.includes('Bearer main-token') ? true : undefined),
       'the first quota poll of row main',
     )
-    // Every row's first quota poll is fired at once, but each takes the pool
-    // store's lock in turn, so a second row's poll can come well after row
-    // main's; wait long enough for it to show.
-    await sleep(1_000)
+    // Row main reaching the wire does not prove another row's queued pull
+    // finished. Drain the actual stores before asserting alpha was not polled.
+    await scope.settlePluginWork()
     expect(wire.polls).not.toContain('Bearer alpha-token')
   })
 
@@ -532,47 +674,56 @@ describe('routing', () => {
     expect(Date.now() - sending).toBeLessThan(4_000)
   }, 10_000)
 
-  test('a static OpenAI API key in the vault is never listed, read, routed or reported', async () => {
-    const running = await startDaemon({
-      'apikey:openai:platform': {
-        payload: JSON.stringify({ access_token: 'sk-vault-platform-key' }),
-        record_version: 3,
-        expires_at_ms: null,
-        type: 'api_key',
-        refresh_adapter: null,
-      },
-      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
-    })
-    enroll()
-    seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
-    const wire = wireWithExhaustedMain()
-    // Every model request answers 401, so a key that was sent would be
-    // reported to the vault.
-    const recorded = globalThis.fetch
-    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-      if (!String(url).includes('/responses'))
-        return recorded(url as string, init)
-      wire.sends.push(new Headers(init?.headers).get('authorization') ?? '')
-      return new Response('{}', { status: 401 })
-    }) as typeof globalThis.fetch
-    const { vault } = await plugin()
-    await setMode('fallback-first')
-    const send = await fetchOverride()
+  phaseIt(
+    'a static OpenAI API key in the vault is never listed, read, routed or reported',
+    async () => {
+      const running = await startDaemon({
+        'apikey:openai:platform': {
+          payload: JSON.stringify({ access_token: 'sk-vault-platform-key' }),
+          record_version: 3,
+          expires_at_ms: null,
+          type: 'api_key',
+          refresh_adapter: null,
+        },
+        'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+      })
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+      const wire = wireWithExhaustedMain()
+      // Every model request answers 401, so a key that was sent would be
+      // reported to the vault.
+      const recorded = globalThis.fetch
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (!String(url).includes('/responses'))
+          return recorded(url as string, init)
+        wire.sends.push(new Headers(init?.headers).get('authorization') ?? '')
+        return new Response('{}', { status: 401 })
+      }) as typeof globalThis.fetch
+      const { vault } = await plugin()
+      await clock.phase('routing settings lock and mtime pause', () =>
+        setMode('fallback-first'),
+      )
+      const send = await clock.phase('second auth loader', () =>
+        fetchOverride(),
+      )
 
-    await request(send)
+      await clock.phase('request including vault dispatch and 401 report', () =>
+        request(send),
+      )
 
-    expect(vault.snapshot()?.rows.map((row) => row.credentialId)).toEqual([
-      'oauth:openai:vault',
-    ])
-    expect(vault.routes().map((route) => route.kind)).not.toContain('api-key')
-    expect(running.gets.map((get) => get.credential_id)).not.toContain(
-      'apikey:openai:platform',
-    )
-    expect(wire.sends).not.toContain('Bearer sk-vault-platform-key')
-    expect(running.reports.map((report) => report.credential_id)).not.toContain(
-      'apikey:openai:platform',
-    )
-  })
+      expect(vault.snapshot()?.rows.map((row) => row.credentialId)).toEqual([
+        'oauth:openai:vault',
+      ])
+      expect(vault.routes().map((route) => route.kind)).not.toContain('api-key')
+      expect(running.gets.map((get) => get.credential_id)).not.toContain(
+        'apikey:openai:platform',
+      )
+      expect(wire.sends).not.toContain('Bearer sk-vault-platform-key')
+      expect(
+        running.reports.map((report) => report.credential_id),
+      ).not.toContain('apikey:openai:platform')
+    },
+  )
 
   test('in an ordered mode, a vault account the vault will not serve passes the request to the next account', async () => {
     const running = await startDaemon({
