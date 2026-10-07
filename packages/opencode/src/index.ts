@@ -117,6 +117,7 @@ import {
   findPoolMainRow,
   isPoolMainPlaceholder,
   MainAccountInPoolError,
+  POOL_LOGIN_REQUIRED_MESSAGE,
   type PoolMainAccess,
   resolvePoolMainAccess,
   withoutPoolMainRow,
@@ -125,6 +126,7 @@ import {
   adoptHostSlotLogin,
   migrateToPool,
   PoolTransferPendingError,
+  poolPlaceholderWithoutMain,
   poolTransferPendingInConfigFile,
   reclaimExpiredPoolTransfer,
 } from './core/pool-migration'
@@ -1447,6 +1449,7 @@ export async function CodexAuthPlugin(
   const ownedCacheKeepManagers = new Map<string, OpenAICacheKeepManager>()
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
+  let missingPoolMainLogged = false
   let sidebarStateFileForEvents: string | undefined
   // Sticky-balanced session-to-account pins this process placed and is using,
   // whose writes may not have reached the sidebar file yet (see
@@ -1858,6 +1861,21 @@ export async function CodexAuthPlugin(
             { cause: err },
           )
         })
+
+        if (
+          await poolPlaceholderWithoutMain(
+            getAccountPaths(getConfigPath()),
+            auth,
+          )
+        ) {
+          if (poolLifecycle) poolLifecycle.noticePlaceholderWithoutMain()
+          else if (!missingPoolMainLogged) {
+            missingPoolMainLogged = true
+            createLogger('pool-migration').warn(POOL_LOGIN_REQUIRED_MESSAGE, {
+              reason: 'placeholder-without-main',
+            })
+          }
+        }
 
         let requestStorageCache:
           | {
@@ -4306,6 +4324,12 @@ export async function CodexAuthPlugin(
           const mainRow = poolSource
             .peek()
             .rows.find((row) => row.id === 'main')
+          const loginRequired =
+            !mainRow &&
+            (await poolPlaceholderWithoutMain(
+              getAccountPaths(getConfigPath()),
+              await getAuth(),
+            ))
           if (generation === mainIdentityGeneration) {
             currentMainIdentity = mainRow?.identity
           }
@@ -4371,15 +4395,20 @@ export async function CodexAuthPlugin(
             },
             placePin: (placement) =>
               placeStickyPin({ ...placement, sidebarSnapshot }),
-            blocked: (block, quotas) =>
-              block.reason === 'no-credential'
-                ? new Response(null, { status: 401 })
-                : killswitchBlockedResponse(
-                    reqStorage,
-                    block.reason,
-                    block.resetAtMs,
-                    quotas,
-                  ),
+            blocked: (block, quotas) => {
+              if (block.reason === 'no-credential') {
+                // Routing has already tried every row that could serve, so
+                // a missing main must not prevent a healthy fallback send.
+                if (loginRequired) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
+                return new Response(null, { status: 401 })
+              }
+              return killswitchBlockedResponse(
+                reqStorage,
+                block.reason,
+                block.resetAtMs,
+                quotas,
+              )
+            },
             resetCredits: (id) =>
               resetCreditsApplicable(
                 id === 'main'
@@ -4911,6 +4940,20 @@ export async function CodexAuthPlugin(
                   servedActiveId = fallbackResult.accountId
               }
             }
+
+            // A transfer may have filled main while this request waited for
+            // its refresh lock. The original snapshot can still lack the row,
+            // so a token resolved from the newer snapshot counts as available.
+            if (
+              mainInPool &&
+              mainUnavailable &&
+              !fallbackServed &&
+              (await poolPlaceholderWithoutMain(
+                getAccountPaths(getConfigPath()),
+                await getAuth(),
+              ))
+            )
+              throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
 
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)

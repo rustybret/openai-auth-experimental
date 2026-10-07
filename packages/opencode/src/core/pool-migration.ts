@@ -308,6 +308,12 @@ export type PoolTransferOutcome =
     }
   /** Migration already recorded as done; nothing was imported. */
   | { status: 'already-migrated' }
+  /**
+   * The slot holds the placeholder but this store has no `main` row and no
+   * transfer of its own in progress: another store sharing this login slot
+   * moved the login. Nothing is written.
+   */
+  | { status: 'refused'; reason: 'placeholder-without-main' }
   /** Adoption asked for before the migration ran. */
   | { status: 'not-migrated' }
   | { status: 'nothing-to-import'; slot: SlotNothingKind }
@@ -373,6 +379,14 @@ type SlotView =
     }
   | { kind: Exclude<SlotNothingKind, 'declined'> }
   | { kind: 'indeterminate' }
+
+function placeholderWithoutMain(
+  slot: SlotView,
+  hasMain: boolean,
+  book: PoolMigrationBookkeeping,
+): boolean {
+  return slot.kind === 'placeholder' && !hasMain && !book.pending
+}
 
 /** Durable record of one slot-to-row transfer, written before the row. */
 export interface PendingTransfer {
@@ -875,6 +889,41 @@ async function readSlot(ctx: Context): Promise<SlotView> {
   return verdict.kind === 'slot-absent' || verdict.kind === 'indeterminate'
     ? { kind: verdict.kind }
     : { kind: verdict.kind }
+}
+
+/**
+ * Whether a freshly read host slot is a placeholder without this store's
+ * main row or pending transfer. The request paths use the migration's exact
+ * predicate, not an empty legacy roster: that roster can be empty while a
+ * real login waits in the slot for the version fence to open.
+ *
+ * Read the store after the slot. Our own placeholder is written only after
+ * the row and pending record are durable, so an older store snapshot must
+ * not be combined with that newer slot value to declare the login missing.
+ * This only reads files; it neither takes a store lock nor starts a migration.
+ */
+export async function poolPlaceholderWithoutMain(
+  paths: AccountPaths,
+  slot: unknown,
+): Promise<boolean> {
+  if (!isPoolPlaceholder(slot)) return false
+  const config = await readConfig(paths.configPath)
+  const load = await openPoolStore({
+    provider: PROVIDER,
+    configPath: paths.configPath,
+    statePath: paths.statePath,
+    quota: quotaCodec,
+  }).read()
+  if (load.status === 'error') return false
+  const hasMain =
+    load.status === 'ready'
+      ? load.rows.some((row) => row.id === 'main')
+      : load.roster.some((row) => isRecord(row) && row.id === 'main')
+  return placeholderWithoutMain(
+    { kind: 'placeholder' },
+    hasMain,
+    readPoolMigrationBookkeeping(config),
+  )
 }
 
 /**
@@ -1648,8 +1697,24 @@ async function gate(
   config: Record<string, unknown>,
 ): Promise<PoolTransferOutcome | undefined> {
   const book = readPoolMigrationBookkeeping(config)
-  if (mode === 'migrate' && book.migratedAt !== undefined)
+  if (mode === 'migrate' && book.migratedAt !== undefined) {
+    // Older builds marked a store migrated even when the placeholder in the
+    // slot came from another store and no login was moved into this one.
+    // Report that state as refused, and leave the store as it is.
+    const load = await ctx.store.read()
+    if (
+      load.status === 'ready' &&
+      !load.rows.some((row) => row.id === 'main') &&
+      !book.pending &&
+      placeholderWithoutMain(
+        await readSlot(ctx),
+        load.rows.some((row) => row.id === 'main'),
+        book,
+      )
+    )
+      return { status: 'refused', reason: 'placeholder-without-main' }
     return { status: 'already-migrated' }
+  }
   if (mode === 'adopt' && book.migratedAt === undefined)
     return { status: 'not-migrated' }
   if (mode === 'adopt' && ctx.vaultServes?.()) {
@@ -1680,7 +1745,20 @@ async function runLocked(
       return early
     }
     let load = await ctx.store.read()
+    const book = readPoolMigrationBookkeeping(config)
     if (load.status === 'pending-migration') {
+      // The placeholder proves that some store moved a login, not that this
+      // store did. Check before even initializing the pool key. Our own crash
+      // after the placeholder write has a main row and pending record/shield;
+      // let that record resume through the ordinary crash-safe planner.
+      if (
+        placeholderWithoutMain(
+          await readSlot(ctx),
+          load.roster.some((row) => isRecord(row) && row.id === 'main'),
+          book,
+        )
+      )
+        return { status: 'refused', reason: 'placeholder-without-main' }
       // The store refuses every write to a legacy roster until its pool key
       // exists. `mainAccountId` is deliberately kept here: older builds skip
       // the roster row whose identity it names, which keeps them off the
@@ -1703,7 +1781,14 @@ async function runLocked(
       return { status: 'retry', reason: 'legacy-refresh-in-progress' }
     if (slot.kind === 'indeterminate')
       return { status: 'retry', reason: 'host-slot-indeterminate' }
-    const book = readPoolMigrationBookkeeping(config)
+    if (
+      placeholderWithoutMain(
+        slot,
+        load.rows.some((row) => row.id === 'main'),
+        book,
+      )
+    )
+      return { status: 'refused', reason: 'placeholder-without-main' }
     const first = plan(
       mode,
       book,

@@ -65,6 +65,7 @@ import {
   resolveMidStreamRateLimitResetAt,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { windowsFromQuotaMap } from '../core/pool-quota'
 import { routableRows } from '../core/pool-request'
 import {
@@ -177,6 +178,12 @@ export type OpenAIAttemptData =
 
 export interface OpenAIAdapterDeps {
   source: PoolAccess
+  /**
+   * True when OpenCode's login slot holds the placeholder while this store has
+   * no `main` row and no transfer of its own in progress, so another store
+   * holds the login. The migration's own check, read without locks.
+   */
+  slotPlaceholderWithoutMain?: () => Promise<boolean>
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
   pins: SessionPins
@@ -543,7 +550,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ): Promise<string | undefined> => {
     const storage = await deps.storage()
     const view = await source.current()
+    const refuseMissingLogin = () => {
+      throw new OpenCode2AuthError({
+        kind: 'no-account',
+        providerID: OPENAI_PROVIDER_ID,
+        sessionID: input.sessionID,
+        requestKind: input.kind,
+        message: POOL_LOGIN_REQUIRED_MESSAGE,
+      })
+    }
     if (!view.active) {
+      if (await deps.slotPlaceholderWithoutMain?.()) refuseMissingLogin()
       log?.warn(
         'the account pool does not serve requests yet; refusing the request',
         { kind: input.kind },
@@ -612,6 +629,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       refused.add(accountId)
     }
+    // No row could serve and the login lives in another store. Without this,
+    // the installer turns an empty choice into its generic no-account error;
+    // give the same sign-in instructions OpenCode 1 gives instead. Only after
+    // routing found no row, so a setup with other accounts still uses them.
+    if (
+      accountId === undefined &&
+      targets.length === 0 &&
+      (await deps.slotPlaceholderWithoutMain?.())
+    )
+      refuseMissingLogin()
     if (accountId !== undefined && primary)
       rememberSessionAccount(input.sessionID, accountId)
     log?.debug('pool account chosen', {

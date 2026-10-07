@@ -72,13 +72,16 @@ import {
   createPoolLifecycle,
   type PoolLifecycleDeps,
 } from '../core/pool-lifecycle'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
   migrateToPool,
+  poolPlaceholderWithoutMain,
 } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
+import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
 import { createLogger } from '../logger'
 import { PackageVersion } from '../version'
@@ -274,12 +277,21 @@ export async function setupOpenAIAuth(
   // Only while the migration is switched on. With it off, setup gets here
   // only on an already migrated install, and no adoption of a later login in
   // OpenCode 1's slot runs, as on OpenCode 1 with the switch off.
+  const fence =
+    options.fence ?? (() => migrationFenceOpen({ currentVersion: version }))
+  const migrationSlot = options.slot ?? opencode1HostSlot()
+  const slotPlaceholderWithoutMain = async () =>
+    poolPlaceholderWithoutMain(
+      paths(),
+      await migrationSlot.get({ path: { id: 'openai' } }),
+    )
+  let migrationRefused = false
   const lifecycle = migrationEnabled
     ? createPoolLifecycle({
         paths,
-        slot: options.slot ?? opencode1HostSlot(),
+        slot: migrationSlot,
         version,
-        ...(options.fence ? { fence: options.fence } : {}),
+        fence,
         // While the vault serves this host its accounts, a login in the slot
         // is not adopted (the request path refuses it instead), as on
         // OpenCode 1.
@@ -289,6 +301,7 @@ export async function setupOpenAIAuth(
         // polls at once.
         migrate: async (deps) => {
           const outcome = await migrateToPool(deps)
+          migrationRefused = outcome.status === 'refused'
           void source.load()
           return outcome
         },
@@ -327,6 +340,7 @@ export async function setupOpenAIAuth(
   const pins = new SessionPins()
   const openai = createOpenAIAdapter({
     source,
+    slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
     pins,
     vault,
@@ -346,10 +360,22 @@ export async function setupOpenAIAuth(
   )
 
   /** Waits for a migration run when the install has not migrated yet. */
-  const ensureMigrated = async () => {
+  const ensureMigrated = async (login: PoolLoginResult) => {
     if (poolMigrated(paths().configPath)) return
     await lifecycle?.idle()
     if (poolMigrated(paths().configPath)) return
+    if (
+      migrationRefused &&
+      !isLeftoverCredential(login) &&
+      (await fence()).open
+    ) {
+      // The migration was refused because the placeholder in the login slot
+      // came from another store. A real login made for this setup can start
+      // this store: write it as `main` first, then let the migration finish
+      // from that row, leaving the shared slot as the other store left it.
+      await source.poolStore().initialize()
+      return
+    }
     throw new Error(
       'OpenAI accounts move to the shared account pool once every OpenCode process on this machine runs this version of openai-auth; the login was not stored. Update or close the older processes and sign in again.',
     )
@@ -359,10 +385,11 @@ export async function setupOpenAIAuth(
     login: PoolLoginResult,
     origin: 'login' | 'import' = 'login',
   ) => {
-    await ensureMigrated()
+    await ensureMigrated(login)
     const outcome = await writeLoginToPool(source.poolStore(), paths(), login, {
       origin,
     })
+    if (!poolMigrated(paths().configPath)) await lifecycle?.requestAdoption()
     await source.load()
     log.info(
       outcome.operation === 'kept'
@@ -394,7 +421,13 @@ export async function setupOpenAIAuth(
     // Placeholders (this plugin's own, or OpenCode 1's carried over when
     // OpenCode 2 imported a migrated `auth.json`) and tombstones of the
     // removed vault custody hold no credential.
-    if (isLeftoverCredential(value)) return
+    if (isLeftoverCredential(value)) {
+      if (await slotPlaceholderWithoutMain()) {
+        if (lifecycle) lifecycle.noticePlaceholderWithoutMain()
+        else log.warn(POOL_LOGIN_REQUIRED_MESSAGE)
+      }
+      return
+    }
     const accountId =
       typeof value.metadata?.accountID === 'string'
         ? value.metadata.accountID
