@@ -2,22 +2,60 @@
 # =============================================================================
 # publish-all-arcus.sh — Unified Arcus Publisher for openai-auth Suite
 #
-# Publishes all components built under dist/<version>/<sequence>/<component>/:
-#   - Uploads release assets to GitHub Releases (via gh)
-#   - Stages v3 envelopes to Arcus manifests
-#   - Signs index via arcus manifest sign-index
-#   - Provides arcus publish submit / arcus publish status entrypoints
+# Publishes all components built under dist/<sequence>/<component>/<version>/:
+#   - Assembles canonical schema-2 submission bundles
+#   - Uploads binary release assets to GitHub Releases (via gh)
+#   - Submits bundles to the Arcus gateway via "arcus publish submit"
+#   - Reports diagnostics and submission IDs for "arcus publish status"
+#
+# (Legacy local-git manifest commits and submodule hacks are deprecated).
 # =============================================================================
 set -eu
 
 SCRIPT_DIR="$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH="" cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-VERSION="${1:-}"
-ARCUS_BIN="${ARCUS_BIN:-arcus}"
-ARCUS_REPO="${ARCUS_REPO:-/Volumes/Topper2TB/Git/arcus}"
-KEY_FILE="${KEY_FILE:-${HOME}/.config/arcus/signing.key}"
-DRY_RUN="${DRY_RUN:-0}"
+VERSION=""
+SEQUENCE=""
+DRY_RUN=0
+SUBMIT=0
+WAIT=0
+SKIP_UPLOAD=0
+GATEWAY_URL="${ARCUS_GATEWAY_URL:-https://arcus-auth.rustybret.com}"
+GITHUB_REPO="rustybret/openai-auth-experimental"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --submit) SUBMIT=1; shift ;;
+    --wait) WAIT=1; shift ;;
+    --skip-upload) SKIP_UPLOAD=1; shift ;;
+    --gateway) GATEWAY_URL="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
+    --sequence) SEQUENCE="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+Usage: $0 [options]
+  --dry-run          Preview publication steps without uploading or submitting
+  --submit           Submit release bundles to the gateway via 'arcus publish submit'
+  --wait             Wait for automated gate testing and hydration outcome (with --submit)
+  --skip-upload      Skip uploading binary assets to GitHub Releases
+  --gateway URL      Arcus gateway endpoint (default: https://arcus-auth.rustybret.com)
+  --version X.Y.Z    Filter by explicit version string
+  --sequence N       Filter by explicit sequence directory
+EOF
+      exit 0
+      ;;
+    *)
+      if [ -z "$VERSION" ] && [ "${1#-}" = "$1" ]; then
+        VERSION="$1"; shift
+      else
+        printf 'error: unknown option: %s\n' "$1" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
 
 if [ -z "$VERSION" ]; then
   VERSION=$(node -e 'console.log(require("./packages/opencode/package.json").version)')
@@ -32,87 +70,91 @@ if [ ! -d "$DIST_DIR" ]; then
 fi
 
 printf "=====================================================================\n"
-printf "publish-all-arcus: Publishing openai-auth Suite (%s)\n" "$VERSION"
-printf "Reading packages from: %s\n" "$DIST_DIR"
+printf "publish-all-arcus: Arcus Suite Publisher (%s)\n" "$VERSION"
+printf "  Distribution Root: %s\n" "$DIST_DIR"
+printf "  Gateway Endpoint:  %s\n" "$GATEWAY_URL"
+printf "  GitHub Repository: %s\n" "$GITHUB_REPO"
+printf "  Submit to Gateway: %s\n" "$([ "$SUBMIT" -eq 1 ] && echo "YES" || echo "NO (pass --submit to submit)")"
 printf "=====================================================================\n"
 
-# Locate all release envelopes
-ENVELOPES=$(find "$DIST_DIR" -name "*.json" 2>/dev/null | grep "/releases/" | grep -v ".index-policy.json" | sort)
-
+# Locate release envelopes (supporting both direct release.json and releases/*.json)
+ENVELOPES=$(find "$DIST_DIR" -name "release.json" -o -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
 if [ -z "$ENVELOPES" ]; then
   printf "error: no release envelopes found under %s\n" "$DIST_DIR" >&2
   exit 1
 fi
 
-GITHUB_REPO="rustybret/openai-auth-experimental"
-
-for env_file in $ENVELOPES; do
-  comp_dir="$(dirname "$(dirname "$env_file")")"
-  comp_name="$(jq -r '.package_id // empty' "$env_file" 2>/dev/null || basename "$(dirname "$comp_dir")")"
-  pkg_ver="$(jq -r '.version // empty' "$env_file" 2>/dev/null || echo "$VERSION")"
-  pkg_seq="$(jq -r '.sequence // empty' "$env_file" 2>/dev/null || echo "1")"
-  env_name="$(basename "$env_file")"
-  release_id="${env_name%.json}"
-
-  printf "\n>>> Processing component: %s (version: %s, sequence: %s)...\n" "$comp_name" "$pkg_ver" "$pkg_seq"
-
-  TAG="v${pkg_ver}"
-
-  # 1. GitHub release asset upload
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf "  [dry-run] would upload %s assets to GitHub release %s\n" "$comp_name" "$TAG"
-  else
-    if ! gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
-      printf "  -> creating GitHub release %s on %s...\n" "$TAG" "$GITHUB_REPO"
-      gh release create "$TAG" --repo "$GITHUB_REPO" \
-        --title "openai-auth ${TAG}" \
-        --notes "Arcus release for ${TAG}"
-    fi
-
-    printf "  -> uploading assets to GitHub release %s...\n" "$TAG"
-    for asset in "${comp_dir}"/*; do
-      [ -f "$asset" ] || continue
-      case "$asset" in
-        *.tar.gz|*.tar.zst|*.zip|*.pwr|*.json)
-          gh release upload "$TAG" "$asset" --repo "$GITHUB_REPO" --clobber
-          ;;
-      esac
-    done
-  fi
-
-  # 2. Stage into Arcus manifests repository
-  if [ -d "$ARCUS_REPO" ]; then
-    V3_DEST_DIR="${ARCUS_REPO}/manifests/v3/${comp_name}/releases"
-    if [ "$DRY_RUN" -eq 1 ]; then
-      printf "  [dry-run] would stage %s to %s\n" "$env_name" "$V3_DEST_DIR"
-    else
-      printf "  -> staging envelope to %s...\n" "$V3_DEST_DIR"
-      mkdir -p "$V3_DEST_DIR"
-      cp "$env_file" "${V3_DEST_DIR}/"
-      policy_file="${env_file%.json}.index-policy.json"
-      if [ -f "$policy_file" ]; then
-        cp "$policy_file" "${V3_DEST_DIR}/"
-      fi
-    fi
-  fi
-done
-
-# 3. Synchronize and sign Arcus index
-if [ -d "$ARCUS_REPO" ] && [ "$DRY_RUN" -eq 0 ]; then
-  printf "\n[Signing] Synchronizing and signing Arcus v3 index...\n"
-  (
-    cd "$ARCUS_REPO"
-    "$ARCUS_BIN" manifest sign-index --root manifests/v3 --key-file "$KEY_FILE"
-    git add manifests/v3
-    git commit -m "feat(manifests): publish openai-auth suite ${VERSION}" ||
-      printf "notice: manifests already up to date\n"
-    git push --no-verify origin main
-  )
+PUBLISHER_SCRIPT="${REPO_ROOT}/packages/arcus/toolchain/scripts/publish-arcus.sh"
+if [ ! -f "$PUBLISHER_SCRIPT" ]; then
+  printf "error: toolchain publish-arcus.sh not found at: %s\n" "$PUBLISHER_SCRIPT" >&2
+  printf "hint: run \"sh packages/arcus/bootstrap.sh\" first.\n" >&2
+  exit 1
 fi
 
+BUNDLES_SUBMITTED=0
+
+for env_file in $ENVELOPES; do
+  if [ "$(basename "$env_file")" = "release.json" ]; then
+    comp_dir="$(dirname "$env_file")"
+  else
+    comp_dir="$(dirname "$(dirname "$env_file")")"
+  fi
+  comp_name="$(jq -r '(.signed.package_id // .package_id // empty)' "$env_file" 2>/dev/null || basename "$(dirname "$comp_dir")")"
+  pkg_ver="$(jq -r '(.signed.version // .version // empty)' "$env_file" 2>/dev/null || echo "$VERSION")"
+  pkg_seq="$(jq -r '(.signed.sequence // .sequence // empty)' "$env_file" 2>/dev/null || echo "1")"
+  pkg_rel_id="$(jq -r '(.signed.release_id // .release_id // empty)' "$env_file" 2>/dev/null || echo "${comp_name}-${pkg_ver}-${pkg_seq}")"
+
+  if [ -n "$SEQUENCE" ] && [ "$pkg_seq" != "$SEQUENCE" ]; then
+    continue
+  fi
+
+  printf "\n>>> Publishing component: %s (version: %s, sequence: %s)...\n" "$comp_name" "$pkg_ver" "$pkg_seq"
+
+  # Tier B Release Tag Standard: mandatory _seq<sequence> suffix
+  TAG="v${pkg_ver}_seq${pkg_seq}"
+  CONFIG_FILE="${REPO_ROOT}/packages/arcus/${comp_name}.json"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE="${REPO_ROOT}/packages/arcus/arcus.json"
+  fi
+
+  PUBLISH_CMD="sh \"$PUBLISHER_SCRIPT\" \
+    --v3 \"$env_file\" \
+    --package-id \"$comp_name\" \
+    --version "$pkg_ver" \
+    --release-id "$pkg_rel_id" \
+    --output \"$comp_dir\" \
+    --dist-dir \"$DIST_DIR\" \
+    --bundle-dir \"$comp_dir\" \
+    --github-repo \"$GITHUB_REPO\" \
+    --tag \"$TAG\" \
+    --config \"$CONFIG_FILE\" \
+    --gateway \"$GATEWAY_URL\""
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    PUBLISH_CMD="$PUBLISH_CMD --dry-run"
+  fi
+  if [ "$SUBMIT" -eq 1 ]; then
+    PUBLISH_CMD="$PUBLISH_CMD --submit"
+    if [ "$WAIT" -eq 1 ]; then
+      PUBLISH_CMD="$PUBLISH_CMD --wait"
+    fi
+  fi
+  if [ "$SKIP_UPLOAD" -eq 1 ]; then
+    PUBLISH_CMD="$PUBLISH_CMD --skip-upload"
+  fi
+
+  eval "$PUBLISH_CMD"
+  BUNDLES_SUBMITTED=$((BUNDLES_SUBMITTED + 1))
+done
+
 printf "\n=====================================================================\n"
-printf "publish-all-arcus: Suite publication complete!\n"
-printf "Available gateway publishing commands:\n"
-printf "  • arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com\n"
-printf "  • arcus publish status <submission_id> --gateway https://arcus-auth.rustybret.com\n"
+printf "publish-all-arcus: Processed %s component submission bundle(s).\n" "$BUNDLES_SUBMITTED"
+if [ "$SUBMIT" -eq 1 ]; then
+  printf "Status checking commands:\n"
+  printf "  • arcus publish status <submission_id> --gateway %s\n" "$GATEWAY_URL"
+else
+  printf "Next step (submit bundles to Arcus gateway):\n"
+  printf "  • Run: %s --submit [--wait]\n" "$0"
+  printf "  • Or directly: arcus publish submit <bundle_dir> --gateway %s\n" "$GATEWAY_URL"
+fi
 printf "=====================================================================\n"

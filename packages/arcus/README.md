@@ -22,9 +22,8 @@ sh packages/arcus/bootstrap.sh
 This will:
 1. Verify `arcus` CLI is installed and available on `PATH`.
 2. Install or update the `arcus-publisher` package (`arcus install arcus-publisher`).
-3. Symlink `packages/arcus/toolchain` to the Arcus installation directory.
-4. Symlink `.opencode/skills/arcus-publisher` to `packages/arcus/toolchain/skill`.
-5. Run `arcus manifest verify-toolchain` to validate the toolchain headers.
+3. Symlink `packages/arcus/toolchain` to `<installRoot>/arcus-publisher/.arcus/current` (the stable pointer, tracking active toolchain updates automatically). Project-local skill symlinks are deprecated; the publisher skill is delivered centrally via `arcus-publisher`.
+4. Run `arcus manifest verify-toolchain` to validate the toolchain headers.
 
 ## Packaging & Publishing
 
@@ -40,10 +39,12 @@ bun run pack:pi         # packages pi-openai-auth
 
 ### 2. Publish Suite
 ```sh
-bun run publish:arcus   # uploads to GitHub Releases and stages to Arcus manifests
+bun run publish:arcus     # Assembles submission bundles and uploads to GitHub Releases
+bun run submit:arcus      # Publishes and submits release bundles to Arcus gateway
+bun run submit:arcus:wait # Submits to gateway and waits for gate verification/hydration
 ```
 
-### 3. Gateway Submission Commands
+### 3. Gateway Submission Commands (Arcus v3 CLI)
 - **Submit Release Bundle**:
   ```sh
   arcus publish submit [bundle_dir] --gateway https://arcus-auth.rustybret.com [--wait]
@@ -52,6 +53,8 @@ bun run publish:arcus   # uploads to GitHub Releases and stages to Arcus manifes
   ```sh
   arcus publish status <submission_id> --gateway https://arcus-auth.rustybret.com
   ```
+
+> **Note on Deprecated Patterns**: Direct git commits to the `arcus` manifests repository and project-local skill symlinks under `.opencode/skills/` are permanently deprecated. All releases are ingested via authenticated HTTP gateway intake (`POST /v1/publish` via `arcus publish submit`), and the catalog index is signed exclusively by Cloudhome's signer pod holding the `CATALOG` root key.
 
 ## Submodule Prohibition
 

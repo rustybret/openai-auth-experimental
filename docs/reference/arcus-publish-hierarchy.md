@@ -111,14 +111,16 @@ Fails closed if:
 
 ### 4. Unified Publication & Gateway Submission: `scripts/publish-all-arcus.sh`
 ```bash
-bun run publish:arcus
+bun run publish:arcus          # Assembles bundles and uploads GitHub release assets
+bun run submit:arcus           # Submits release bundles to gateway via arcus publish submit
+bun run submit:arcus:wait      # Submits to gateway and waits for verification and hydration
 ```
 Publishes all components under `dist/<sequence>/`:
-- Creates GitHub Release tag `v<version>` on `rustybret/openai-auth-experimental`.
-- Uploads platform archives, content zips, and Wharf signatures.
-- Stages signed envelopes to Arcus manifests in `/Volumes/Topper2TB/Git/arcus/manifests/v3/`.
-- Signs the Arcus index with `arcus manifest sign-index`.
-
+- Assembles canonical schema-2 submission bundles (`release.json`, `release.index-policy.json`, `assets.sha256`, `submission.json`, `toolchain.json`).
+- Creates GitHub Release tag `v<version>_seq<sequence>` (e.g. `v0.11.0_seq8`) on `rustybret/openai-auth-experimental`. The mandatory `_seq<sequence>` suffix avoids SemVer pre-release sorting ambiguity.
+- Uploads platform archives, content zips, and Wharf signatures to GitHub Releases BEFORE gateway submission (mandatory to prevent gateway fetch size-zero errors).
+- Submits immutable bundles directly over authenticated HTTPS to the Arcus gateway (`arcus publish submit <bundle_dir> [--wait]`).
+- Direct git commits to the `arcus` manifests repository and project-local skill symlinks under `.opencode/skills/` are strictly deprecated; root catalog index signing is performed exclusively by Cloudhome's signer pod holding the `CATALOG` root key.
 ### 5. Arcus Gateway Commands (Arcus v3 CLI)
 - **Submit Release Bundle**:
   ```bash

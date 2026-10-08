@@ -76,26 +76,4 @@ if [ -f "${OUTPUT_DIR}/releases/${RELEASE_ID}.json" ] && [ ! -f "${OUTPUT_DIR}/r
   ln -sf "releases/${RELEASE_ID}.json" "${OUTPUT_DIR}/release.json"
 fi
 
-# Generate submission.json for self-contained intake
-CREATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-cat <<EOF > "${OUTPUT_DIR}/submission.json"
-{
-  "schema_version": 1,
-  "package_id": "opencode-openai-auth",
-  "release_id": "${RELEASE_ID}",
-  "version": "${VERSION}",
-  "sequence": ${SEQUENCE},
-  "sequence_source": "suite",
-  "created_at": "${CREATED_AT}",
-  "toolchain_version": "0.4.0",
-  "publisher_key_id": "fc7b2603635dc23aa87223cc3cf9395cef2f9e630a951d7da22803649b1fdac8"
-}
-EOF
-
-# Compatibility symlink for legacy dist/arcus intake paths
-LEGACY_ARCUS_DIR="${REPO_ROOT}/dist/arcus/${RELEASE_ID}"
-mkdir -p "${REPO_ROOT}/dist/arcus"
-rm -rf "$LEGACY_ARCUS_DIR"
-ln -sfn "$OUTPUT_DIR" "$LEGACY_ARCUS_DIR"
-
 find "$OUTPUT_DIR" -name '.DS_Store' -type f -delete 2>/dev/null || true

@@ -17,6 +17,8 @@
     "validate:arcus": "bash scripts/validate-arcus.sh",
     "publish:arcus": "bash scripts/publish-all-arcus.sh",
     "publish:suite": "bash scripts/publish-all-arcus.sh",
+    "submit:arcus": "bash scripts/publish-all-arcus.sh --submit",
+    "submit:arcus:wait": "bash scripts/publish-all-arcus.sh --submit --wait",
     "migrate:arcus": "bash scripts/migrate-arcus.sh",
     "pipeline:arcus": "bash scripts/arcus-pipeline.sh",
     "fork-sync": "bash scripts/fork-sync.sh",
