@@ -9,9 +9,9 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { isTombstoned } from '@cortexkit/openai-auth-core/internal'
-import type { HostSlotAdapter } from './pool-migration.ts'
+import { type HostSlotAdapter, isPoolPlaceholder } from './pool-migration.ts'
 
 const MAIN_PROVIDER = 'openai'
 const SLOT_ABSENT_CONFIRMATION_MS = 250
@@ -28,6 +28,7 @@ export type MainOauthSlot = {
   access?: string
   refresh?: string
   expires?: number
+  accountId?: string
 }
 
 /** A fingerprint of the slot's token pair, so a later read can tell it is the same login. */
@@ -53,17 +54,25 @@ export function mainSlotFamilyFingerprint(
 }
 
 /**
- * - `real`: an OAuth value that is not a tombstone (the pool placeholder is
- *   told apart by the caller);
- * - `tombstone`: the value the removed vault custody left in the slot;
+ * The pool placeholder is not a kind here: `classifyMainAuthSlot` reports it
+ * as `real`, so callers recognise it with `isPoolPlaceholder` before they
+ * classify a slot value.
+ * - `real`: an OAuth value that is not a tombstone;
+ * - `tombstone`: the value the removed vault custody mode ("handle mode")
+ *   wrote into the slot when it moved the account into the Claustrum vault:
+ *   an OAuth-shaped value with an empty access token and a fixed
+ *   `claustrum-tombstone:` refresh token (see `tombstone.ts` in the core
+ *   package). It is never a credential;
  * - `slot-absent`: confirmed missing;
- * - `indeterminate`: not an OAuth value, or a missing read that could not be
- *   confirmed.
+ * - `api`: a platform API key, not a ChatGPT OAuth login to import;
+ * - `indeterminate`: an unrecognized value, or a missing read that could not
+ *   be confirmed.
  */
 export type MainAuthSlot =
   | { kind: 'real'; oauth: MainOauthSlot }
   | { kind: 'tombstone'; oauth: MainOauthSlot }
   | { kind: 'slot-absent' }
+  | { kind: 'api' }
   | { kind: 'indeterminate' }
 
 type HostAuthClient = {
@@ -88,6 +97,9 @@ function asOauthSlot(value: unknown): MainOauthSlot | undefined {
     ...(typeof candidate.expires === 'number'
       ? { expires: candidate.expires }
       : {}),
+    ...(typeof candidate.accountId === 'string'
+      ? { accountId: candidate.accountId }
+      : {}),
   }
 }
 
@@ -107,6 +119,12 @@ export function asCompleteMainOauthSlot(
 }
 
 export function classifyMainAuthSlot(value: unknown): MainAuthSlot {
+  if (
+    isPlainRecord(value) &&
+    value.type === 'api' &&
+    typeof value.key === 'string'
+  )
+    return { kind: 'api' }
   const oauth = asOauthSlot(value)
   if (!oauth) return { kind: 'indeterminate' }
   return isTombstoned(oauth)
@@ -262,6 +280,36 @@ export type OpencodeAuthSet = (input: {
 }) => Promise<unknown>
 
 /**
+ * Whether `OPENCODE_AUTH_CONTENT` is set to valid JSON. OpenCode 1 then
+ * reads its logins from that variable instead of `auth.json`, but writes only
+ * to the file, so a write to the slot would not change what OpenCode reads:
+ * the slot is read-only for migration and adoption.
+ */
+export function opencodeAuthIsEnvBacked(env: NodeJS.ProcessEnv): boolean {
+  if (!env.OPENCODE_AUTH_CONTENT) return false
+  try {
+    JSON.parse(env.OPENCODE_AUTH_CONTENT)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Thrown by a slot adapter asked to write the placeholder when the slot no
+ * longer holds the login the migration last read and based that write on.
+ * Nothing is written; the migration plans again on a later run.
+ */
+export class HostSlotChangedError extends Error {
+  constructor() {
+    super(
+      'OpenCode openai login changed after the account-pool migration read it; nothing was written',
+    )
+    this.name = 'HostSlotChangedError'
+  }
+}
+
+/**
  * OpenCode 1's login slot for a plugin running inside OpenCode 1: reads
  * `auth.json` itself (see `readOpencodeAuthMap`), writes through OpenCode 1's
  * own `client.auth.set`.
@@ -273,14 +321,36 @@ export function opencode1ClientSlot(options: {
 }): HostSlotAdapter {
   const env = options.env ?? process.env
   const path = options.path ?? opencodeAuthPath(env)
+  const seen = new Map<string, string | undefined>()
   return {
+    path: resolve(path),
+    migrationDisabledReason: () =>
+      opencodeAuthIsEnvBacked(env)
+        ? 'OPENCODE_AUTH_CONTENT supplies the login; the environment-backed slot is read-only'
+        : undefined,
     async get(input) {
-      return (await readOpencodeAuthMap(path, env))[input.path.id]
+      const value = (await readOpencodeAuthMap(path, env))[input.path.id]
+      seen.set(input.path.id, JSON.stringify(value))
+      return value
     },
     async all() {
       return readOpencodeAuthMap(path, env)
     },
     async set(input) {
+      if (opencodeAuthIsEnvBacked(env))
+        throw new Error('OPENCODE_AUTH_CONTENT supplies a read-only login slot')
+      // OpenCode's client has no compare-and-set write. Before writing the
+      // placeholder, read the slot again and refuse if it differs from the
+      // value `get` last returned, which the migration based the write on.
+      // A login OpenCode's server writes between its own read and write of
+      // the file can still be lost; nothing here can see that.
+      const current = (await readOpencodeAuthMap(path, env))[input.path.id]
+      if (
+        isPoolPlaceholder(input.body) &&
+        (!seen.has(input.path.id) ||
+          seen.get(input.path.id) !== JSON.stringify(current))
+      )
+        throw new HostSlotChangedError()
       const result = await options.set(input)
       // The generated client reports a refused request in its result
       // (`{ error, response }`) instead of throwing; a write that did not
