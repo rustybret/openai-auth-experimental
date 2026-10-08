@@ -3,6 +3,12 @@ import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
+import {
+  type CanonicalInput,
+  canonicalInput,
+  canonicalPrefixLength,
+  retainedInput,
+} from './util/canonical-input'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
@@ -72,12 +78,14 @@ interface PoolEntry {
   // not look like a fresh turn.
   turnInput?: unknown[]
   turnSignature?: string
+  turnCanonical?: CanonicalInput
 }
 
 interface ContinuationState {
   responseID: string
   input: unknown[]
   signature: string
+  canonical?: CanonicalInput
   // call_ids the chained response actually finalized. Only these may be trimmed
   // from a later continuation suffix; an unfinalized function_call (e.g. an
   // aborted partial whose output is still replayed) must be kept inline.
@@ -159,6 +167,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     entry: PoolEntry,
     body: Record<string, unknown> | undefined,
     httpInit: RequestInit | undefined,
+    comparison?: RequestComparison,
   ): RequestInit | undefined {
     if (!body || !httpInit) return httpInit
     // Normalize first: the socket path records its turn input from the
@@ -166,7 +175,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     // whether this is a fresh turn. Handing it the raw body would fail that
     // comparison and mint a spurious turn_id on the very fallback we are here
     // to keep stable.
-    advanceTurn(entry, normalizeResponseBody(body))
+    advanceTurn(entry, normalizeResponseBody(body), undefined, comparison)
     const headers = new Headers(httpInit.headers)
     const existing = headers.get('x-codex-turn-metadata')
     if (!existing) return httpInit
@@ -251,18 +260,26 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       streamFailures: 0,
     }
     pool.set(key, entry)
+    const sourceBody = normalizeResponseBody(body)
+    let comparison: RequestComparison | undefined
 
     if (entry.fallback) {
-      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
+      return httpFetch(
+        input,
+        httpFallbackInit(entry, body, httpInit, comparison),
+      )
     }
     if (entry.busy) {
-      return httpFetch(input, httpFallbackInit(entry, body, httpInit))
+      return httpFetch(
+        input,
+        httpFallbackInit(entry, body, httpInit, comparison),
+      )
     }
 
     entry.busy = true
     entry.lastUsedAt = Date.now()
     try {
-      const sourceBody = normalizeResponseBody(body)
+      comparison = requestComparison(entry, sourceBody)
       const sourceHeaders = OpenAIWebSocket.normalizeHeaders(wsInit?.headers)
 
       // Capture the per-request account identity at send time so that any
@@ -304,7 +321,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         rawWebSocket,
         init?.signal,
       )
-      if (shouldPrewarm(entry, sourceBody)) {
+      if (shouldPrewarm(entry, sourceBody, comparison)) {
         await prewarm(entry, sourceBody, idleTimeout, {
           signal: init?.signal ?? undefined,
           sessionID: dumpSessionID,
@@ -323,9 +340,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           rejectFirstEvent = reject
         },
       )
-      const continuedBody = withContinuation(entry, sourceBody)
+      const continuedBody = withContinuation(entry, sourceBody, comparison)
       const requestBody = orderCodexBody(
-        applyTurnId(entry, continuedBody, sourceBody),
+        applyTurnId(entry, continuedBody, sourceBody, comparison),
       )
       // The request chained to the prior continuation iff it carries a
       // previous_response_id (withContinuation only sets it when it actually
@@ -336,7 +353,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         sessionID: dumpSessionID,
         transport: 'websocket',
         phase: 'main',
-        bodyText: JSON.stringify(requestBody),
+        bodyText: () => JSON.stringify(requestBody),
         url: options?.url ?? url,
         method: wsInit?.method,
         headers: wsInit?.headers,
@@ -365,6 +382,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             event,
             finalizedCallIds,
             mainChainedToPrior,
+            comparison,
           )
         },
         onTerminal: (event) => {
@@ -420,7 +438,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       // advanceTurn is idempotent for a body already applied this send, so the
       // post-attempt exits re-stamp the header without minting a second turn.
       const runHttpFallback = () =>
-        httpFetch(input, httpFallbackInit(entry, body, httpInit))
+        httpFetch(input, httpFallbackInit(entry, body, httpInit, comparison))
       if (!entry.fallback)
         return relayWithOversizedFallback(response, runHttpFallback)
       return runHttpFallback()
@@ -455,7 +473,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       entry.continuation = undefined
       invalidate(entry)
       if (entry.fallback)
-        return httpFetch(input, httpFallbackInit(entry, body, httpInit))
+        return httpFetch(
+          input,
+          httpFallbackInit(entry, body, httpInit, comparison),
+        )
       return failedResponse(
         new ResponseStreamError(
           error instanceof Error ? error.message : String(error),
@@ -677,7 +698,7 @@ async function prewarm(
     sessionID: options.sessionID,
     transport: 'websocket',
     phase: 'prewarm',
-    bodyText: JSON.stringify(request),
+    bodyText: () => JSON.stringify(request),
     url: options.url,
     method: 'POST',
     headers: options.headers,
@@ -702,7 +723,11 @@ async function prewarm(
       })
       // A prewarm always starts a fresh chain (previous_response_id:null), so it
       // never inherits the prior turn's finalized set.
-      updateContinuation(entry, request, event, finalizedCallIds, false)
+      updateContinuation(entry, request, event, finalizedCallIds, false, {
+        input: canonicalInput([]),
+        signature: bodySignature(request),
+        priorInputs: new Map(),
+      })
     },
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
@@ -861,6 +886,7 @@ function updateContinuation(
   // previous_response_id to the PRIOR continuation. Only then does this response's
   // reconstructable context include the prior chain's finalized calls.
   chainedToPrior: boolean,
+  comparison = requestComparison(entry, fullBody),
 ) {
   const response = event.response
   const responseID =
@@ -886,7 +912,8 @@ function updateContinuation(
   entry.continuation = {
     responseID,
     input: fullBody.input,
-    signature: bodySignature(fullBody),
+    signature: comparison.signature,
+    canonical: retainedInput(comparison.input),
     finalizedCallIds: chainFinalized,
   }
 }
@@ -907,13 +934,20 @@ export function advanceTurn(
   entry: PoolEntry,
   body: Record<string, unknown>,
   fullBody: Record<string, unknown> = body,
+  comparison = requestComparison(entry, {
+    ...fullBody,
+    input: Array.isArray(fullBody.input) ? fullBody.input : body.input,
+  }),
 ) {
   const input = Array.isArray(body.input) ? body.input : []
   const fullInput = Array.isArray(fullBody.input) ? fullBody.input : input
-  const fullSignature = bodySignature(fullBody)
+  const fullSignature = comparison.signature
   const prefixLength =
     entry.turnInput && entry.turnSignature === fullSignature
-      ? matchingInputPrefixLength(entry.turnInput, fullInput)
+      ? canonicalPrefixLength(
+          priorCanonical(comparison, entry.turnInput),
+          comparison.input,
+        )
       : undefined
   const turnInput =
     prefixLength === undefined ? input : fullInput.slice(prefixLength)
@@ -923,7 +957,9 @@ export function advanceTurn(
     entry.turnStartedAt = Date.now()
   }
   entry.turnInput = fullInput.slice()
+  comparison.priorInputs.set(entry.turnInput, comparison.input)
   entry.turnSignature = fullSignature
+  entry.turnCanonical = retainedInput(comparison.input)
 }
 
 // Stabilize turn_id/turn_started_at across a turn's tool-loop, matching Codex. The *sent* input
@@ -938,8 +974,12 @@ export function applyTurnId(
   entry: PoolEntry,
   body: Record<string, unknown>,
   fullBody: Record<string, unknown> = body,
+  comparison = requestComparison(entry, {
+    ...fullBody,
+    input: Array.isArray(fullBody.input) ? fullBody.input : body.input,
+  }),
 ) {
-  advanceTurn(entry, body, fullBody)
+  advanceTurn(entry, body, fullBody, comparison)
   const cm = body.client_metadata
   if (!isRecord(cm) || typeof cm['x-codex-turn-metadata'] !== 'string')
     return body
@@ -982,23 +1022,64 @@ function rewriteTurnMetadata(
   })
 }
 
-function matchingInputPrefixLength(prefix: unknown[], input: unknown[]) {
-  if (prefix.length > input.length) return undefined
-  for (let index = 0; index < prefix.length; index++) {
-    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
-      return undefined
-  }
-  return prefix.length
+interface RequestComparison {
+  input: CanonicalInput
+  signature: string
+  priorInputs: Map<unknown[], CanonicalInput>
 }
 
-function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
+function requestComparison(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+): RequestComparison {
+  const input = Array.isArray(body.input) ? body.input : []
+  const priorInputs = new Map<unknown[], CanonicalInput>()
+  if (entry.turnInput && entry.turnCanonical)
+    priorInputs.set(entry.turnInput, entry.turnCanonical)
+  if (entry.continuation?.canonical)
+    priorInputs.set(entry.continuation.input, entry.continuation.canonical)
+  const canonical = canonicalInput(
+    input,
+    entry.turnCanonical ?? entry.continuation?.canonical,
+  )
+  priorInputs.set(input, canonical)
+  return { input: canonical, signature: bodySignature(body), priorInputs }
+}
+
+function priorCanonical(comparison: RequestComparison, input: unknown[]) {
+  let canonical = comparison.priorInputs.get(input)
+  if (!canonical) {
+    // The turn's saved input is a copy of the array, and the continuation saves
+    // the whole body, so the same items can sit in two different arrays. Reuse
+    // the canonical texts of any array holding exactly the same item objects,
+    // even when the history was too large to keep its texts between requests.
+    for (const [prior, represented] of comparison.priorInputs) {
+      if (
+        prior.length === input.length &&
+        prior.every((item, index) => item === input[index])
+      ) {
+        canonical = represented
+        break
+      }
+    }
+    canonical ??= canonicalInput(input)
+    comparison.priorInputs.set(input, canonical)
+  }
+  return canonical
+}
+
+function withContinuation(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  comparison = requestComparison(entry, body),
+) {
   const input = Array.isArray(body.input) ? body.input : undefined
   if (!input || !entry.continuation) return body
-  if (entry.continuation.signature !== bodySignature(body)) {
+  if (entry.continuation.signature !== comparison.signature) {
     entry.continuation = undefined
     return body
   }
-  if (!hasInputPrefix(entry.continuation.input, input)) {
+  if (!hasContinuationPrefix(entry.continuation, comparison)) {
     entry.continuation = undefined
     return body
   }
@@ -1021,11 +1102,15 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
   }
 }
 
-function shouldPrewarm(entry: PoolEntry, body: Record<string, unknown>) {
+function shouldPrewarm(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  comparison = requestComparison(entry, body),
+) {
   const input = Array.isArray(body.input) ? body.input : undefined
   if (!entry.continuation) return true
   if (!input) return false
-  if (!hasInputPrefix(entry.continuation.input, input)) return true
+  if (!hasContinuationPrefix(entry.continuation, comparison)) return true
   const suffix = input.slice(entry.continuation.input.length)
   return suffix.some(isUserTurnMessage)
 }
@@ -1096,13 +1181,20 @@ function normalizeSignatureBody(body: Record<string, unknown>) {
   return { ...body, client_metadata }
 }
 
-function hasInputPrefix(prefix: unknown[], input: unknown[]) {
-  if (prefix.length >= input.length) return false
-  for (let index = 0; index < prefix.length; index++) {
-    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
-      return false
-  }
-  return true
+function hasContinuationPrefix(
+  prior: ContinuationState,
+  comparison: RequestComparison,
+) {
+  // Chaining onto the previous response needs at least one new input item: an
+  // input no longer than the previous one is sent in full, without
+  // previous_response_id. (Turn detection, by contrast, accepts equal length.)
+  if (prior.input.length >= comparison.input.texts.length) return false
+  return (
+    canonicalPrefixLength(
+      priorCanonical(comparison, prior.input),
+      comparison.input,
+    ) !== undefined
+  )
 }
 
 export {
