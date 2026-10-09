@@ -1,14 +1,19 @@
 // In-process rows for the account-pool migration and host-slot adoption:
-// the placeholder, custody mode, older builds running against the same files
+// the placeholder, the Claustrum vault, older builds running against the same files
 // (through openai-auth's real legacy functions), adoption of later logins,
 // the slot fence and its declared race, and refreshing a pool row while
 // older builds may refresh the same token.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import * as commonFs from '@cortexkit/common-auth/fs'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
-import { openPoolStore, rowLockKey } from '@cortexkit/common-auth/store'
+import {
+  openPoolStore,
+  POOL_KEY,
+  rowLockKey,
+} from '@cortexkit/common-auth/store'
 import {
   buildRefreshOperationError,
   codexRefreshFn,
@@ -20,19 +25,23 @@ import {
   refreshBackoffActive,
   saveAccountState,
   saveAccounts,
-  writeClaustrumModeAndTransition,
+  tokenFingerprint,
 } from '@cortexkit/openai-auth-core/internal'
-import { classifyMainAuthSlot } from '../core/custody-host-slot.ts'
-import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition.ts'
+import {
+  classifyMainAuthSlot,
+  MAIN_REFRESH_LOCK_NAME,
+} from '../core/host-slot.ts'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
   isPoolPlaceholder,
   LegacyMainRefreshInFlightError,
   migrateToPool,
+  PENDING_TRANSFER_TTL_MS,
   POOL_MIGRATION_KEY,
   POOL_PLACEHOLDER,
   poolTransferPendingInConfigFile,
+  reclaimExpiredPoolTransfer,
   refreshPoolRow,
 } from '../core/pool-migration.ts'
 import {
@@ -53,11 +62,15 @@ import {
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
 
+import { createRequestTestScope } from './request-test-scope'
+
+const scope = createRequestTestScope()
+const it = scope.it
 let h: Harness
 beforeEach(() => {
   h = harness()
 })
-afterEach(() => h.cleanup())
+afterEach(async () => scope.teardown(async () => h.cleanup()))
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void
@@ -67,13 +80,16 @@ function deferred<T = void>() {
   return { promise, resolve }
 }
 
-function openStore() {
+function openStore(
+  onLockEvent?: Parameters<typeof openPoolStore>[0]['onLockEvent'],
+) {
   return openPoolStore({
     provider: 'openai',
     configPath: h.paths.configPath,
     statePath: h.paths.statePath,
     quota: quotaCodec,
     lockOptions: { timeoutMs: 5_000 },
+    onLockEvent,
   })
 }
 
@@ -87,7 +103,7 @@ async function migrated() {
 }
 
 describe('the slot placeholder', () => {
-  it('only an exact match counts as the placeholder, and it is not the custody tombstone', () => {
+  it('only an exact match counts as the placeholder, and it is not the tombstone of the removed vault custody', () => {
     expect(isPoolPlaceholder({ ...POOL_PLACEHOLDER })).toBe(true)
     expect(POOL_PLACEHOLDER.refresh.startsWith('claustrum-tombstone:')).toBe(
       false,
@@ -179,6 +195,37 @@ describe('migration', () => {
     })
   })
 
+  it('does not carry a legacy main quota read with another access token onto row main', async () => {
+    await seedLegacyInstall(h)
+    const state = await h.state()
+    state.main.quotaToken = tokenFingerprint(jwt('acct-before'))
+    writeFileSync(h.paths.statePath, JSON.stringify(state))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+    })
+    const main = await h.row('main')
+    expect(main?.quota).toBeUndefined()
+    expect(main?.needsFirstReading).toBe(true)
+    expect((await h.state()).accounts.main.quota).toBeUndefined()
+    // The refresh backoff from `state.main` is still copied onto row main:
+    // it names the refresh token it was recorded for (by hash), so it can
+    // never apply to another login's token.
+    expect((await h.state()).accounts.main.lastRefreshError.tokenHash).toBe(
+      hashRefreshToken('r-main'),
+    )
+  })
+
+  it('carries a legacy main quota read with the access token row main now holds', async () => {
+    await seedLegacyInstall(h)
+    const state = await h.state()
+    state.main.quotaToken = tokenFingerprint(jwt('acct-main'))
+    writeFileSync(h.paths.statePath, JSON.stringify(state))
+    await migrateToPool(h.deps())
+    expect((await h.row('main'))?.needsFirstReading).toBe(false)
+    expect((await h.state()).accounts.main.quota.primary.usedPercent).toBe(40)
+  })
+
   it('a re-run after completion does nothing', async () => {
     await migrated()
     const before = await h.bytes()
@@ -229,31 +276,55 @@ describe('migration', () => {
   })
 })
 
-describe('claustrum custody mode', () => {
-  it('writes nothing and logs the deferral once; after a switch to local mode it migrates', async () => {
-    await seedLegacyInstall(h)
-    await writeClaustrumModeAndTransition(h.paths, 'claustrum')
-    const before = await h.bytes()
-    const info: string[] = []
+describe('the Claustrum vault', () => {
+  it('a placeholder and a later login with a connected vault recover without warning', async () => {
+    await migrated()
+    const warned: string[] = []
     const log = {
-      info: (message: string) => info.push(message),
-      warn: () => {},
+      info: () => {},
+      warn: (message: string) => warned.push(message),
     }
-    expect(await migrateToPool(h.deps({ log }))).toEqual({
-      status: 'deferred-claustrum',
+    const deps = { ...h.deps({ log }), vaultServes: () => true }
+    expect(await adoptHostSlotLogin(deps)).toEqual({
+      status: 'nothing-to-import',
+      slot: 'placeholder',
     })
-    expect(await adoptHostSlotLogin(h.deps({ log }))).toEqual({
-      status: 'deferred-claustrum',
+    await h.setSlot(login('acct-new', 'r-new'))
+    expect(await adoptHostSlotLogin(deps)).toMatchObject({
+      status: 'completed',
     })
-    expect(await h.bytes()).toEqual(before)
-    expect(info).toHaveLength(1)
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    expect(warned).toEqual([])
+  })
 
-    await writeClaustrumModeAndTransition(h.paths, 'local')
-    expect(await migrateToPool(h.deps({ log }))).toMatchObject({
+  it('a config still naming the custody mode of older versions migrates like any other', async () => {
+    await seedLegacyInstall(h)
+    const config = await h.config()
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({ ...config, claustrum: { mode: 'claustrum' } }),
+    )
+    expect(await migrateToPool(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'main',
     })
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
+  })
+
+  it('while the vault serves this host, adoption restores the placeholder without disconnecting', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    const warned: string[] = []
+    const log = {
+      info: () => {},
+      warn: (message: string) => warned.push(message),
+    }
+    expect(
+      await adoptHostSlotLogin({ ...h.deps({ log }), vaultServes: () => true }),
+    ).toMatchObject({ status: 'completed', rowId: 'acct-new' })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    expect(await poolTokens(h)).toContain('r-new')
+    expect(warned).toEqual([])
   })
 })
 
@@ -278,8 +349,23 @@ describe('older builds running at the same time', () => {
       }),
     })
     await locked.promise
+    const contended = deferred()
+    const acquire = commonFs.acquireRefreshFileLock
+    const lockSpy = spyOn(
+      commonFs,
+      'acquireRefreshFileLock',
+    ).mockImplementation(async (options) => {
+      const result = await acquire(options)
+      if (options.name === MAIN_REFRESH_LOCK_NAME && result === null)
+        contended.resolve()
+      return result
+    })
     const migration = migrateToPool(h.deps())
-    await Bun.sleep(300)
+    try {
+      await contended.promise
+    } finally {
+      lockSpy.mockRestore()
+    }
     proceed.resolve()
     await legacy
     expect(await migration).toMatchObject({ status: 'completed' })
@@ -305,8 +391,11 @@ describe('older builds running at the same time', () => {
     await seedLegacyInstall(h)
     await leaseSlotToken('older-build')
     let rowWhileLeased: unknown = 'not checked'
+    const initialized = Promise.withResolvers<void>()
     const released = (async () => {
-      await Bun.sleep(200)
+      // The store cannot expose rows until migration writes its pool key.
+      // Observe that step instead of guessing how long initialization takes.
+      await initialized.promise
       rowWhileLeased = await h.row('main')
       // The older build's refresh ends and clears its lease, as
       // `refreshMainWithLease` does in its `finally`.
@@ -320,7 +409,12 @@ describe('older builds running at the same time', () => {
       }, h.paths)
     })()
     const outcome = await migrateToPool(
-      h.deps({ leaseWait: { timeoutMs: 5_000, pollMs: 20 } }),
+      h.deps({
+        leaseWait: { timeoutMs: 5_000, pollMs: 20 },
+        onStep: async (step) => {
+          if (step === 'after-pool-key-write') initialized.resolve()
+        },
+      }),
     )
     await released
     expect(rowWhileLeased).toBeUndefined()
@@ -470,6 +564,68 @@ describe('adoption of a later login in the slot', () => {
     })
   })
 
+  it('a rotation whose row learned another account after the transfer read it is refused, writes nothing and is retried', async () => {
+    await migrated()
+    // Row `main` with no recorded account, so the transfer passes the slot's
+    // account to the rotation. The account is removed from the config and
+    // from the credential's stamp: a stamp naming it would otherwise show the
+    // row with that account (the store treats it as a config write still to
+    // come), as on a row written before stamps carried an account.
+    const unrecorded = await h.config()
+    for (const account of unrecorded.accounts as Array<Record<string, unknown>>)
+      if (account.id === 'main') delete account.accountId
+    writeFileSync(h.paths.configPath, JSON.stringify(unrecorded, null, 2))
+    const state = JSON.parse(readFileSync(h.paths.statePath, 'utf8')) as {
+      accounts: Record<
+        string,
+        Record<string, { binding?: { identity?: string } }>
+      >
+    }
+    delete state.accounts.main?.[POOL_KEY]?.binding?.identity
+    writeFileSync(h.paths.statePath, JSON.stringify(state, null, 2))
+    expect((await h.row('main'))?.identity).toBeUndefined()
+    await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
+
+    // Another writer records a different account on the row after the
+    // transfer read it and before the rotation's own locked re-read.
+    let raced = false
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (raced || event.type !== 'acquired') return
+            if (!event.name.startsWith('row-')) return
+            raced = true
+            const config = JSON.parse(
+              readFileSync(h.paths.configPath, 'utf8'),
+            ) as { accounts: Array<Record<string, unknown>> }
+            for (const account of config.accounts)
+              if (account.id === 'main') account.accountId = 'acct-other'
+            writeFileSync(h.paths.configPath, JSON.stringify(config, null, 2))
+          },
+        },
+      }),
+    )
+
+    expect(raced).toBe(true)
+    // The store never records a second account on the row. Recording the
+    // first one moved the row's lock key (an unrecorded row is locked by its
+    // id, a recorded one by its account), so the store refuses at its locked
+    // re-read before comparing the accounts. Either refusal writes nothing,
+    // and the run ends retryably (the next run reads the row again) instead
+    // of failing.
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'store-row-key-changed',
+    })
+    const main = await h.row('main')
+    expect(main?.identity).toBe('acct-other')
+    expect(main?.credential).not.toMatchObject({
+      access: jwt('acct-main', 'fresh-access'),
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(false)
+  })
+
   it('a re-login with a different token replaces the row and bumps its credential epoch', async () => {
     await migrated()
     await h.setSlot(login('acct-main', 'r-main-2'))
@@ -507,9 +663,37 @@ describe('adoption of a later login in the slot', () => {
     })
   })
 
-  it('declared: a login landing between the fence and the placeholder write is overwritten', async () => {
+  it('a login adopted into a pool with no row main becomes row main', async () => {
+    await seedLegacyInstall(h)
+    const map = await h.slot.all()
+    delete map.openai
+    await Bun.write(h.authPath, JSON.stringify(map))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'nothing-to-import',
+    })
+    expect(await h.row('main')).toBeUndefined()
+
+    await h.setSlot(login('acct-later', 'r-later'))
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      operation: 'add',
+      placeholder: 'written',
+    })
+    const main = await h.row('main')
+    expect(main?.identity).toBe('acct-later')
+    expect(main?.credential).toMatchObject({ refresh: 'r-later' })
+    // `state.main` (quota, refresh backoff) describes the login that was in
+    // the slot before the migration, not this later login, so an adoption
+    // never copies it onto the row.
+    expect(main?.quota).toBeUndefined()
+    expect((await h.state()).accounts.main.lastRefreshError).toBeUndefined()
+  })
+
+  it('a login landing after the fence read is caught by the read right before the placeholder write', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
+    const writesBefore = await h.placeholderWrites()
     const outcome = await adoptHostSlotLogin(
       h.deps({
         onStep: async (step) => {
@@ -518,16 +702,28 @@ describe('adoption of a later login in the slot', () => {
         },
       }),
     )
-    // Declared race (the host slot has no compare-and-replace): the
-    // placeholder overwrites the late login in the slot, the earlier login is
-    // in the pool, and the late login is lost until the user logs in again.
-    expect(outcome).toMatchObject({
+    // The late login stays in the slot; the run ends retryably with its
+    // record kept, and nothing is overwritten.
+    expect(outcome).toEqual({ status: 'retry', reason: 'slot-changed' })
+    expect((await h.slotValue())?.refresh).toBe('r-late')
+    expect(await h.placeholderWrites()).toBe(writesBefore)
+    expect((await h.config())[POOL_MIGRATION_KEY].pending).toMatchObject({
+      rowId: 'acct-new',
+    })
+    // The next run finds the slot moved on and ends the earlier transfer
+    // without touching it; the one after adopts the late login.
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'acct-new',
+      placeholder: 'slot-moved-on',
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-late')
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-late',
       placeholder: 'written',
     })
-    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main', 'r-new'])
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-late', 'r-main', 'r-new'])
   })
 
   it('waits for an older build refreshing the target row under its fallback lock, then adopts', async () => {
@@ -539,12 +735,25 @@ describe('adoption of a later login in the slot', () => {
       path: h.paths.configPath,
     })
     let rowWhileHeld: unknown
+    const contended = deferred()
     const released = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       rowWhileHeld = (await h.row('main'))?.credential
       await held?.release()
     })()
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await released
     expect(rowWhileHeld).toMatchObject({ access: jwt('acct-main') })
     expect(outcome).toMatchObject({
@@ -593,7 +802,7 @@ describe('adoption of a later login in the slot', () => {
     })
   })
 
-  it('a login landing right after the placeholder write is reported and adopted next', async () => {
+  it('a login landing right after the placeholder write ends the run retryably; the next run ends the transfer and the one after adopts the login', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
     const outcome = await adoptHostSlotLogin(
@@ -604,11 +813,64 @@ describe('adoption of a later login in the slot', () => {
         },
       }),
     )
-    expect(outcome).toMatchObject({ placeholder: 'overwritten' })
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'placeholder-overwritten',
+    })
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      placeholder: 'slot-moved-on',
+    })
     expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'acct-late',
     })
+  })
+
+  it('a placeholder the host overwrites with the token just moved keeps the record and the shield, and the next run writes it again', async () => {
+    await migrated()
+    const relogin = login('acct-new', 'r-new')
+    await h.setSlot(relogin)
+    // The host writes back the very login the run just copied into the row
+    // (from its own earlier read of the file), so the slot and the row hold
+    // the same token again.
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        onStep: async (step) => {
+          if (step === 'after-placeholder-write') await h.setSlot(relogin)
+        },
+      }),
+    )
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'placeholder-overwritten',
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-new')
+    expect((await h.row('acct-new'))?.credential).toMatchObject({
+      refresh: 'r-new',
+    })
+    // Both copies stand, so older builds must keep skipping the row and this
+    // build's slot refresh must keep standing down for the token.
+    const config = await h.config()
+    expect(config.mainAccountId).toBe('acct-new')
+    expect(config[POOL_MIGRATION_KEY].pending).toMatchObject({
+      rowId: 'acct-new',
+    })
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-new')).toBe(
+      true,
+    )
+
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      operation: 'resumed',
+      placeholder: 'written',
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    const after = await h.config()
+    expect(after.mainAccountId).toBeUndefined()
+    expect(after[POOL_MIGRATION_KEY].pending).toBeUndefined()
   })
 })
 
@@ -657,13 +919,26 @@ describe('a slot that changes while the row write waits for its legacy lock', ()
     await h.setSlot(login('acct-main', 'r-main-2'))
     const held = await holdRowLock('main')
     let rowWhileHeld: unknown
+    const contended = deferred()
     const change = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       rowWhileHeld = (await h.row('main'))?.credential
       await h.setSlot(login('acct-main', 'r-main-3', 'third'))
       await held?.release()
     })()
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await change
     // Nothing was written to the row while its legacy lock was held.
     expect(rowWhileHeld).toMatchObject({ refresh: 'r-main' })
@@ -687,14 +962,27 @@ describe('a slot that changes while the row write waits for its legacy lock', ()
     // An older build holds the fb1 row's fallback refresh lock throughout,
     // as it does while it refreshes that row.
     const fb1Held = await holdRowLock('fb1')
+    const contended = deferred()
     const change = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       await h.setSlot(login('acct-fb1', 'r-fb1-2'))
       await mainHeld?.release()
     })()
     // The main row's write waited out its lock and landed; the slot had
     // moved on to another account's login, which is left for the next run.
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await change
     expect(outcome).toMatchObject({
       status: 'completed',
@@ -929,9 +1217,18 @@ describe('lock order of a transfer', () => {
       path: h.paths.statePath,
     })
     expect(poolRowLock).not.toBeNull()
-    const running = migrateToPool(h.deps())
-    // Long enough for the run to reach the row write and wait there.
-    await Bun.sleep(400)
+    const contended = deferred()
+    const running = migrateToPool(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (event.type === 'contended' && event.name.startsWith('row-'))
+              contended.resolve()
+          },
+        },
+      }),
+    )
+    await contended.promise
     const free: Record<string, boolean> = {}
     for (const name of [
       MAIN_REFRESH_LOCK_NAME,
@@ -1009,6 +1306,182 @@ describe('the pending record and the slot refresh', () => {
     expect(outcome).toMatchObject({ status: 'completed', rowId: 'main' })
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-rotated'])
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+})
+
+// A run that stops after writing its record (a crash, or a build with the
+// migration switched off taking over) leaves the record behind, and the slot
+// refresh stands down for the token it names. Past its expiry the slot
+// refresh may drop it, unless that would leave the token with two refreshers.
+describe('an expired pending-transfer record', () => {
+  class Stop extends Error {}
+
+  /** Runs `run` until `step`, where it stops for good, as after a crash. */
+  async function stopAt(
+    run: typeof migrateToPool | typeof adoptHostSlotLogin,
+    step: string,
+  ) {
+    await expect(
+      run(
+        h.deps({
+          onStep: async (current) => {
+            if (current === step) throw new Stop()
+          },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(Stop)
+  }
+
+  async function ageRecord(ms: number) {
+    const config = await h.config()
+    config[POOL_MIGRATION_KEY].pending.recordedAt = Date.now() - ms
+    writeFileSync(h.paths.configPath, JSON.stringify(config))
+  }
+
+  it('a fresh record is kept and the slot refresh keeps standing down', async () => {
+    await seedLegacyInstall(h)
+    await stopAt(migrateToPool, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS - 60_000)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(false)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      true,
+    )
+  })
+
+  it('an expired record of a stopped migration is dropped, and the next run starts over and completes', async () => {
+    await seedLegacyInstall(h)
+    // Stopped after the row write: before the migration is marked done the
+    // pool refreshes no row and the shield keeps older builds off it, so the
+    // slot is the only refresher left.
+    await stopAt(migrateToPool, 'after-row-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(true)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      false,
+    )
+    expect((await h.config()).mainAccountId).toBe('acct-main')
+    // With the record gone, this build's slot refresh may rotate the slot's
+    // token; the next run must pick up the rotated one.
+    await h.setSlot(login('acct-main', 'r-main-2', 'rotated'))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      placeholder: 'written',
+    })
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-2'])
+  })
+
+  it('is kept while a run holds the run lock', async () => {
+    await seedLegacyInstall(h)
+    await stopAt(migrateToPool, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    const live = await acquireRefreshFileLock({
+      name: 'pool-migration',
+      ttlMs: 60_000,
+      path: h.paths.configPath,
+    })
+    try {
+      expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(false)
+    } finally {
+      await live?.release()
+    }
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      true,
+    )
+  })
+
+  it('on a migrated install it is kept once the row holds the token, which the pool then refreshes', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    await stopAt(adoptHostSlotLogin, 'after-row-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-new')).toBe(false)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-new')).toBe(
+      true,
+    )
+  })
+
+  // The user signs in again as main's account; the adoption stops after the
+  // row write, and the pool then rotates row `main`, spending the token the
+  // slot still holds. Which copy is good can no longer be told from the
+  // files, so the slot value must never replace the row.
+  it('on a migrated install whose row was rotated since, dropping it declines the slot value, so a spent token never replaces the row', async () => {
+    await migrated()
+    const relogin = login('acct-main', 'r-relogin', 'relogin')
+    await h.setSlot(relogin)
+    await stopAt(adoptHostSlotLogin, 'after-row-write')
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-relogin',
+    })
+    await openStore().rotate('main', {
+      type: 'oauth',
+      access: jwt('acct-main', 'pool-rotated'),
+      refresh: 'r-pool-rotated',
+      expires: FAR,
+    })
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+
+    expect(
+      await reclaimExpiredPoolTransfer(h.paths, 'r-relogin', {
+        slotAccess: relogin.access,
+      }),
+    ).toBe(true)
+    expect(
+      poolTransferPendingInConfigFile(h.paths.configPath, 'r-relogin'),
+    ).toBe(false)
+
+    // The slot refresh of the spent token fails and leaves the slot as it
+    // was; the next adoption leaves that value alone.
+    expect(await adoptHostSlotLogin(h.deps())).toEqual({
+      status: 'nothing-to-import',
+      slot: 'declined',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-pool-rotated',
+    })
+  })
+
+  it('on a migrated install whose row was rotated before the transfer wrote it, a slot token the refresh renewed is adopted', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-relogin', 'relogin'))
+    await stopAt(adoptHostSlotLogin, 'after-record-write')
+    await openStore().rotate('main', {
+      type: 'oauth',
+      access: jwt('acct-main', 'pool-rotated'),
+      refresh: 'r-pool-rotated',
+      expires: FAR,
+    })
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(
+      await reclaimExpiredPoolTransfer(h.paths, 'r-relogin', {
+        slotAccess: jwt('acct-main', 'relogin'),
+      }),
+    ).toBe(true)
+
+    // The slot token was never copied, so the slot refresh renews it; the
+    // renewed login is a new slot value and is adopted as usual.
+    await h.setSlot(login('acct-main', 'r-relogin-2', 'renewed'))
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      placeholder: 'written',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-relogin-2',
+    })
+  })
+
+  it('on a migrated install it is dropped when the row never received the token', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    await stopAt(adoptHostSlotLogin, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-new')).toBe(true)
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      placeholder: 'written',
+    })
   })
 })
 
@@ -1126,15 +1599,19 @@ describe('refreshing a pool row while older builds run', () => {
       })
       let calledWhileHeld: boolean | undefined
       let called = false
+      const contended = deferred()
       const released = (async () => {
-        await Bun.sleep(300)
+        await contended.promise
         calledWhileHeld = called
         await held?.release()
       })()
       const outcome = await refreshPoolRow(
         {
           paths: h.paths,
-          store: openStore(),
+          store: openStore((event) => {
+            if (event.type === 'contended' && event.name === name())
+              contended.resolve()
+          }),
           legacyLocks: { timeoutMs: 5_000 },
         },
         rowId,

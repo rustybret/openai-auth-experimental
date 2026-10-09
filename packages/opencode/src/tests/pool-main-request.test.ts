@@ -5,9 +5,10 @@
 // drive the plugin's real fetch override (as integration.test.ts does) and the
 // loader lifecycle against that layout.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   statSync,
@@ -25,12 +26,17 @@ import {
   isPoolMainPlaceholder,
   POOL_MAIN_PLACEHOLDER_REFRESH,
 } from '../core/pool-main.ts'
-import { POOL_PLACEHOLDER_REFRESH } from '../core/pool-migration.ts'
+import {
+  adoptHostSlotLogin,
+  migrateToPool,
+  POOL_PLACEHOLDER_REFRESH,
+} from '../core/pool-migration.ts'
 import {
   __resetProcessHeartbeatForTest,
   processHeartbeatPath,
 } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin, createResetTargetResolver } from '../index.ts'
+import { flushForTest } from '../logger.ts'
 import {
   drainSidebarWrites,
   hashSidebarSessionId,
@@ -38,6 +44,14 @@ import {
   type SidebarState,
 } from '../sidebar-state.ts'
 import { PackageVersion } from '../version.ts'
+import { createFailurePhaseClock } from './failure-phase-clock.ts'
+import {
+  harness,
+  jwt,
+  login,
+  seedLegacyInstall,
+} from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -53,6 +67,9 @@ const PLACEHOLDER = {
   expires: 0,
 }
 
+const LOGIN_REQUIRED_MESSAGE =
+  'This setup has no OpenAI login in its account store. Sign in for this setup with opencode auth login, or point OPENCODE_OPENAI_AUTH_FILE and OPENCODE_OPENAI_AUTH_STATE_FILE at the store that holds the login.'
+
 type SlotValue = {
   type: 'oauth'
   access?: string
@@ -65,8 +82,14 @@ let configFile: string
 let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
+const clock = createFailurePhaseClock()
+const phaseIt = (name: string, body: () => Promise<void>) =>
+  scope.it(name, () => clock.run(name, body))
 
 beforeEach(() => {
+  scope.capturePluginWork()
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-main-'))
   configFile = join(configDir, 'openai-auth.json')
   sidebarFile = join(configDir, 'sidebar-state.json')
@@ -84,16 +107,20 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  restoreEnv('XDG_STATE_HOME')
-  delete process.env.NODE_ENV
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    restoreEnv('XDG_STATE_HOME')
+    restoreEnv('XDG_DATA_HOME')
+    delete process.env.NODE_ENV
+  })
 })
 
 function mockPluginInput(): PluginInput {
@@ -138,6 +165,16 @@ function seedStore(
       refresh: { refreshBeforeExpiryMinutes: 5 },
       accounts,
     }),
+  )
+}
+
+function seedSharedPlaceholder() {
+  process.env.XDG_DATA_HOME = join(configDir, 'data')
+  const dataDir = join(configDir, 'data', 'opencode')
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(
+    join(dataDir, 'auth.json'),
+    JSON.stringify({ openai: PLACEHOLDER }),
   )
 }
 
@@ -197,22 +234,31 @@ function installWire(
 }
 
 async function loadFetch(getAuth: () => Promise<SlotValue>) {
-  hooks = await CodexAuthPlugin(mockPluginInput(), {
-    experimentalWebSockets: false,
-  })
+  hooks = await clock.phase('plugin initialization', () =>
+    CodexAuthPlugin(mockPluginInput(), {
+      experimentalWebSockets: false,
+    }),
+  )
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
-  const loaded = await authHook.loader(
-    getAuth as never,
-    { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
-      NonNullable<(typeof authHook)['loader']>
-    >[1],
+  const loader = authHook.loader
+  const loaded = await clock.phase('auth loader', () =>
+    loader(
+      getAuth as never,
+      { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
+        NonNullable<(typeof authHook)['loader']>
+      >[1],
+    ),
   )
   const fetchOverride = (loaded as Record<string, unknown>).fetch as
     | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return fetchOverride
+  return scope.wrap((...args: Parameters<typeof fetchOverride>) =>
+    clock.phase('request refresh lock, token refresh and send', () =>
+      fetchOverride(...args),
+    ),
+  )
 }
 
 function request(headers: Record<string, string> = {}): RequestInit {
@@ -256,6 +302,153 @@ describe('placeholder recognition', () => {
 })
 
 describe('request path with the main account in the pool', () => {
+  it('a wrongly migrated empty store refuses locally with sign-in instructions', async () => {
+    seedSharedPlaceholder()
+    // The separate setup's config after it wrongly adopted the operator's
+    // placeholder, with no login moved into its own account store.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        commonAuthPool: { schemaVersion: 1, rows: {} },
+        routing: { mode: 'main-first' },
+        openaiAuthPool: { migratedAt: 1_791_000_000_000 },
+      }),
+    )
+    writeFileSync(
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+      '{"version":1,"accounts":{}}',
+    )
+    const wire = installWire()
+    const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+    await expect(
+      fetchOverride('https://api.openai.com/v1/responses', request()),
+    ).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+    expect(wire.sends).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+    flushForTest()
+    const warnings = readFileSync(
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE as string,
+      'utf8',
+    )
+      .split('\n')
+      .filter((line) => line.includes(LOGIN_REQUIRED_MESSAGE))
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('WARN')
+  })
+
+  it('an unmigrated empty store with a foreign placeholder refuses locally', async () => {
+    seedSharedPlaceholder()
+    seedStore('main-first', [])
+    const wire = installWire()
+    const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+    await expect(
+      fetchOverride('https://api.openai.com/v1/responses', request()),
+    ).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+    expect(wire.sends).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+  })
+
+  it('a completed base migration with an untagged placeholder still serves main and adopts later logins', async () => {
+    const h = harness()
+    try {
+      await seedLegacyInstall(h)
+      const config = await h.config()
+      config.routing = { mode: 'main-first' }
+      writeFileSync(h.paths.configPath, JSON.stringify(config))
+      await migrateToPool(h.deps())
+      await h.setSlot(PLACEHOLDER)
+      expect(await migrateToPool(h.deps())).toEqual({
+        status: 'already-migrated',
+      })
+      expect(await adoptHostSlotLogin(h.deps())).toEqual({
+        status: 'nothing-to-import',
+        slot: 'placeholder',
+      })
+      expect((await h.row('main'))?.enabled).toBe(true)
+      expect((await h.row('main'))?.disabledReason).toBeUndefined()
+      const bytes = await h.bytes()
+      writeFileSync(configFile, bytes.config as string)
+      writeFileSync(
+        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+        bytes.state as string,
+      )
+      const wire = installWire()
+      const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+      expectPlaceholderNeverRefreshed(wire)
+      await h.setSlot(login('acct-main', 'signed-in-again'))
+      expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+        status: 'completed',
+        rowId: 'main',
+      })
+      expect((await h.row('main'))?.enabled).toBe(true)
+      expect((await h.row('main'))?.credential).toMatchObject({
+        refresh: 'signed-in-again',
+      })
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('an interrupted own migration still serves main after writing the placeholder', async () => {
+    const h = harness()
+    try {
+      await seedLegacyInstall(h)
+      const config = await h.config()
+      config.routing = { mode: 'main-first' }
+      writeFileSync(h.paths.configPath, JSON.stringify(config))
+      const crash = new Error('interrupted after placeholder write')
+      await expect(
+        migrateToPool(
+          h.deps({
+            onStep: (step) => {
+              if (step === 'after-placeholder-write') throw crash
+            },
+          }),
+        ),
+      ).rejects.toThrow(crash.message)
+      const interrupted = await h.config()
+      expect(interrupted.openaiAuthPool.migratedAt).toBeUndefined()
+      expect(interrupted.openaiAuthPool.pending.rowId).toBe('main')
+      expect(interrupted.mainAccountId).toBe('acct-main')
+      const mainToken = (await h.slot.all()).openai
+      expect(mainToken).toMatchObject(PLACEHOLDER)
+      expect((mainToken as { accountId: string }).accountId).toMatch(
+        /^openai-auth-pool:[a-f0-9]{64}$/,
+      )
+      const bytes = await h.bytes()
+      writeFileSync(configFile, bytes.config as string)
+      writeFileSync(
+        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+        bytes.state as string,
+      )
+      const wire = installWire()
+      const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+      expectPlaceholderNeverRefreshed(wire)
+      expect(await migrateToPool(h.deps())).toMatchObject({
+        status: 'completed',
+        rowId: 'main',
+        operation: 'resumed',
+      })
+    } finally {
+      h.cleanup()
+    }
+  })
+
   it('main-first sends with row main and attributes its quota to main', async () => {
     seedStore('main-first', [row('main'), row('fallback-1')])
     const wire = installWire()
@@ -425,7 +618,13 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
   // from then on, so only a read made while holding the lock can see `after`.
   function slotChangingUnderLock(before: SlotValue, after: SlotValue) {
     const lockFile = `${configFile}.main-refresh.lock`
-    return async () => ({ ...(existsSync(lockFile) ? after : before) })
+    return async () =>
+      clock.phase(
+        existsSync(lockFile)
+          ? 'slot read under refresh lock'
+          : 'slot read before refresh lock',
+        () => ({ ...(existsSync(lockFile) ? after : before) }),
+      )
   }
 
   const expiredR1: SlotValue = {
@@ -435,27 +634,30 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
     expires: Date.now() - 1_000,
   }
 
-  it('refreshes the token present after the lock, not the one read before it', async () => {
-    seedStore('main-first', [])
-    const wire = installWire()
-    const fetchOverride = await loadFetch(
-      slotChangingUnderLock(expiredR1, {
-        type: 'oauth',
-        access: 'main-R2-access',
-        refresh: 'main-R2',
-        expires: Date.now() - 1_000,
-      }),
-    )
+  phaseIt(
+    'refreshes the token present after the lock, not the one read before it',
+    async () => {
+      seedStore('main-first', [])
+      const wire = installWire()
+      const fetchOverride = await loadFetch(
+        slotChangingUnderLock(expiredR1, {
+          type: 'oauth',
+          access: 'main-R2-access',
+          refresh: 'main-R2',
+          expires: Date.now() - 1_000,
+        }),
+      )
 
-    const response = await fetchOverride(
-      'https://api.openai.com/v1/responses',
-      request(),
-    )
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
 
-    expect(response.status).toBe(200)
-    expect(wire.refreshTokens).toEqual(['main-R2'])
-    expect(wire.sends).toEqual(['Bearer refreshed-access'])
-  })
+      expect(response.status).toBe(200)
+      expect(wire.refreshTokens).toEqual(['main-R2'])
+      expect(wire.sends).toEqual(['Bearer refreshed-access'])
+    },
+  )
 
   it('uses a token another process already rotated without refreshing again', async () => {
     seedStore('main-first', [])

@@ -7,7 +7,7 @@
  * pushed quota and sticky pin are written in the background and land once the
  * file can be written again, without another request having to come along.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
@@ -18,6 +18,12 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import {
+  type AccountStorage,
+  FallbackAccountManager,
+  loadAccounts,
+  type OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index.ts'
 import { flushForTest } from '../logger.ts'
@@ -27,6 +33,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -39,6 +46,8 @@ import {
 // hold on a loaded machine: a request that waits on the lock at all overruns
 // it by an order of magnitude.
 const HOT_PATH_BOUND_MS = 1_000
+const scope = createRequestTestScope()
+const it = scope.it
 
 type FetchOverride = (
   url: RequestInfo | URL,
@@ -63,6 +72,11 @@ function createMockPluginInput(): PluginInput {
 async function loadFetchOverride(experimentalWebSockets = false) {
   const hooks = await CodexAuthPlugin(createMockPluginInput(), {
     experimentalWebSockets,
+    // These tests hold the store's locks to prove the request path never
+    // waits on them, on an install that has not moved to the account pool.
+    // A background pool migration would take the same locks and move the
+    // store under the test.
+    poolMigration: { enabled: false },
   })
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
@@ -83,7 +97,7 @@ async function loadFetchOverride(experimentalWebSockets = false) {
     | FetchOverride
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return { hooks, fetchOverride }
+  return { hooks, fetchOverride: scope.wrap(fetchOverride) }
 }
 
 function responseRequestInit(sessionId: string): RequestInit {
@@ -177,6 +191,7 @@ describe('request path never waits on bookkeeping', () => {
   const heldLocks: Array<{ release(): Promise<void> }> = []
 
   beforeEach(() => {
+    scope.capturePluginWork()
     configDir = mkdtempSync(join(tmpdir(), 'oai-hot-path-'))
     configFile = join(configDir, 'openai-auth.json')
     stateFile = join(configDir, 'openai-auth-state.json')
@@ -194,17 +209,19 @@ describe('request path never waits on bookkeeping', () => {
 
   afterEach(async () => {
     for (const lock of heldLocks.splice(0)) await lock.release()
-    globalThis.fetch = originalFetch
-    await hooks?.dispose?.()
-    await drainSidebarWrites()
-    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-      FLOOR_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    restoreEnv('OPENCODE_CONFIG_DIR')
-    delete process.env.NODE_ENV
-    rmSync(configDir, { recursive: true, force: true })
+    await scope.teardown(async () => {
+      await hooks?.dispose?.()
+      globalThis.fetch = originalFetch
+      await drainSidebarWrites()
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      restoreEnv('OPENCODE_CONFIG_DIR')
+      delete process.env.NODE_ENV
+      rmSync(configDir, { recursive: true, force: true })
+    })
   })
 
   // Every provider call answers 200 with a quota header, so the served
@@ -342,6 +359,40 @@ describe('request path never waits on bookkeeping', () => {
     expect(new Set(labels).size).toBe(labels.length)
   }, 20_000)
 
+  it("legacy fallback selection after a refresh does not wait for the state file's save lock", async () => {
+    seedStore('fallback-first', ['fallback-1'])
+    const paths = { configPath: configFile, statePath: stateFile }
+    const storage = (await loadAccounts(paths)) as AccountStorage
+    const due = storage.accounts[0] as OAuthAccount
+    due.expires = Date.now() + 1_000
+    const manager = new FallbackAccountManager({
+      paths,
+      now: () => Date.now(),
+      fetchImpl: fetch,
+    })
+    // The refresh persists its own rotated token; right after it, another
+    // writer takes the state file's save lock. What selection still saves
+    // (recorded refresh errors, `lastUsed`) only feeds later decisions, so
+    // the request must not wait for that lock.
+    manager.refreshAccount = async (account) => {
+      await holdLock(stateFile, 'save')
+      return {
+        ...(account as OAuthAccount),
+        access: 'fallback-1-rotated',
+        expires: Date.now() + 3600_000,
+      }
+    }
+
+    const started = performance.now()
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    const elapsedMs = performance.now() - started
+
+    expect(usable.map((account) => account.id)).toEqual(['fallback-1'])
+    expect(elapsedMs).toBeLessThan(HOT_PATH_BOUND_MS)
+    await releaseLocks()
+    await manager.selectionBookkeepingSettled()
+  }, 30_000)
+
   for (const mode of ['main-first', 'fallback-first', 'sticky-balanced']) {
     it(`${mode}: returns within the bound while the sidebar and store locks are held, and the bookkeeping lands after release`, async () => {
       const fallbackIds =
@@ -446,8 +497,10 @@ describe('request path never waits on bookkeeping', () => {
         )
         expect(response.status).toBe(200)
         await response.text()
-        // Let the failed write settle and any rejection be reported.
-        await new Promise((resolve) => setTimeout(resolve, 200))
+        await drainSidebarWrites()
+        // Node reports unhandled rejections on the next event-loop turn, after
+        // the sidebar promises have settled; no wall-clock grace is needed.
+        await new Promise<void>((resolve) => setImmediate(resolve))
       })
     } finally {
       process.off('unhandledRejection', onUnhandled)

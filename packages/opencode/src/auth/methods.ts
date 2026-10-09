@@ -4,6 +4,7 @@ import {
   type DoctorCheck,
   doctorAction,
   type LoginAccount,
+  type MenuAction,
   type MenuLogin,
   type MenuOutcome,
   type MenuTerminal,
@@ -24,15 +25,19 @@ import {
   beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
-  claustrumMode,
   completeDeviceAuth,
   extractAccountId,
   flowCleanup,
   generatePKCE,
   loadAccounts,
   mutateAccounts,
+  type OpenAiVault,
   POOL_MAIN_ROW_ID,
   startOAuthServer,
+  type VaultWaitOptions,
+  vaultApprovalInstructions,
+  vaultConnectOutcome,
+  vaultEnrollmentLine,
   waitForOAuthCallback,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -49,11 +54,13 @@ import {
   poolRemovalRefusal,
   poolSettingsLocks,
 } from '../core/pool-accounts'
-import { legacyRefreshLocks } from '../core/pool-migration'
+import { isPoolMainPlaceholder } from '../core/pool-main'
+import { legacyRefreshLocks, withMainRefreshLock } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
 import { type AuthDetails, authDoctorChecks, readStoreIds } from './doctor'
+import { runVaultAccountMenu } from './vault-account-menu'
 
 type AuthMethod = AuthHook['methods'][number]
 type BeginLogin = typeof beginAccountLogin
@@ -76,6 +83,8 @@ export interface AuthMethodDependencies {
   migrationBlockers(): Promise<readonly MigrationBlocker[]>
   /** The terminal the menu draws on; the process's own by default. */
   terminal?: MenuTerminal
+  /** How Connect waits for the operator's approval (tests shorten it). */
+  vaultWait?: VaultWaitOptions
 }
 
 export interface CreateAuthMethodsOptions {
@@ -93,6 +102,22 @@ export interface CreateAuthMethodsOptions {
    * failure never fails the repair.
    */
   onMainSlotWritten?: () => Promise<void>
+  /**
+   * This host's connection to the Claustrum vault. With it, the menu of a
+   * migrated install offers to connect (enroll) this host.
+   */
+  vault?: Pick<
+    OpenAiVault,
+    | 'host'
+    | 'name'
+    | 'status'
+    | 'waitForApproval'
+    | 'routes'
+    | 'snapshot'
+    | 'identities'
+    | 'refresh'
+    | 'pollQuota'
+  >
 }
 
 const MENU_TITLE = 'OpenAI accounts'
@@ -164,6 +189,7 @@ export function createAuthMethods({
   packageVersion = PackageVersion,
   dependencies,
   onMainSlotWritten,
+  vault,
 }: CreateAuthMethodsOptions): AuthMethod[] {
   const deps: AuthMethodDependencies = {
     authorizeBrowser: dependencies?.authorizeBrowser ?? authorizeBrowser,
@@ -191,6 +217,7 @@ export function createAuthMethods({
             }))
       }),
     ...(dependencies?.terminal ? { terminal: dependencies.terminal } : {}),
+    ...(dependencies?.vaultWait ? { vaultWait: dependencies.vaultWait } : {}),
   }
 
   const readAuth = async (): Promise<AuthDetails> =>
@@ -217,16 +244,29 @@ export function createAuthMethods({
     return (storage?.accounts.length ?? 0) > 0
   }
 
+  // Writes OpenCode's `openai` slot under `main-refresh`, the lock every slot
+  // writer of this plugin holds, so this write cannot land between the
+  // account-pool migration's last slot read and its placeholder write. The
+  // slot is read again under the lock: if the migration put the placeholder
+  // in meanwhile, main lives in the pool row and nothing is written. The
+  // lock is released before `onMainSlotWritten`, whose adoption takes it.
   const setMainAuth = async (credential: {
     refresh: string
     access?: string
     expires?: number
   }) => {
-    await client.auth.set({
-      path: { id: 'openai' },
-      body: { type: 'oauth', ...credential },
-    } as never)
-    await onMainSlotWritten?.().catch(() => {})
+    const written = await withMainRefreshLock(
+      getPaths().configPath,
+      async () => {
+        if (isPoolMainPlaceholder(await readAuth())) return false
+        await client.auth.set({
+          path: { id: 'openai' },
+          body: { type: 'oauth', ...credential },
+        } as never)
+        return true
+      },
+    )
+    if (written) await onMainSlotWritten?.().catch(() => {})
   }
 
   /** The OAuth login the menu's add and re-authenticate actions run. */
@@ -321,11 +361,56 @@ export function createAuthMethods({
     extraLocks: poolSettingsLocks(paths),
     pollQuota,
     doctor: doctorChecks(true),
-    custody: async () =>
-      claustrumMode(await deps.loadAccounts(paths)) === 'claustrum',
     status: async () => {
       const storage = await deps.loadAccounts(paths)
-      return [`Routing: ${storage?.routing?.mode ?? 'main-first'}`]
+      return [
+        `Routing: ${storage?.routing?.mode ?? 'main-first'}`,
+        ...(vault
+          ? [
+              vaultEnrollmentLine(
+                vault.host,
+                vault.name,
+                (await vault.status()).enrollment,
+              ),
+            ]
+          : []),
+      ]
+    },
+    ...(vault ? { extraActions: [connectVaultAction(vault)] } : {}),
+  })
+
+  /**
+   * Enrolls this host with the Claustrum vault: proposes it, tells the
+   * operator the `ck` commands that approve it, and waits for the approval.
+   * Interrupting the wait loses nothing: the request stays on disk, and
+   * Connect resumes it.
+   */
+  const connectVaultAction = (
+    target: NonNullable<CreateAuthMethodsOptions['vault']>,
+  ): MenuAction => ({
+    id: 'vault-connect',
+    label: 'Connect to the Claustrum vault',
+    hint: 'serve OpenAI accounts held in the vault',
+    run: async (context) => {
+      context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
+      let shown: string | undefined
+      const status = await target.waitForApproval({
+        ...deps.vaultWait,
+        onPending: (pending) => {
+          const key =
+            pending.state === 'pending'
+              ? (pending.requestId ?? pending.retryCode ?? '')
+              : pending.state
+          if (key === shown) return
+          shown = key
+          for (const line of vaultApprovalInstructions(target.name, pending))
+            context.print(line)
+          context.print(
+            'Waiting for the approval… (stop with Ctrl-C; Connect picks the request up again)',
+          )
+        },
+      })
+      context.print(vaultConnectOutcome(target, status).text)
     },
   })
 
@@ -360,7 +445,8 @@ export function createAuthMethods({
     const store = deps.openAccountPool(paths)
     if ((await migratedPoolRows(paths, store)) === undefined)
       return notMigratedMenu()
-    return runAccountMenu(accountMenuOptions(paths, store))
+    const options = accountMenuOptions(paths, store)
+    return vault ? runVaultAccountMenu(options, vault) : runAccountMenu(options)
   }
 
   return [

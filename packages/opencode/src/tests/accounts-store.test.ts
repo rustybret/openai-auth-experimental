@@ -17,7 +17,6 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import { getAccountPaths } from '../core/account-paths'
-import { localCustody } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -95,7 +94,6 @@ describe('request-path bookkeeping never fails the caller', () => {
     breakStateWrites()
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
     })
 
     // Must resolve, not reject: the caller has a provider response to return.
@@ -125,7 +123,6 @@ describe('request-path bookkeeping never fails the caller', () => {
     breakStateWrites()
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
       refreshFn: async () => ({
         access: 'rotated-access',
         refresh: 'rotated-refresh',
@@ -778,6 +775,40 @@ describe('account store migration locking', () => {
     expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
     expect(readFileSync(statePath, 'utf8')).toBe(firstState)
   })
+
+  it('returns at once on an already migrated store while another writer holds the lock', async () => {
+    // Every session start calls this. On a migrated store it must not wait
+    // for the save lock: a held lock, or an event loop too busy to retry in
+    // time, used to fail the whole session start after 15 s.
+    const { migrateIfNeeded } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const token = {
+      type: 'oauth' as const,
+      access: 'first-access',
+      refresh: 'first-refresh',
+      expires: Date.now() + 3600_000,
+    }
+    await migrateIfNeeded(token, getAccountPaths(cfgPath))
+    const firstConfig = readFileSync(cfgPath, 'utf8')
+
+    const lock = await acquireRefreshFileLock({
+      name: 'save',
+      ttlMs: 10_000,
+      path: cfgPath,
+    })
+    expect(lock).not.toBeNull()
+    try {
+      const settled = await Promise.race([
+        migrateIfNeeded(token, getAccountPaths(cfgPath)).then(() => 'done'),
+        wait(1_000).then(() => 'waited on the lock'),
+      ])
+      expect(settled).toBe('done')
+    } finally {
+      await lock?.release()
+    }
+    expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
+  })
 })
 
 describe('removed fallback refresh guard', () => {
@@ -813,7 +844,6 @@ describe('removed fallback refresh guard', () => {
       cfgPath,
       {
         paths: getAccountPaths(cfgPath),
-        custody: localCustody,
         now: () => now,
         refreshFn: async () => {
           refreshCalls++
@@ -883,7 +913,6 @@ describe('removed fallback refresh guard', () => {
       | undefined
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
       now: () => now,
       refreshFn: async () => {
         signalRefreshStarted?.()
@@ -961,7 +990,6 @@ describe('removed fallback refresh guard', () => {
       cfgPath,
       {
         paths: getAccountPaths(cfgPath),
-        custody: localCustody,
         now: () => now,
         refreshFn: async () => {
           refreshCalls++

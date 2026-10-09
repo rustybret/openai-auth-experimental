@@ -1,0 +1,2 @@
+# Exclusions for ORW fork sync
+take-theirs: .github/workflows/*

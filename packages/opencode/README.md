@@ -20,6 +20,10 @@ Restart OpenCode after changing plugin config, then authenticate:
 /login openai
 ```
 
+## OpenCode 2
+
+On OpenCode 2 (`@opencode/cli`, tested on 2.0.21) list the same package under `plugins`; OpenCode 2 loads its `./server` entry. OpenCode 2's own OpenAI driver sends the requests, and the plugin chooses the account from the shared account pool and sets its credential through OpenCode 2's session hooks. Logins (`opencode auth login openai`) go into the pool; OpenCode 2 keeps only a placeholder. The `/openai` menu, the sidebar, keep-warm and OpenCode 1's Codex request shaping are not available there yet. See the [repository README](https://github.com/cortexkit/openai-auth#opencode-2) for the details.
+
 ## Features
 
 - ChatGPT Plus/Pro OAuth login (browser and headless device flows), plus a manual API-key fallback.
@@ -34,9 +38,9 @@ Restart OpenCode after changing plugin config, then authenticate:
 
 ## Commands
 
-One command, `/openai`, opens one menu in the TUI: Accounts (add with browser or device-code sign-in, disable, enable, move, remove), Quota, Routing, Limits (the killswitch and per-account floors), Cache (keep-warm), Diagnostics (request dumps, log level), Reset credits, This session (the sticky pin) and Claustrum. The menu works on the account pool; until the accounts have moved to it, `/openai` shows only that notice and the processes holding the move back. The earlier per-feature commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone.
+One command, `/openai`, opens one menu in the TUI: Accounts (add with browser or device-code sign-in, disable, enable, move, remove), Quota, Routing, Limits (the killswitch and per-account floors), Cache (keep-warm), Diagnostics (request dumps, log level), Reset credits, This session (the sticky pin) and Vault (connect this host to the Claustrum vault, whose OpenAI accounts then serve beside yours; disconnect; disable or enable each vault account). The menu works on the account pool; until the accounts have moved to it, `/openai` shows only that notice and the processes holding the move back. The earlier per-feature commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone.
 
-On a headless machine, where `/openai` is out of reach, `opencode auth login` offers the account actions — add, re-authenticate, remove, enable or disable, check quotas, the auth doctor, or delete every account except `main`. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai`.
+On a headless machine, where `/openai` is out of reach, `opencode auth login` offers the account actions — add, re-authenticate, remove, enable or disable, check quotas, the auth doctor, connect to the Claustrum vault (it prints the `ck auth enroll approve` and `ck auth grant` commands to run, and waits for the approval), or delete every account except `main`. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai`.
 
 ## Configuration
 

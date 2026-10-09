@@ -1,13 +1,27 @@
 // The plugin running the account-pool migration and later adoptions in the
 // background: through its real loader, fetch override and auth methods,
 // against a legacy install on disk and a file-backed OpenCode login slot.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { connectClaustrumScopedClient } from '@cortexkit/common-auth/claustrum'
+import { vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-import type { PoolLifecycleDeps } from '../core/pool-lifecycle.ts'
 import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import type { PoolLifecycleDeps } from '../core/pool-lifecycle.ts'
+import * as poolMigrationSteps from '../core/pool-migration.ts'
+import {
+  adoptHostSlotLogin,
   type HostSlotAdapter,
   isPoolPlaceholder,
   POOL_MIGRATION_KEY,
@@ -17,6 +31,7 @@ import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -34,8 +49,12 @@ let stateFile: string
 let slot: HostSlotAdapter
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
+const releaseMigrations: Array<() => void> = []
 
 beforeEach(() => {
+  scope.capturePluginWork()
   dir = mkdtempSync(join(tmpdir(), 'oai-pool-lifecycle-'))
   configFile = join(dir, 'openai-auth.json')
   stateFile = join(dir, 'openai-auth-state.json')
@@ -50,24 +69,34 @@ beforeEach(() => {
   // A state home of its own: no other plugin process is visible to the
   // version fence, and this one's heartbeat lands here.
   process.env.XDG_STATE_HOME = join(dir, 'state')
+  // OpenCode 1's data directory, where the plugin reads the login slot.
+  process.env.XDG_DATA_HOME = join(dir, 'data')
+  mkdirSync(join(dir, 'data', 'opencode'), { recursive: true })
   process.env.NODE_ENV = 'test'
   __resetProcessHeartbeatForTest()
-  slot = fileSlot(join(dir, 'auth.json'))
+  // OpenCode 1's own reads and writes of the slot, for the test to use and
+  // for the plugin client's `auth.set`.
+  slot = fileSlot(join(dir, 'data', 'opencode', 'auth.json'))
   originalFetch = globalThis.fetch
   hooks = undefined
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  restoreEnv('XDG_STATE_HOME')
-  delete process.env.NODE_ENV
+  for (const release of releaseMigrations.splice(0)) release()
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    restoreEnv('XDG_STATE_HOME')
+    restoreEnv('XDG_DATA_HOME')
+    delete process.env.NODE_ENV
+  })
 })
 
 function deferred<T = void>() {
@@ -165,14 +194,43 @@ type PoolOptions = Partial<
   Pick<PoolLifecycleDeps, 'fence' | 'migrate' | 'adopt' | 'runDeps' | 'log'>
 > & { enabled?: boolean }
 
+/**
+ * OpenCode 1's plugin client `auth`, shaped exactly as its generated SDK
+ * class: it has no way to read a login, only these five methods, and it
+ * reports a request's result as `{ data }` or `{ error }` instead of
+ * throwing. `set` writes the file the way OpenCode 1's server does.
+ */
+function opencode1SdkAuth() {
+  const envelope = (data: unknown) => ({
+    data,
+    request: new Request('http://opencode.internal/auth'),
+    response: new Response(null, { status: 200 }),
+  })
+  class Auth {
+    async remove() {
+      return envelope(true)
+    }
+    async start() {
+      return envelope({})
+    }
+    async callback() {
+      return envelope(true)
+    }
+    async authenticate() {
+      return envelope({})
+    }
+    async set(options: { path: { id: string }; body: unknown }) {
+      await slot.set(options)
+      return envelope(true)
+    }
+  }
+  return new Auth()
+}
+
 function pluginInput(): PluginInput {
   return {
     client: {
-      auth: {
-        get: slot.get,
-        set: slot.set,
-        all: slot.all,
-      },
+      auth: opencode1SdkAuth(),
       session: { promptAsync: async () => {} },
     } as unknown as PluginInput['client'],
     project: { id: 'test', name: 'test' } as unknown as PluginInput['project'],
@@ -188,6 +246,7 @@ function pluginInput(): PluginInput {
 function parkAt(step: PoolMigrationStep) {
   const reached = deferred()
   const release = deferred()
+  releaseMigrations.push(() => release.resolve())
   let parked = false
   return {
     reached: reached.promise,
@@ -224,7 +283,7 @@ async function loadPlugin(poolMigration: PoolOptions = {}, extra = {}) {
     init?: RequestInit,
   ) => Promise<Response>
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return { fetchOverride, methods: authHook.methods }
+  return { fetchOverride: scope.wrap(fetchOverride), methods: authHook.methods }
 }
 
 function send(
@@ -241,14 +300,23 @@ function send(
 }
 
 describe('the migration after the loader starts', () => {
-  it('is switched off by default in this release: nothing moves', async () => {
+  it('runs by default: with no override the main login moves into the pool', async () => {
+    await seedLegacy()
+    installWire({ usage: true })
+    await loadPlugin({ enabled: undefined })
+    await waitFor(
+      async () => isPoolPlaceholder(await slotValue()),
+      'the placeholder in the slot',
+    )
+  })
+
+  it('moves nothing while switched off', async () => {
     await seedLegacy()
     const wire = installWire()
-    const { fetchOverride } = await loadPlugin({ enabled: undefined })
+    const { fetchOverride } = await loadPlugin({ enabled: false })
     const before = readFileSync(configFile, 'utf8')
     expect((await send(fetchOverride)).status).toBe(200)
-    // Long enough for a background run to have written its record.
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await scope.settlePluginWork()
     expect(isPoolPlaceholder(await slotValue())).toBe(false)
     expect(readFileSync(configFile, 'utf8')).toBe(before)
     expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
@@ -321,8 +389,22 @@ describe('the migration after the loader starts', () => {
       runDeps: { onStep: park.onStep },
     })
     await park.reached
+    const pendingChecked = deferred()
+    const check = poolMigrationSteps.poolTransferPendingInConfigFile
+    const checkSpy = spyOn(
+      poolMigrationSteps,
+      'poolTransferPendingInConfigFile',
+    ).mockImplementation((...args) => {
+      const result = check(...args)
+      if (result) pendingChecked.resolve()
+      return result
+    })
     const pending = send(fetchOverride)
-    await Bun.sleep(400)
+    try {
+      await pendingChecked.promise
+    } finally {
+      checkSpy.mockRestore()
+    }
     // The pending record names the slot's token: nothing refreshed it.
     const refreshedDuringTransfer = [...wire.refreshTokens]
     park.release()
@@ -334,6 +416,195 @@ describe('the migration after the loader starts', () => {
     expect(wire.refreshTokens).toEqual(['r-main'])
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
     expect(isPoolPlaceholder(await slotValue())).toBe(true)
+  })
+})
+
+describe("on OpenCode 1's plugin client", () => {
+  it('migrates through a client that can only write the slot', async () => {
+    const auth = opencode1SdkAuth()
+    // The client the plugin gets: the five methods of OpenCode 1's SDK, and
+    // nothing that reads a login.
+    expect(
+      Object.getOwnPropertyNames(Object.getPrototypeOf(auth))
+        .filter((name) => name !== 'constructor')
+        .sort(),
+    ).toEqual(['authenticate', 'callback', 'remove', 'set', 'start'])
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        mainAccountId: 'acct-main',
+      }),
+    )
+    await setSlot(login('acct-main', 'r-main'))
+    installWire({ usage: true })
+    await loadPlugin({ enabled: undefined })
+    await waitFor(
+      async () => readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt > 0,
+      'the migration marker',
+    )
+    expect(isPoolPlaceholder(await slotValue())).toBe(true)
+    const config = readJson(configFile)
+    expect(config.commonAuthPool).toBeDefined()
+    expect('mainAccountId' in config).toBe(false)
+    expect(readJson(stateFile).accounts.main).toMatchObject({
+      access: jwt('acct-main'),
+      refresh: 'r-main',
+    })
+  })
+
+  it('says why it runs without the migration when the client cannot write the slot', async () => {
+    await seedLegacy()
+    installWire()
+    const warnings: Array<{ message: string; data: unknown }> = []
+    const input = pluginInput()
+    ;(input.client as unknown as { auth: unknown }).auth = {}
+    hooks = await CodexAuthPlugin(input, {
+      experimentalWebSockets: false,
+      poolMigration: {
+        enabled: true,
+        log: {
+          info: () => {},
+          warn: (message: string, data?: unknown) => {
+            warnings.push({ message, data })
+          },
+        },
+      },
+    })
+    expect(warnings).toEqual([
+      {
+        message: 'account pool migration is off for this OpenCode client',
+        data: {
+          reason:
+            'the OpenCode client has no auth.set to write its login slot with',
+        },
+      },
+    ])
+  })
+})
+
+describe('adoption beside the Claustrum vault', () => {
+  // Until the vault has read its first roster it reports serving nothing, so
+  // an adoption run before then would take a slot login on a host the vault
+  // serves. The loader does not wait for the roster; the adoption does.
+  it("the first adoption waits for the vault's first roster, so it sees the vault serving", async () => {
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    try {
+      const stateDir = join(dir, 'vault')
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+      const { tokenPath } = vaultPaths(stateDir, 'opencode')
+      writeFileSync(
+        tokenPath,
+        JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+        { mode: 0o600 },
+      )
+      chmodSync(tokenPath, 0o600)
+      await seedLegacy()
+      installWire({ usage: true })
+      const seen: Array<boolean | undefined> = []
+      const connectionEntered = deferred()
+      const connectionRelease = deferred()
+      releaseMigrations.push(() => connectionRelease.resolve())
+      await loadPlugin(
+        {
+          adopt: async (deps) => {
+            seen.push(deps.vaultServes?.())
+            return adoptHostSlotLogin(deps)
+          },
+        },
+        {
+          vault: {
+            stateDir,
+            connectionFile: () => daemon.connectionFile,
+            // Hold roster discovery until the loader has returned. Adoption
+            // must not use an empty vault roster just because loading is done.
+            connectScoped: async () => {
+              connectionEntered.resolve()
+              await connectionRelease.promise
+              return connectClaustrumScopedClient({
+                connectionFile: daemon.connectionFile,
+                projectRoot: dir,
+                storagePath: tokenPath,
+              })
+            },
+            pollIntervalMs: 0,
+          },
+        },
+      )
+      await connectionEntered.promise
+      expect(seen).toEqual([])
+      connectionRelease.resolve()
+      await waitFor(async () => seen.length > 0, 'the first adoption')
+      expect(seen[0]).toBe(true)
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await daemon.stop()
+    }
+  })
+})
+
+describe('adoption beside a vault that never answers', () => {
+  // The adoption waits for the vault's first roster only for a bounded time.
+  // Past it the run adopts nothing and ends retryable, so the lifecycle is
+  // free again and its next scheduled run tries once more.
+  it('gives up after its bound without adopting, and ends retryable', async () => {
+    const stateDir = join(dir, 'vault')
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+    await seedLegacy()
+    installWire({ usage: true })
+    let adopted = 0
+    const warnings: Array<{ message: string; data: unknown }> = []
+    await loadPlugin(
+      {
+        adopt: async (deps) => {
+          adopted++
+          return adoptHostSlotLogin(deps)
+        },
+        log: {
+          info: () => {},
+          warn: (message: string, data?: unknown) => {
+            warnings.push({ message, data })
+          },
+        },
+      },
+      {
+        vault: {
+          stateDir,
+          // The connection is never made, so the first roster read never ends.
+          connectScoped: () => new Promise(() => {}),
+          pollIntervalMs: 0,
+          firstRosterWaitMs: 300,
+        },
+      },
+    )
+    await waitFor(
+      async () =>
+        warnings.some(
+          (warning) =>
+            warning.message === 'host login adoption will be tried again',
+        ),
+      'the adoption to end retryable',
+    )
+    expect(
+      warnings.find(
+        (warning) =>
+          warning.message === 'host login adoption will be tried again',
+      )?.data,
+    ).toEqual({ outcome: { status: 'retry', reason: 'vault-roster-pending' } })
+    expect(adopted).toBe(0)
   })
 })
 
@@ -373,20 +644,7 @@ describe('later logins on a migrated install', () => {
       expires_in: number
     }>()
     const { methods } = await migratedPlugin({
-      custody: {
-        transport: {
-          getCredential: async () => {
-            throw new Error('not used')
-          },
-          statusCredential: async () => ({
-            ready: false,
-            lastErrorCode: null,
-            leaseHeld: false,
-            recordVersion: 0,
-          }),
-          reportAuthFailure: async () => {},
-          close: () => {},
-        },
+      login: {
         authorize: {
           browser: async () => ({ url: 'about:blank', tokens: tokens.promise }),
         },

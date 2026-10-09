@@ -11,12 +11,13 @@
  *   #12 quota-normalize: NaN used_percent → no window / quota gate still applies
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAccountPaths, getAccountStoragePath } from '../core/account-paths'
-import { localCustody } from './custody-fixtures.ts'
+import { createFailurePhaseClock } from './failure-phase-clock'
+import { createRequestTestScope } from './request-test-scope'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,11 @@ import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 let dir: string
 let cfgPath: string
 let statePath: string
+const scope = createRequestTestScope()
+const it = scope.it
+const clock = createFailurePhaseClock()
+const phaseIt = (name: string, body: () => Promise<void>) =>
+  scope.it(name, () => clock.run(name, body))
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'oai-review-fixes-'))
@@ -35,7 +41,8 @@ beforeEach(() => {
   process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = statePath
 })
 
-afterEach(() => {
+afterEach(async () => {
+  await scope.teardown(async () => {})
   // Restore to the floor (not delete) so any in-flight write resolves to a
   // temp path rather than the operator's live default.
   process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
@@ -134,41 +141,52 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
 // ---------------------------------------------------------------------------
 
 describe('#3 QuotaManager.refreshMain: token-keyed deduplication', () => {
-  it('two concurrent calls with DIFFERENT tokens each trigger their own fetch', async () => {
-    const { QuotaManager } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
+  phaseIt(
+    'two concurrent calls with DIFFERENT tokens each trigger their own fetch',
+    async () => {
+      const { QuotaManager } = await clock.phase(
+        'import QuotaManager',
+        () => import('@cortexkit/openai-auth-core/internal'),
+      )
 
-    let fetchCount = 0
-    const qm = new QuotaManager({
-      configPath: getAccountStoragePath(),
-      storage: null,
-      fetchQuotaFn: async ({ accessToken }) => {
-        fetchCount++
-        // Simulate a short network delay
-        await new Promise((r) => setTimeout(r, 20))
-        return {
-          primary: {
-            usedPercent: accessToken === 'token-A' ? 10 : 20,
-            remainingPercent: accessToken === 'token-A' ? 90 : 80,
-            checkedAt: Date.now(),
-          },
-        }
-      },
-    })
+      let fetchCount = 0
+      const qm = new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: null,
+        fetchQuotaFn: async ({ accessToken }) => {
+          fetchCount++
+          // Hold the first refresh open while the other token's refresh is\n          // queued; the manager spaces the two API calls by one second.
+          await clock.phase(
+            `mock quota timer for ${accessToken}`,
+            () => new Promise((r) => setTimeout(r, 20)),
+          )
+          return {
+            primary: {
+              usedPercent: accessToken === 'token-A' ? 10 : 20,
+              remainingPercent: accessToken === 'token-A' ? 90 : 80,
+              checkedAt: Date.now(),
+            },
+          }
+        },
+      })
 
-    // Fire both concurrently with different tokens
-    const [snapA, snapB] = await Promise.all([
-      qm.refreshMain('token-A'),
-      qm.refreshMain('token-B'),
-    ])
+      // Fire both concurrently with different tokens
+      const [snapA, snapB] = await Promise.all([
+        clock.phase('refresh token-A including persistence', () =>
+          qm.refreshMain('token-A'),
+        ),
+        clock.phase('refresh token-B including persistence', () =>
+          qm.refreshMain('token-B'),
+        ),
+      ])
 
-    // Both fetches must have run (not shared a single in-flight promise)
-    expect(fetchCount).toBe(2)
-    // Each snapshot must reflect its own token's data
-    expect(snapA.primary?.usedPercent).toBe(10)
-    expect(snapB.primary?.usedPercent).toBe(20)
-  })
+      // Both fetches must have run (not shared a single in-flight promise)
+      expect(fetchCount).toBe(2)
+      // Each snapshot must reflect its own token's data
+      expect(snapA.primary?.usedPercent).toBe(10)
+      expect(snapB.primary?.usedPercent).toBe(20)
+    },
+  )
 
   it('two concurrent calls with the SAME token share one in-flight fetch', async () => {
     const { QuotaManager } = await import(
@@ -457,7 +475,7 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
 //       checks in the critical section must detect the theft and elect exactly
 //       one winner.
 //
-//   (b) High-volume stress: 3000 rounds × 16 contenders on a seeded stale lock;
+//   (b) Bounded stress: 128 rounds × 16 contenders on a seeded stale lock;
 //       every round must elect exactly one winner with zero eviction-marker leaks.
 // ---------------------------------------------------------------------------
 
@@ -622,9 +640,11 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
 
   it('refresh file lock stale-marker steal has a single winner across bounded contention', async () => {
     // The deterministic forced-race test above covers the fencing interleaving
-    // directly. This bounded sample adds filesystem contention coverage without
-    // making the full suite depend on tens of thousands of real fs races.
-    // Every round must still elect exactly one winner with zero marker leaks.
+    // directly. Repeated cohorts still search for rare filesystem interleavings,
+    // including errors when an eviction marker disappears. Use 128 rounds, as in
+    // core/src/tests/refresh-file-lock.test.ts, to limit real I/O under load.
+    // The fixed logical clock prevents a slow cohort from expiring its winner;
+    // every round must still elect exactly one winner with zero marker leaks.
     const { acquireRefreshFileLock } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -633,7 +653,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     const name = 'test-refresh-high-volume-stale-steal'
     const ttlMs = 1_000
     const contenders = 16
-    const rounds = 512
+    const rounds = 128
 
     for (let round = 0; round < rounds; round++) {
       const now = 1_000_000 + round * 20_000
@@ -1231,7 +1251,6 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
       refreshFn: async () => {
         throw refreshError
       },
@@ -1284,7 +1303,6 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     // fetchQuotaFn throws a 401 with no isRefreshError (exactly as whamUsageFn does).
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 401'), {
           status: 401,
@@ -1330,7 +1348,6 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     // fetchQuotaFn throws a non-401 quota error (no isRefreshError).
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
-      custody: localCustody,
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 429'), {
           status: 429,

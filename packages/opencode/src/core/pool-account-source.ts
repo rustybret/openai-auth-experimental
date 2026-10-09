@@ -22,8 +22,9 @@
 // - Unknown quota blocks admission (`@cortexkit/common-auth/routing`), so no
 //   row may stay without a reading: every row gets a quota poll as soon as
 //   this process sees it (at load, when it is added, and when the install
-//   turns migrated), and admission asks for another whenever it refuses a row
-//   for want of one.
+//   turns migrated; at startup only once the vault has read which accounts
+//   it holds), and admission asks for another whenever it refuses a row for
+//   want of one.
 //
 // State that belongs to an account (rate-limit marks, pending quota) is keyed
 // by the row's wire identity where the row records one, so a row that comes
@@ -81,6 +82,44 @@ export const POOL_PULL_RETRY_MS = 15_000
  */
 const LOCAL_REFRESH_RETRY_MS = 30_000
 
+/**
+ * Longest a request's token step waits for the vault's first roster (see
+ * `PoolAccountSourceDeps.vaultFirstRoster`) before it goes ahead with the
+ * vault accounts known so far.
+ */
+export const VAULT_FIRST_ROSTER_WAIT_MS = 2_000
+
+/**
+ * Longest background work waits for the vault's first roster: the first
+ * quota polls of new rows here, and each host's adoption of a slot login.
+ * Past it that work is skipped for now (nothing is done under uncertainty)
+ * and tried again later.
+ */
+export const VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS = 10_000
+
+/**
+ * Whether `promise` settles (resolves or rejects) within `ms`. Never rejects,
+ * and its timer never keeps the process alive.
+ */
+export async function settlesWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settled = await Promise.race([
+    promise.then(
+      () => true,
+      () => true,
+    ),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms)
+      timer.unref?.()
+    }),
+  ])
+  clearTimeout(timer)
+  return settled
+}
+
 /** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
 const PENDING_OBSERVATIONS_PER_ROW = 8
 const PENDING_OBSERVATION_MAX_AGE_MS = 30 * 60_000
@@ -107,6 +146,26 @@ export interface PoolAccountSourceDeps {
     Pick<OpenPoolStoreOptions, 'lockOptions' | 'rowLockOptions' | 'hold'>
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
+  /**
+   * The ChatGPT accounts the Claustrum vault holds for this host. A row
+   * signing in as one of them is not this host's to use (one account has
+   * one owner, and the vault owns it): request routing skips it, and this
+   * source never refreshes it or polls its quota either.
+   */
+  vaultIdentities?: () => ReadonlySet<string>
+  /**
+   * Settles (resolved or rejected) once the vault has read its first roster.
+   * Until then `vaultIdentities` is empty even for an account the vault
+   * holds, so the first-sight quota polls of new rows wait for it (at most
+   * `vaultFirstRosterBackgroundWaitMs`, else they are skipped this time),
+   * and a token step waits for it at most `vaultFirstRosterWaitMs`. Nothing
+   * else waits for it. Absent: there is no vault roster to wait for.
+   */
+  vaultFirstRoster?: Promise<unknown>
+  /** Overrides `VAULT_FIRST_ROSTER_WAIT_MS` (tests). */
+  vaultFirstRosterWaitMs?: number
+  /** Overrides `VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS` (tests). */
+  vaultFirstRosterBackgroundWaitMs?: number
 }
 
 type BackoffEntry = {
@@ -169,6 +228,22 @@ function readMigratedAt(configPath: string): number | undefined {
   }
 }
 
+/**
+ * Whether a row gets its first quota poll: a candidate OAuth row, or an
+ * enabled OAuth row marked `torn`. A row is torn when a credential replace
+ * wrote the new credential to the state file and stopped before its config
+ * write (the new account and epoch); the store then never offers it for
+ * routing (`candidate` is false) until its next write on the row records
+ * what the state file says. A quota poll is such a write: the store's pull
+ * completes the row before it reads the credential to poll with, so polling
+ * a torn row is what makes it routable again. The store's own `load()` would
+ * fire that pull, but this source reads with `read()`, which fires nothing.
+ */
+function pollable(row: PoolRow): boolean {
+  if (row.type !== 'oauth') return false
+  return row.candidate || (row.torn === true && row.enabled)
+}
+
 /** The key account state is partitioned by: the wire identity, else the row id. */
 function accountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
   return row.identity ? `identity:${row.identity}` : `row:${row.id}`
@@ -204,7 +279,17 @@ export class PoolAccountSource {
   private store: { configPath: string; store: PoolStore } | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
   private readonly backoff = new Map<string, BackoffEntry>()
-  private readonly rotated = new Map<string, PoolRow['credential']>()
+  /**
+   * Credentials this process rotated, by row id, with the credential epoch
+   * of the row they were rotated from. A rotation keeps the epoch; a
+   * replacement (a re-login, another account) bumps it, so an entry whose
+   * epoch no longer matches the row's belongs to a credential the row no
+   * longer holds.
+   */
+  private readonly rotated = new Map<
+    string,
+    { credential: PoolRow['credential']; credentialEpoch: number | undefined }
+  >()
   private readonly pending = new Map<string, PendingObservation[]>()
   private readonly writes = new Map<string, Promise<void>>()
   private readonly marks = new Map<string, number>()
@@ -213,11 +298,30 @@ export class PoolAccountSource {
   /** The latest poll outcome per row id, read back by `pollRows`. */
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
   private disposed = false
+  /** Whether `deps.vaultFirstRoster` has settled (true when there is none). */
+  private vaultRosterSettled: boolean
+  /** Set once the first-sight polls are queued behind the vault's first roster. */
+  private pollsAwaitVault = false
 
   constructor(deps: PoolAccountSourceDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? createLogger('pool')
+    this.vaultRosterSettled = deps.vaultFirstRoster === undefined
+    const settled = () => {
+      this.vaultRosterSettled = true
+    }
+    deps.vaultFirstRoster?.then(settled, settled)
+  }
+
+  /**
+   * Waits for the vault's first roster for at most `ms`, then returns either
+   * way. Never rejects.
+   */
+  private async awaitVaultRoster(ms: number): Promise<void> {
+    const first = this.deps.vaultFirstRoster
+    if (this.vaultRosterSettled || !first) return
+    await settlesWithin(first, ms)
   }
 
   // -------------------------------------------------------------------------
@@ -342,8 +446,15 @@ export class PoolAccountSource {
     const now = this.now()
     return rows.map((row) => {
       let next = row
-      const rotated = this.rotated.get(row.id)
-      if (rotated?.type === 'oauth' && row.credential?.type === 'oauth') {
+      const own = this.rotated.get(row.id)
+      const rotated = own?.credential
+      if (own && own.credentialEpoch !== row.credentialEpoch) {
+        // The row's credential was replaced since this process rotated it.
+        this.rotated.delete(row.id)
+      } else if (
+        rotated?.type === 'oauth' &&
+        row.credential?.type === 'oauth'
+      ) {
         const fileStamp = row.credential.lastRefreshedAt ?? 0
         const ownStamp = rotated.lastRefreshedAt ?? 0
         if (fileStamp >= ownStamp) this.rotated.delete(row.id)
@@ -391,10 +502,43 @@ export class PoolAccountSource {
    * at the first load, a row added since, a replaced credential, and every
    * row once the install turns migrated. Never waits.
    */
+  /** Whether the vault owns the account this row signs in as. */
+  private vaultOwned(row: Pick<PoolRow, 'identity'>): boolean {
+    return (
+      row.identity !== undefined &&
+      (this.deps.vaultIdentities?.().has(row.identity) ?? false)
+    )
+  }
+
   private pollUnseenRows(): void {
     if (this.disposed) return
+    const first = this.deps.vaultFirstRoster
+    if (!this.vaultRosterSettled && first) {
+      // Which rows the vault owns is not known yet. These polls run in the
+      // background anyway, so they wait for the roster (for a bounded time)
+      // rather than poll a vault account's local row with that row's own
+      // token. One deferred pass covers every read until then: it polls the
+      // rows as they are. When the roster does not come within the bound the
+      // polls are skipped this time; a later read tries again, and admission
+      // still asks for a reading of any row it refuses for want of one.
+      if (this.pollsAwaitVault) return
+      this.pollsAwaitVault = true
+      void settlesWithin(
+        first,
+        this.deps.vaultFirstRosterBackgroundWaitMs ??
+          VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+      ).then((settled) => {
+        this.pollsAwaitVault = false
+        if (settled) this.pollUnseenRows()
+        else
+          this.log.info(
+            'first quota polls skipped: the vault has not read its accounts yet',
+          )
+      })
+      return
+    }
     for (const row of this.snapshot.rows) {
-      if (!row.candidate || row.type !== 'oauth') continue
+      if (!pollable(row) || this.vaultOwned(row)) continue
       const key = `${row.id}\u0000${row.credentialEpoch ?? 0}\u0000${row.identity ?? ''}`
       if (this.polled.has(key)) continue
       this.polled.add(key)
@@ -553,11 +697,17 @@ export class PoolAccountSource {
     storage: AccountStorage | null,
     options: { waitForAll?: boolean } = {},
   ): Promise<void> {
+    // A row signing in as a vault account must not be refreshed, and before
+    // the vault's first roster no such account is known. Bounded, so a vault
+    // that never answers costs a request at most this wait.
+    await this.awaitVaultRoster(
+      this.deps.vaultFirstRosterWaitMs ?? VAULT_FIRST_ROSTER_WAIT_MS,
+    )
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(storage)
     const waits: Promise<void>[] = []
     for (const row of rows) {
-      if (!row.candidate) continue
+      if (!row.candidate || this.vaultOwned(row)) continue
       const token = oauthAccess(row)
       if (!token) continue
       const left = (token.expires ?? 0) - now
@@ -598,9 +748,27 @@ export class PoolAccountSource {
     )
   }
 
-  /** The bearer to send for a row, or undefined when it holds no unexpired token. */
+  /**
+   * The bearer to send for `row`, or undefined when it holds no unexpired
+   * token. The row is looked up again in the current snapshot, so a row
+   * chosen from an older snapshot never sends a login that has since been
+   * disabled, replaced (another identity or credential epoch), or found to
+   * belong to an account the vault holds.
+   */
   usableToken(row: PoolRow, now = this.now()): string | undefined {
-    const token = oauthAccess(row)
+    const current = this.snapshot.rows.find(
+      (candidate) => candidate.id === row.id,
+    )
+    if (
+      !current?.enabled ||
+      !current.candidate ||
+      current.type !== 'oauth' ||
+      current.identity !== row.identity ||
+      current.credentialEpoch !== row.credentialEpoch ||
+      this.vaultOwned(current)
+    )
+      return undefined
+    const token = oauthAccess(current)
     if (!token?.access.trim()) return undefined
     if (typeof token.expires !== 'number' || token.expires <= now)
       return undefined
@@ -621,6 +789,13 @@ export class PoolAccountSource {
     const paths = this.deps.paths()
     const before = this.snapshot.rows.find((row) => row.id === id)
     const refreshToken = before ? oauthAccess(before)?.refresh : undefined
+    // The epoch of the row the store actually refreshed, read under its
+    // locks. A rotation keeps it, so the rotated credential belongs to it.
+    let refreshedEpoch: number | undefined
+    const provider: ProviderRefresh = (credential, row) => {
+      refreshedEpoch = row.credentialEpoch
+      return this.deps.refreshProvider(credential, row)
+    }
     try {
       const outcome = await refreshPoolRow(
         {
@@ -632,18 +807,42 @@ export class PoolAccountSource {
             : {}),
         },
         id,
-        this.deps.refreshProvider,
+        provider,
       )
       if (outcome.status === 'rotated') {
         this.backoff.delete(id)
-        this.rotated.set(id, outcome.credential)
+        this.rotated.set(id, {
+          credential: outcome.credential,
+          credentialEpoch: refreshedEpoch,
+        })
+        this.replaceRow(id, (row) =>
+          row.credentialEpoch !== refreshedEpoch
+            ? row
+            : {
+                ...row,
+                credential: outcome.credential,
+                ...(outcome.identity !== undefined && row.identity === undefined
+                  ? { identity: outcome.identity }
+                  : {}),
+              },
+        )
+        return
+      }
+      if (outcome.status === 'identity-contradicted') {
+        // The provider handed back a different account's tokens. The store has
+        // already kept them on the row and disabled it, so this row stops
+        // serving here too; backing off would only retry a row that is off.
+        // The identities stay out of the log: they are ChatGPT account ids.
+        this.backoff.delete(id)
         this.replaceRow(id, (row) => ({
           ...row,
-          credential: outcome.credential,
-          ...(outcome.identity !== undefined && row.identity === undefined
-            ? { identity: outcome.identity }
-            : {}),
+          enabled: false,
+          candidate: false,
         }))
+        this.log.warn(
+          'pool row disabled: its refresh returned a different account',
+          { rowId: id },
+        )
         return
       }
       this.recordRefreshFailure(id, refreshToken, new Error(outcome.reason))
@@ -762,7 +961,8 @@ export class PoolAccountSource {
     if (!view.active || this.disposed) return []
     const now = this.now()
     const targets = view.rows.filter((row) => {
-      if (!row.candidate || row.type !== 'oauth') return false
+      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
+        return false
       if (options.ids && !options.ids.includes(row.id)) return false
       if (options.skipReadWithinMs === undefined) return true
       const readAt = quotaReadAt(row)
@@ -801,6 +1001,9 @@ export class PoolAccountSource {
     await this.prepareTokens([row], storage)
     const current =
       this.snapshot.rows.find((candidate) => candidate.id === id) ?? row
+    // The refresh just run can take the row out of routing (it returned
+    // another account's tokens), and then it has no bearer to offer.
+    if (!current.candidate) return undefined
     const token = this.usableToken(current)
     return token ? { row: current, token } : undefined
   }

@@ -53,6 +53,34 @@ Three methods are offered:
 
 The account you log in with via `/login openai` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
 
+## OpenCode 2
+
+The same package runs on OpenCode 2 (`@opencode/cli`, tested on 2.0.21). OpenCode 2 loads the plugin from the package's `./server` entry. OpenCode 1 also prefers that entry over the package root, so it carries the same OpenCode 1 plugin as the root as well:
+
+```json
+{
+  "plugins": ["@cortexkit/opencode-openai-auth@0.11.0"]
+}
+```
+
+or `opencode plugin add @cortexkit/opencode-openai-auth`. Sign in with `opencode auth login openai` (or the TUI) and pick **ChatGPT Pro/Plus (browser)** or **(headless)**.
+
+How it differs from OpenCode 1:
+
+- **OpenCode 2 sends the requests itself**, through its own OpenAI driver over HTTP or its WebSocket. The plugin picks the account and sets that account's `Authorization` and `chatgpt-account-id` through OpenCode 2's session hooks (`@cortexkit/common-auth/opencode2`), and edits the requests only where OpenCode 1's behaviour needs it (below).
+- **Codex client identity.** Every request and every WebSocket handshake carries the identity OpenCode 1 sends: `version` (`0.159.0`), `originator: codex_exec` and Codex's `user-agent`. It is the same for every request of a session, so OpenCode 2 keeps reusing the session's WebSocket. (The backend refuses `gpt-6.1-sol` from a client stating an older version, such as `0.158.0`; in a probe on 2026-10-01 it served a request that stated no version at all.)
+- **Mid-conversation reasoning effort.** OpenCode 2 already carries an effort change for `gpt-6-astra`, `gpt-6-sol` and `gpt-6-luna` itself: the request keeps the session's first effort and the change goes in as a `configuration_update` item, so the conversation stays cached. The plugin does the same for `gpt-6.1-sol`, which OpenCode 2 does not: over HTTP the item rides every request after the change, just before the turn's user message; over the WebSocket it goes on the frame that starts the turn, and the server keeps it for the turn's tool steps. OpenCode 2 sends the turn whose effort changed as a full request rather than a continuation; the turns after it chain again on the same socket. Responses keep reporting the session's first effort, as on OpenCode 1.
+- **One account pool for both hosts.** OpenCode 2 reads and writes the same files as OpenCode 1 (`~/.config/opencode/openai-auth.json` and its state file). An install whose accounts are not in the shared account pool yet (the main login still in OpenCode 1's own login store) moves them there on the first OpenCode 2 start, the same way OpenCode 1 does: OpenCode 1's `openai` login (`~/.local/share/opencode/auth.json`) becomes row `main`, and the move waits until no older openai-auth process is running. Until then OpenAI requests are refused.
+- **Logins land in the pool.** The two ChatGPT logins replace OpenCode 2's built-in ones. Signing in again with an account the pool already holds replaces that account's credential; the first login of a pool with no `main` account becomes `main`; any other login adds an account. OpenCode 2 itself only stores a placeholder that works against nothing. A ChatGPT login OpenCode 2 held before the plugin was installed is copied into the pool at start, unless the pool already holds that account.
+- **Routing** follows the same settings (`main-first`, `fallback-first`, `sticky-balanced`, the killswitch and quota floors). A session's side requests (title, compaction, generate) go to the session's account. Sticky pins live in the server process, so a restarted server places its sessions again.
+- **Rate limits.** A usage-limit or rate-limit refusal that arrives before any output is retried at once on another account, and that account is marked limited. Once output has started a request is never retried.
+- **Quota** from the `x-codex-*` response headers and `codex.rate_limits` frames is recorded on the account that served.
+- **Claustrum vault accounts** are routed beside the pool's own, with OpenCode 1's rules: enroll from OpenCode 1 (`opencode auth login`, Connect); OpenCode 2 uses the same enrollment. A pool account that signs in as a ChatGPT account the vault holds is skipped, and only ChatGPT logins are used, never API keys. Each request on a vault account asks the vault for that request's token; if the vault refuses, the request goes to the next account before anything is sent. A 401 on that request is reported to the vault against the exact record version it used (HTTP only: a refused WebSocket handshake reaches no hook). A vault account starts serving once it has a quota reading, taken in the background shortly after OpenCode 2 starts the plugin.
+- **Responses Lite** (`responsesLite: true`) applies to HTTP requests for the Lite models. Over the WebSocket the standard request shape is sent: the Lite shape moves `tools` and `instructions` into the input, which would put the server's view of the conversation out of step with OpenCode 2's own continuation.
+- **Models**: the same allow and deny lists and context caps as on OpenCode 1.
+
+Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, cost zeroing, and the rest of the Codex request shaping OpenCode 1 does (turn-metadata headers, `session-id`/`thread-id` and `x-codex-*` headers, tool normalisation). While the plugin is loaded, provider `openai` is served from the pool and the vault only: an OpenAI API key does not work through it.
+
 ## Multiple accounts
 
 The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
@@ -149,7 +177,7 @@ One command, `/openai`, opens one menu in the TUI. Its sections, in order:
 | Diagnostics | Request dumps and the log level. |
 | Reset credits | Preview an account, spend one reset credit after explicit confirmation, or retry the last redemption. |
 | This session | The session's sticky pin, and clearing it. |
-| Claustrum | Enter Claustrum mode, or return to local mode. |
+| Vault | Whether this host is connected to the Claustrum vault, the OpenAI accounts the vault serves it, and the last error. **Connect** asks the vault to enroll this host; **Disconnect** forgets its token. Each vault account can be disabled (it stays listed and is never sent from this host) or enabled again. |
 
 Settings the menu changes are saved through the account pool's store, under the names `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. The menu needs the account pool: until every OpenCode process on the machine runs a version that understands it and the accounts have moved, `/openai` shows only that notice and the processes still holding the move back.
 
@@ -166,10 +194,34 @@ Remove account            remove one account (not main)
 Enable or disable account
 Check quotas              poll every account's quota now
 Auth doctor               report problems with the stored credentials, and offer repairs
+Connect to the Claustrum vault   serve OpenAI accounts held in the vault
 Delete all accounts       remove every account except main
 ```
 
 This is the path for headless machines, where `/openai` is out of reach. The first login on a new machine goes straight to sign-in as usual. Before the accounts have moved to the account pool, the menu shows only that notice and the doctor.
+
+### The Claustrum vault
+
+The OpenAI accounts held in a [Claustrum](https://github.com/cortexkit/claustrum) vault can serve beside your own accounts, once the accounts have moved to the account pool. Each host enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. Connect (in `opencode auth login`, or the Vault section of `/openai`) proposes the enrollment and tells you what to run:
+
+```text
+Enrollment request <id> for openai-auth-opencode is waiting for approval. Approve it with:
+  ck auth enroll approve --request-id <id>
+and let it read your OpenAI accounts with:
+  ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
+```
+
+The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. The vault accounts route through the same routing modes and limits as the accounts signed in on this machine; each request fetches its token from the vault, and a token the provider rejects is reported back to the vault. An account you also signed in to here is served by the vault only (one account, one owner). A later login written into OpenCode's own `openai` slot is adopted into the pool in the background and the placeholder is restored, even while the vault serves accounts. A local copy of a vault-owned account is set aside: it is neither routed nor refreshed locally. If a stray slot login temporarily blocks requests, let adoption finish or sign in again; Disconnect is not required. Do not delete the slot value as a repair: OpenCode 1 needs its OAuth placeholder to install the plugin's fetch.
+
+Downgrading after the account-pool migration is unsupported. The migration replaces OpenCode's login with an OAuth placeholder whose access token is empty; a pre-1.0 build that does not understand the placeholder would send an empty bearer instead of reading the account pool. Keep the pool-aware build, or sign in afresh in a separate store before using an older build.
+
+When `OPENCODE_AUTH_CONTENT` supplies OpenCode 1's login, the slot is read-only for migration and adoption. The plugin leaves the environment login and `auth.json` untouched and continues using the login as before; unset the override to migrate the disk login.
+
+Development installs that ran an unreleased build may hold an untagged placeholder left by an interrupted move of the login from OpenCode's slot into the account pool, together with the unfinished record of that move. Placeholders written by this release carry a tag recording which config root wrote them; an untagged one cannot show whether this store or another store sharing `auth.json` moved the login. Its credential is therefore preserved but disabled, rather than deleted or assumed to belong to this store. The auth doctor lists the row: sign in again with `opencode auth login`, or re-enable it only if this config root is the only one using that `auth.json`. Already completed development migrations with an untagged placeholder keep working unchanged, including later login adoption.
+
+Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they are never listed, read or routed. Every request this plugin sends goes to the ChatGPT Codex endpoint, which takes ChatGPT logins, not platform API keys, so only the vault's OpenAI logins serve.
+
+An install that used the vault custody of earlier versions may still hold its tombstones (in accounts, or in OpenCode's slot) and the `claustrum.mode` setting. They are never sent; the auth doctor lists them, with the remedy: connect the vault, or sign in to the account again.
 
 One quirk worth knowing: the menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai`.
 
@@ -266,7 +318,7 @@ Install dependencies:
 bun install
 ```
 
-Run checks:
+Run checks (the build refuses dependencies that resolve outside the repository):
 
 ```bash
 bun run typecheck
@@ -292,6 +344,15 @@ This builds the plugin, symlinks the output into `.opencode/plugins/`, and start
 
 ```bash
 bun run dev:clean
+```
+
+### Mutation catalogue
+
+[`mutations.toml`](mutations.toml) lists deliberate breaks of production code, each with the named test that must fail when it is applied, so a guard cannot quietly stop guarding. `ckdev-mutate` replays them: it runs each named test on the clean tree, applies the break, requires the test to fail for the recorded reason, and restores the file. A row is for a silent, costly failure (a credential lost or leaked, a reset credit spent twice, output replayed, an account lost in a crash, a wire contract), not for style. Run it from a clean tree; CI replays the rows a pull request touches, the full catalogue on main, and the full catalogue with `--broad` nightly.
+
+```bash
+cargo install --locked --git https://github.com/cortexkit/commons --rev 73c7e66145e131eadffdd874c82d93548868b668 cortexkit-mutate
+ckdev-mutate run --all
 ```
 
 ## Release

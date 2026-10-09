@@ -3,18 +3,25 @@ import type {
   DoctorCheck,
   DoctorFinding,
 } from '@cortexkit/common-auth/auth-menu'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
   findPoolMainRow,
   isOAuthAccount,
   isPoolMainPlaceholder,
+  isTombstoned,
   type mutateAccounts,
   NON_TRANSIENT_REFRESH_RETRY_DELAY_MS,
   type OAuthAccount,
   readConfigRosterIds,
   refreshBackoffActive,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
+  POOL_UNTAGGED_TRANSFER_REMEDY,
+} from '../core/pool-migration'
 
 export interface AuthDetails {
   type: string
@@ -32,6 +39,10 @@ export type AuthDoctorFindingCode =
   | 'no-enabled-accounts'
   | 'armed-non-transient-refresh-backoff'
   | 'orphan-state-ids'
+  | 'tombstoned-host-slot'
+  | 'tombstoned-account'
+  | 'retired-custody-mode'
+  | 'slot-transfer-origin-unknown'
 
 export type AuthRepair =
   | { type: 'restore-main-credential' }
@@ -86,6 +97,32 @@ export async function readStoreIds(paths: AccountPaths): Promise<StoreIds> {
   }
 }
 
+/**
+ * Whether the config still names the vault custody mode of older versions
+ * (`claustrum.mode: "claustrum"`). Read from the file itself: the account
+ * store no longer carries the setting, and its writers drop it.
+ */
+export async function readRetiredCustodyMode(
+  paths: AccountPaths,
+): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(
+      await readFile(paths.configPath, 'utf8'),
+    ) as unknown
+    return (
+      objectRecord(parsed) &&
+      objectRecord(parsed.claustrum) &&
+      parsed.claustrum.mode === 'claustrum'
+    )
+  } catch {
+    return false
+  }
+}
+
+/** What to do about a tombstone, told the same way for the slot and for a row. */
+const TOMBSTONE_REMEDY =
+  'Connect this host to the Claustrum vault (`opencode auth login` > Connect to the Claustrum vault, or the Vault section of `/openai`) if the vault holds the account, or sign in to the account again.'
+
 export function findStoredMainCredential(
   storage: AccountStorage | null | undefined,
 ): OAuthAccount | undefined {
@@ -116,6 +153,8 @@ export function createAuthDoctorReport(input: {
   auth: AuthDetails | null | undefined
   storage: AccountStorage | null | undefined
   orphanStateIds?: readonly string[]
+  /** Whether the config still names the removed custody mode. */
+  retiredCustodyMode?: boolean
   now?: number
 }): AuthDoctorReport {
   const findings: AuthDoctorFinding[] = []
@@ -124,7 +163,15 @@ export function createAuthDoctorReport(input: {
   const storedMain = findStoredMainCredential(input.storage)
 
   let authNeedsRestore = false
-  if (isPoolMainPlaceholder(input.auth)) {
+  if (isTombstoned(input.auth)) {
+    // Left by the vault custody of older versions. It is never sent: the
+    // main account is the pool row `main` when there is one, and the other
+    // accounts serve when there is not.
+    findings.push({
+      code: 'tombstoned-host-slot',
+      message: `OpenCode's OpenAI slot holds a tombstone left by the vault custody of an older version, not a credential; it is never sent. ${TOMBSTONE_REMEDY}`,
+    })
+  } else if (isPoolMainPlaceholder(input.auth)) {
     // The main account lives in the pool row `main` and the slot holds only
     // the migration's placeholder. That is healthy while the row exists.
     // Copying the row back into the slot is never offered: it would leave one
@@ -187,6 +234,23 @@ export function createAuthDoctorReport(input: {
     findings.push({
       code: 'no-enabled-accounts',
       message: 'The account store has no enabled accounts.',
+    })
+  }
+
+  for (const account of accounts) {
+    if (!isOAuthAccount(account) || !isTombstoned(account)) continue
+    findings.push({
+      code: 'tombstoned-account',
+      accountId: account.id,
+      message: `Account ${account.id} holds a tombstone left by the vault custody of an older version, not a credential; it is never sent. ${TOMBSTONE_REMEDY}`,
+    })
+  }
+
+  if (input.retiredCustodyMode) {
+    findings.push({
+      code: 'retired-custody-mode',
+      message:
+        'The config still selects the vault custody mode of an older version (`claustrum.mode`). It is ignored, and dropped at the next settings write; vault accounts are served once this host is connected to the Claustrum vault.',
     })
   }
 
@@ -298,17 +362,36 @@ export function authDoctorChecks(deps: AuthDoctorCheckDeps): DoctorCheck[] {
     {
       id: 'openai-auth',
       run: async () => {
-        const [storage, ids, auth] = await Promise.all([
+        const [storage, ids, auth, retiredCustodyMode] = await Promise.all([
           deps.loadAccounts(deps.paths),
           deps.readStoreIds(deps.paths),
           deps.readAuth(),
+          readRetiredCustodyMode(deps.paths),
         ])
         const report = createAuthDoctorReport({
           auth: auth.type === 'missing' ? undefined : auth,
           storage,
           orphanStateIds: ids.orphanStateIds,
+          retiredCustodyMode,
           now: deps.now(),
         })
+        const pool = await openPoolStore({
+          provider: 'openai',
+          quota: quotaCodec,
+          configPath: deps.paths.configPath,
+          statePath: deps.paths.statePath,
+        }).read()
+        if (pool.status === 'ready') {
+          for (const row of pool.rows) {
+            if (row.disabledReason !== POOL_UNTAGGED_TRANSFER_DISABLED_REASON)
+              continue
+            report.findings.push({
+              code: 'slot-transfer-origin-unknown',
+              accountId: row.id,
+              message: `Account ${row.id} was preserved disabled after an interrupted transfer with an untagged placeholder; sole ownership could not be established. ${POOL_UNTAGGED_TRANSFER_REMEDY}`,
+            })
+          }
+        }
         return report.findings.map((finding) => {
           const repair = finding.repair ? repairFor(finding.repair) : undefined
           return {

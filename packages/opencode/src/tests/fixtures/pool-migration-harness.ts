@@ -32,6 +32,7 @@ import {
 } from '../../core/pool-migration.ts'
 import { legacyRefreshMain } from './legacy-main-refresh.ts'
 import { preTolerantRefreshDueAccounts } from './pool-migration-legacy-refresh.ts'
+import type { LockTiming } from './pool-migration-lock-clock.ts'
 
 /** A version fence with no older process running. */
 export const OPEN_FENCE = async () => ({ open: true as const })
@@ -100,6 +101,7 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 export function fileSlot(authPath: string): HostSlotAdapter {
   const logPath = `${authPath}.writes`
   return {
+    path: authPath,
     async get(input) {
       const map = (await readJson(authPath)) ?? {}
       return map[input.path.id]
@@ -378,9 +380,6 @@ export async function refreshAsOlderBuild(
     } else {
       const manager = new FallbackAccountManager({
         paths: copy.paths,
-        custody: {
-          readManifest: async () => ({ ok: false, reason: 'absent' }),
-        },
         now,
         refreshFn: async ({ refreshToken }) => refresh(refreshToken),
       })
@@ -389,13 +388,8 @@ export async function refreshAsOlderBuild(
         const served = await resolvePoolMainAccess({
           storage: await loadAccounts(copy.paths),
           now,
-          isRefreshInert: async () => false,
           refreshAccount: (account, storage) =>
             manager.refreshAccount(account, storage, { asPoolMain: true }),
-          resolveAccess: async (account) => ({
-            token: account.access ?? '',
-            provenance: 'local' as const,
-          }),
         })
         if (served) mainServedFrom = 'row main'
       } else {
@@ -416,7 +410,6 @@ export async function refreshAsOlderBuild(
 export async function legacyUsableFallbackIds(h: Harness): Promise<string[]> {
   const manager = new FallbackAccountManager({
     paths: h.paths,
-    custody: { readManifest: async () => ({ ok: false, reason: 'absent' }) },
     refreshFn: async () => {
       throw new Error('no refresh expected')
     },
@@ -447,6 +440,8 @@ export interface ChildTask {
   exitAtIndex?: number
   /** Exit at the first step with this name. */
   exitAtName?: string
+  /** Send lock timings to the parent without printing on passing tests. */
+  traceLocks?: boolean
 }
 
 export interface ChildRun {
@@ -455,37 +450,128 @@ export interface ChildRun {
   steps: string[]
   outcome?: Json
   output: string
+  stderr: string
+  locks: LockTiming[]
+}
+
+export interface ChildObserver {
+  start(name: string): () => void
+  step(name: string): void
+  locks(timings: LockTiming[]): void
+  registerCleanup?(stop: () => void): void
+  beforeDeadLockExpiry?(child: ChildRun): void
 }
 
 /** Runs one migration or adoption in a separate process (see the child). */
-export function runChild(task: ChildTask): Promise<ChildRun> {
+export function runChild(
+  task: ChildTask,
+  observer?: ChildObserver,
+): Promise<ChildRun> {
+  const spawned = observer?.start('child spawn')
   const child = spawn(process.execPath, [childScript, JSON.stringify(task)], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   })
+  let reached: (() => void) | undefined
+  let exited: (() => void) | undefined
+  let closed: (() => void) | undefined
+  let didExit = false
+  observer?.registerCleanup?.(() => {
+    if (!didExit) child.kill('SIGKILL')
+  })
+  child.on('spawn', () => {
+    spawned?.()
+    reached = observer?.start('child time to crash step')
+  })
+  child.on('exit', () => {
+    didExit = true
+    reached?.()
+    exited?.()
+    closed = observer?.start('child pipes close')
+  })
   let out = ''
+  let stderr = ''
+  let buffered = ''
+  let stepIndex = 0
   child.stdout.on('data', (chunk: Buffer) => {
-    out += chunk.toString()
+    const text = chunk.toString()
+    out += text
+    if (!observer) return
+    buffered += text
+    const lines = buffered.split('\n')
+    buffered = lines.pop() ?? ''
+    for (const line of lines) {
+      if (line.startsWith('lock-clock:'))
+        observer.locks(JSON.parse(line.slice('lock-clock:'.length)))
+      if (!line.startsWith('step:')) continue
+      const name = line.slice('step:'.length)
+      observer.step(name)
+      if (task.exitAtIndex === stepIndex || task.exitAtName === name) {
+        reached?.()
+        exited = observer.start('child exit after crash step')
+        // Under load the child's exit can be reported before its last stdout
+        // line arrives. If it already exited, close the exit phase now so the
+        // phase clock does not show it as still running.
+        if (didExit) exited()
+      }
+      stepIndex++
+    }
   })
   child.stderr.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString()
     out += chunk.toString()
   })
-  return new Promise((resolve) => {
-    child.on('exit', (code) => {
-      const lines = out.split('\n')
-      const steps = lines
-        .filter((line) => line.startsWith('step:'))
-        .map((line) => line.slice('step:'.length))
-      const outcomeLine = lines.find((line) => line.startsWith('outcome:'))
-      resolve({
-        pid: child.pid,
-        code,
-        steps,
-        output: out,
-        ...(outcomeLine
-          ? { outcome: JSON.parse(outcomeLine.slice('outcome:'.length)) }
-          : {}),
-      })
+  return new Promise((resolve, reject) => {
+    child.on('error', reject)
+    // Exit can precede the last pipe data. Close guarantees the child's error
+    // stack and final migration step are collected before assertions run.
+    child.on('close', async (code) => {
+      try {
+        reached?.()
+        exited?.()
+        closed?.()
+        const lines = out.split('\n')
+        const steps = lines
+          .filter((line) => line.startsWith('step:'))
+          .map((line) => line.slice('step:'.length))
+        const outcomeLine = lines.find((line) => line.startsWith('outcome:'))
+        const lockLine = lines
+          .filter((line) => line.startsWith('lock-clock:'))
+          .at(-1)
+        const result: ChildRun = {
+          pid: child.pid,
+          code,
+          steps,
+          output: out,
+          stderr,
+          locks: lockLine
+            ? JSON.parse(lockLine.slice('lock-clock:'.length))
+            : [],
+          ...(outcomeLine
+            ? { outcome: JSON.parse(outcomeLine.slice('outcome:'.length)) }
+            : {}),
+        }
+        if (
+          code === CRASH_EXIT_CODE &&
+          (task.exitAtIndex !== undefined || task.exitAtName !== undefined)
+        ) {
+          observer?.beforeDeadLockExpiry?.(result)
+          const expired = observer?.start('expire confirmed-dead child locks')
+          const { expireDeadChildLocks } = await import(
+            './pool-migration-lock-clock.ts'
+          )
+          // The child crashed on purpose and its pipes have closed, so it can
+          // no longer renew the locks it held. Expire them now instead of
+          // waiting out their leases and five-second renewal markers. Only
+          // locks still recorded under this child's owner id are touched, so
+          // a lock someone else has taken since is left alone.
+          expireDeadChildLocks(result, result.locks)
+          expired?.()
+        }
+        resolve(result)
+      } catch (error) {
+        reject(error)
+      }
     })
   })
 }

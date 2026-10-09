@@ -2,7 +2,7 @@
 // adoptions (`core/pool-lifecycle.ts`), against a real legacy install on disk,
 // the file-backed host slot and the real version fence over a temporary state
 // home. Timers are fake: each test fires the retry timer itself.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,6 +17,7 @@ import {
   isPoolPlaceholder,
   migrateToPool,
   POOL_MIGRATION_KEY,
+  POOL_PLACEHOLDER,
 } from '../core/pool-migration.ts'
 import {
   migrationFenceOpen,
@@ -30,6 +31,7 @@ import {
   poolTokens,
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 
 const VERSION = '1.0.0'
 const OLDER_PID = 424_242
@@ -38,17 +40,22 @@ let h: Harness
 let stateHome: string
 let alive: Set<number>
 let lifecycle: PoolLifecycle | undefined
+const scope = createRequestTestScope()
+const it = scope.it
 
 beforeEach(() => {
+  scope.capturePluginWork()
   h = harness()
   stateHome = mkdtempSync(join(tmpdir(), 'pool-lifecycle-state-'))
   alive = new Set()
   lifecycle = undefined
 })
-afterEach(() => {
-  lifecycle?.dispose()
-  h.cleanup()
-  rmSync(stateHome, { recursive: true, force: true })
+afterEach(async () => {
+  await scope.teardown(async () => {
+    lifecycle?.dispose()
+    h.cleanup()
+    rmSync(stateHome, { recursive: true, force: true })
+  })
 })
 
 /** Timers the test fires by hand; `delays` lists what is pending. */
@@ -138,6 +145,52 @@ const deferrals = (sink: ReturnType<typeof logSink>) =>
   )
 
 describe('the migration in the background', () => {
+  it('a shared placeholder cannot migrate an empty separate store', async () => {
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+    writeFileSync(h.paths.statePath, '{"version":1,"accounts":{}}')
+    await h.setSlot(POOL_PLACEHOLDER)
+    const before = await h.bytes()
+    const outcomes: unknown[] = []
+    const { lifecycle, timers, sink } = create({
+      migrate: async (deps) => {
+        const outcome = await migrateToPool(deps)
+        outcomes.push(outcome)
+        return outcome
+      },
+    })
+    lifecycle.start()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(false)
+    expect(await h.bytes()).toEqual(before)
+    expect(outcomes).toEqual([
+      { status: 'refused', reason: 'placeholder-without-main' },
+    ])
+    expect(sink.warn).toHaveLength(1)
+    expect(sink.warn[0]?.message).toContain('opencode auth login')
+    expect(sink.warn[0]?.message).toContain('OPENCODE_OPENAI_AUTH_FILE')
+    expect(sink.warn[0]?.message).toContain('OPENCODE_OPENAI_AUTH_STATE_FILE')
+    timers.fire()
+    await lifecycle.idle()
+    expect(await h.bytes()).toEqual(before)
+    expect(sink.warn).toHaveLength(1)
+
+    // Signing in for this setup must unblock the refused migration, without
+    // needing a restart or waiting for its next background timer.
+    await h.setSlot(login('acct-separate', 'r-separate'))
+    await lifecycle.requestAdoption()
+    expect(lifecycle.migrated()).toBe(true)
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-separate',
+    })
+  })
+
   it('start runs the migration without being awaited, and completes it', async () => {
     await seedLegacyInstall(h)
     const { lifecycle, timers } = create()
@@ -152,6 +205,26 @@ describe('the migration in the background', () => {
     expect(lifecycle.migrated()).toBe(true)
     // Once migrated, the timer only keeps the adoption check going.
     expect(timers.delays()).toEqual([POOL_RETRY_MAX_MS])
+  })
+
+  it('an initialized empty pool still cannot claim a shared placeholder', async () => {
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        commonAuthPool: { schemaVersion: 1, rows: {} },
+      }),
+    )
+    writeFileSync(h.paths.statePath, '{"version":1,"accounts":{}}')
+    await h.setSlot(POOL_PLACEHOLDER)
+    const before = await h.bytes()
+    const { lifecycle } = create()
+    lifecycle.start()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(false)
+    expect(await h.bytes()).toEqual(before)
   })
 
   for (const [what, blocker] of [
@@ -252,20 +325,6 @@ describe('the migration in the background', () => {
     timers.fire()
     await lifecycle.idle()
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-  })
-
-  it('under claustrum custody mode nothing runs again', async () => {
-    await seedLegacyInstall(h)
-    const config = await h.config()
-    writeFileSync(
-      h.paths.configPath,
-      JSON.stringify({ ...config, claustrum: { mode: 'claustrum' } }),
-    )
-    const { lifecycle, timers } = create()
-    lifecycle.start()
-    await lifecycle.idle()
-    expect(timers.delays()).toEqual([])
-    expect((await h.slotValue())?.refresh).toBe('r-main')
   })
 })
 

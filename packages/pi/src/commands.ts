@@ -4,8 +4,10 @@
 // The menu works on Pi's account pool. Pi's own `openai-codex` login is not a
 // row of it: it is routed as `main` and replaced through Pi's `/login`, so the
 // menu shows its quota in a section of its own and refuses to add that
-// account again as a row.
+// account again as a row. Its Vault section connects Pi to the Claustrum
+// vault, whose OpenAI accounts are then routed beside these.
 import {
+  CommandError,
   type CommandMenu,
   runPiCommandMenu,
 } from '@cortexkit/common-auth/commands'
@@ -13,10 +15,12 @@ import {
   createOpenAiMenu,
   OPENAI_COMMAND_NAME,
   sessionSection,
+  vaultSection,
 } from '@cortexkit/openai-auth-core'
 import {
   beginAccountLogin,
   type OAuthQuotaSnapshot,
+  type VaultWaitOptions,
 } from '@cortexkit/openai-auth-core/internal'
 import type {
   ExtensionAPI,
@@ -32,6 +36,8 @@ export type PiCommandDependencies = {
   packageVersion?: string
   /** The account pool the request path routes across; the menu works on it. */
   pool?: PiPoolCommands
+  /** How the Vault section's Connect polls for the approval (tests shorten it). */
+  vaultWait?: VaultWaitOptions
 }
 
 function windowLine(
@@ -76,6 +82,8 @@ export function createPiMenu(
   const version = dependencies.packageVersion ?? packageJson.version
   return createOpenAiMenu({
     store: pool.store(),
+    vault: pool.vault,
+    quotaCheckIncludesVault: true,
     login: {
       begin: (options) => begin({ ...options, version }),
       mainIdentity: async () => pool.mainIdentity(),
@@ -84,8 +92,11 @@ export function createPiMenu(
       const failures = (await pool.refreshAllQuota()).filter(
         (result) => !result.ok,
       )
+      // A CommandError, so the menu shows which accounts failed and why (it
+      // shows a generic line for any other error); the text is still redacted.
       if (failures.length > 0)
-        throw new Error(
+        throw new CommandError(
+          'quota-check-failed',
           failures
             .map(
               (failure) =>
@@ -99,6 +110,10 @@ export function createPiMenu(
       sessionSection({
         getPin: async (sessionId) => getPiStickyRouting(sessionId),
         clearPin: async (sessionId) => clearPiStickyRouting(sessionId),
+      }),
+      vaultSection({
+        vault: pool.vault,
+        ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
       }),
     ],
     afterApply: () => pool.reload(),

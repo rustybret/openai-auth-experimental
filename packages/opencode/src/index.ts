@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto'
 import {
   mkdirSync,
   readFileSync,
@@ -8,12 +9,12 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { parseApplyRequest } from '@cortexkit/common-auth/commands'
 import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from '@cortexkit/common-auth/rpc'
-import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
 import {
   type ResetTargetIdentity,
   writeSettings,
@@ -24,19 +25,13 @@ import {
   beginAccountLogin,
   buildRefreshOperationError,
   buildUserAgent,
-  CUSTODY_EXCLUDED,
-  CUSTODY_REFUSE,
-  CustodyTombstoneRefreshError,
   cacheKeepSettings,
-  claustrumMode,
   codexRefreshFn,
   errorMessage,
   extractAccountId,
   extractAccountIdFromClaims,
-  FALLBACK_REFRESH_LOCK_TTL_MS,
   type FallbackAccount,
   FallbackAccountManager,
-  fallbackRefreshLockName,
   formatRefreshBackoffMessage,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
@@ -45,6 +40,7 @@ import {
   isKillswitchEnabled,
   isOAuthAccount,
   isRecord,
+  isTombstoned,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
   loadAccounts,
@@ -53,6 +49,7 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  type OpenAiVault,
   parseJwtClaims,
   type QuotaEntry,
   QuotaManager,
@@ -60,16 +57,12 @@ import {
   type RoutingMode,
   refreshAllQuota,
   refreshBackoffActive,
-  refreshInert,
-  resolveFallbackAccess,
   resolveMidStreamRateLimitResetAt,
   shouldFallbackStatus,
-  stampVaultProvenance,
   type TokenResponse,
-  tombstoned,
-  type VaultProvenance,
+  TombstoneRefreshError,
+  vaultStateDir,
   whamUsageFn,
-  withAccountStoreTransaction,
 } from '@cortexkit/openai-auth-core/internal'
 import type {
   AuthOAuthResult,
@@ -101,26 +94,15 @@ import {
   routedAccountForSession,
 } from './core/cachekeep'
 import {
-  type CustodyBootstrap,
   classifyMainAuthSlot,
-  mainAccountIdFromServedCredential,
-  reconcileMainSlotBeforeHooks,
-  recordVerifiedInProcessMainLogin,
-} from './core/custody-host-slot.ts'
-import {
-  CUSTODY_OWNING_PROVIDER,
-  custodyManifestHandles,
-  readCustodyManifest,
-} from './core/custody-manifest.ts'
-import {
-  acquireCustodyTransitionMutex,
-  type CustodyHostAuth,
-  enterClaustrumMode,
-  leaveClaustrumMode,
   MAIN_REFRESH_LOCK_NAME,
-  releaseCustodyLoginLeaseAfterHostWrite,
-} from './core/custody-transition.ts'
-import { PoolAccountSource } from './core/pool-account-source'
+  opencode1SlotForClient,
+} from './core/host-slot'
+import {
+  PoolAccountSource,
+  settlesWithin,
+  VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+} from './core/pool-account-source'
 import {
   migratedPoolRows,
   openAccountPool,
@@ -136,6 +118,7 @@ import {
   findPoolMainRow,
   isPoolMainPlaceholder,
   MainAccountInPoolError,
+  POOL_LOGIN_REQUIRED_MESSAGE,
   type PoolMainAccess,
   resolvePoolMainAccess,
   withoutPoolMainRow,
@@ -144,10 +127,13 @@ import {
   adoptHostSlotLogin,
   migrateToPool,
   PoolTransferPendingError,
+  poolPlaceholderWithoutMain,
   poolTransferPendingInConfigFile,
+  reclaimExpiredPoolTransfer,
 } from './core/pool-migration'
-import { observationFromSnapshot } from './core/pool-quota'
+import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
+  LOCAL_CREDENTIAL_REFUSALS,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
@@ -158,6 +144,7 @@ import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
 } from './core/process-heartbeat'
+import { acquireOpenCodeVault } from './core/shared-vault'
 import {
   decideStickyBreak,
   type StickyBreakDecision,
@@ -190,12 +177,10 @@ import {
   isQuotaExhausted,
   persistSidebarStickyAssignment,
   planSidebarStickyAssignmentFromSnapshot,
-  projectCustodyForSidebar,
   type QuotaWindow,
   rememberStickyPin,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
-  type SidebarAccountCustody,
   type SidebarBookkeepingQueue,
   type SidebarMachineState,
   type SidebarSnapshot,
@@ -206,12 +191,18 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
+import {
+  type CanonicalInput,
+  canonicalInput,
+  canonicalPrefixLength,
+  retainedInput,
+} from './util/canonical-input'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
 import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
-const ALLOWED_MODELS = new Set([
+export const ALLOWED_MODELS = new Set([
   'gpt-5.5',
   'gpt-5.3-codex-spark',
   'gpt-5.4',
@@ -227,7 +218,85 @@ const ALLOWED_MODELS = new Set([
 // (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
 // api.id "gpt-6" drop with it. gpt-6.1 is the same again: only gpt-6.1-sol is
 // served, and the bare id (like gpt-6.1-luna and gpt-6.1-astra) answers 400.
-const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
+export const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
+
+/**
+ * Whether a model (by its API id) is offered on a ChatGPT login: the allow
+ * list, else not the deny list and a GPT version above 5.4. The caller drops
+ * `pro` reasoning variants itself. Shared by the OpenCode 1 models hook and
+ * the OpenCode 2 model transform.
+ */
+export function codexOAuthModelListed(apiId: string): boolean {
+  if (ALLOWED_MODELS.has(apiId)) return true
+  if (DISALLOWED_MODELS.has(apiId)) return false
+  // The minor is optional: a major-only id like gpt-6-astra carries no
+  // decimal, and requiring one silently dropped it from the catalogue even
+  // though the backend serves it.
+  const match = apiId.match(/^gpt-(\d+(?:\.\d+)?)/)
+  const version = match?.[1]
+  return version ? parseFloat(version) > 5.4 : false
+}
+
+/**
+ * The context window a ChatGPT login gets for a model (by its id), or
+ * undefined to keep the model's own. Shared by the OpenCode 1 models hook and
+ * the OpenCode 2 model transform.
+ */
+export function codexOAuthModelLimit(
+  modelId: string,
+): { context: number; input: number; output: number } | undefined {
+  if (modelId.includes('gpt-5.5'))
+    return { context: 400_000, input: 272_000, output: 128_000 }
+  // gpt-6-astra pays no long-context surcharge on the Codex backend, so it
+  // keeps the full window that backend reports. Per OpenAI's enterprise rate
+  // card, read 2026-09-05 at help.openai.com/en/articles/20001415 — section
+  // "GPT-6 Astra — Codex long-context exception": "GPT-6 Astra usage in Codex
+  // does not incur additional long-context multipliers above 272K input
+  // tokens." The exemption is per-surface: the same model billed through the
+  // platform API does pay it (developers.openai.com/api/docs/models/gpt-6-astra).
+  //
+  // That makes this correct for the DEFAULT endpoint. A `codexApiEndpoint`
+  // override pointed at a relay or a differently-billed surface inherits this
+  // window without inheriting the exemption, which is the operator's to
+  // re-check.
+  //
+  // 872k is the Codex backend's own reported max_context_window, from
+  // GET /backend-api/codex/models?client_version=<v>. The configured window
+  // follows that reported number rather than the hard ceiling probing found
+  // just above it (876,934 input tokens accepted on 2026-09-04), since the
+  // reported number is the one the backend maintains. Input and output draw on
+  // one shared budget, so `input` is that window minus the 128k output
+  // reserve.
+  if (modelId.includes('gpt-6-astra'))
+    return { context: 872_000, input: 744_000, output: 128_000 }
+  // The 5.6 family is NOT exempt — same rate card, same date: above 272k input
+  // tokens it costs 2x input and 1.5x output ON THE WHOLE REQUEST, so `input`
+  // is held under that line at 244k and `context` is that cap plus the 128k
+  // output reserve. This is a cost decision, never a capability one —
+  // gpt-5.6-sol accepted 861,550 input tokens when measured — so do not
+  // "correct" these numbers upward to that ceiling without re-reading the rate
+  // card first.
+  //
+  // gpt-6-sol and gpt-6-luna are NOT exempt either, even though they share
+  // astra's 872k reported window. The rate card, re-read 2026-09-25, names
+  // only GPT-6 Astra in its Codex long-context exception; the surcharge row
+  // applies to everything else. Checking the model family is the wrong test -
+  // it is the rate card's named list.
+  //
+  // gpt-6.1-sol is held here too. Its published pricing, read 2026-09-29 at
+  // developers.openai.com/api/docs/models/gpt-6.1-sol, charges 2x input and
+  // 1.5x output on the full request above 272K input tokens, and nothing names
+  // it in a Codex exception. (The rate card itself could not be fetched that
+  // day; re-check it before raising this.)
+  if (
+    modelId.includes('gpt-5.6') ||
+    modelId.includes('gpt-6-sol') ||
+    modelId.includes('gpt-6-luna') ||
+    modelId.includes('gpt-6.1-sol')
+  )
+    return { context: 372_000, input: 244_000, output: 128_000 }
+  return undefined
+}
 
 /**
  * Surfaced when a request would go to the wire with no credential.
@@ -244,7 +313,7 @@ export const EMPTY_BEARER_MESSAGE =
 // from the backend's own model list rather than assumed:
 //   GET /backend-api/codex/models?client_version=<v>
 // reports `use_responses_lite` per model, and every gpt-6 variant is marked true.
-const RESPONSES_LITE_MODELS = new Set([
+export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
@@ -266,8 +335,8 @@ const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 // gpt-5.3-codex-spark answer 400 at every version ("not supported when using
 // Codex with a ChatGPT account") - a backend retirement, not something this
 // version causes.
-const CODEX_VERSION = '0.159.0'
-const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
+export const CODEX_VERSION = '0.159.0'
+export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
@@ -284,9 +353,15 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+let bootQuotaSeedPromise: Promise<unknown> | undefined
+
+export function __bootQuotaSeedPromiseForTest(): Promise<unknown> | undefined {
+  return bootQuotaSeedPromise
+}
 
 export function __resetBootQuotaSeedForTest(): void {
   bootQuotaSeedStarted = false
+  bootQuotaSeedPromise = undefined
 }
 
 const logModels = createLogger('models')
@@ -355,19 +430,6 @@ interface ResetTargetResolverDeps {
   accountStoragePath: string
   accountStatePath: string
   now: () => number
-  isFallbackRefreshInert?: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => Promise<boolean>
-  resolveFallbackAccess?: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => ReturnType<typeof resolveFallbackAccess>
-  reportAuthFailure?: (params: {
-    handle: string
-    providerStatus: number
-    recordVersion: number
-  }) => Promise<void>
 }
 
 function resetTargetNeedsRefresh(
@@ -447,7 +509,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       statePath: deps.accountStatePath,
     })
     const row = findPoolMainRow(storage)
-    if (!storage || !row) {
+    if (!storage || !row || isTombstoned(row)) {
       throw new ResetTargetResolutionError(
         'token_unavailable',
         'Main OpenAI account has no usable access token.',
@@ -455,7 +517,6 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     }
     let resolved = row
     if (
-      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
       resetTargetNeedsRefresh(
         resolved.access,
         resolved.expires,
@@ -468,39 +529,20 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
         storage,
       )
     }
-    const accessResolution = deps.resolveFallbackAccess
-      ? await deps.resolveFallbackAccess(resolved, storage)
-      : resolved.access
-        ? { token: resolved.access, provenance: 'local' as const }
-        : CUSTODY_REFUSE
-    if (
-      accessResolution === CUSTODY_REFUSE ||
-      accessResolution === CUSTODY_EXCLUDED ||
-      !accessResolution.token
-    ) {
+    if (!resolved.access) {
       throw new ResetTargetResolutionError(
         'token_unavailable',
         'Main OpenAI account has no usable access token.',
       )
     }
-    const claims = parseJwtClaims(accessResolution.token)
+    const claims = parseJwtClaims(resolved.access)
     return {
       accountKey: 'main',
       label: 'Main account',
-      accessToken: accessResolution.token,
+      accessToken: resolved.access,
       chatgptAccountId:
         resolved.accountId ??
         (claims ? extractAccountIdFromClaims(claims) : undefined),
-      onAuthFailure:
-        accessResolution.provenance === 'local'
-          ? undefined
-          : async (status: number) => {
-              await deps.reportAuthFailure?.({
-                handle: accessResolution.provenance.handle,
-                providerStatus: status,
-                recordVersion: accessResolution.provenance.recordVersion,
-              })
-            },
     }
   }
 
@@ -585,9 +627,14 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       )
     }
 
+    const noToken = () =>
+      new ResetTargetResolutionError(
+        'token_unavailable',
+        `Fallback account ${accountKey} has no usable access token.`,
+      )
+    if (isTombstoned(account)) throw noToken()
     let resolved = account
     if (
-      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
       resetTargetNeedsRefresh(
         resolved.access,
         resolved.expires,
@@ -597,20 +644,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     ) {
       resolved = await deps.refreshFallbackAccount(resolved, storage)
     }
-    const accessResolution = deps.resolveFallbackAccess
-      ? await deps.resolveFallbackAccess(resolved, storage)
-      : resolved.access
-        ? { token: resolved.access, provenance: 'local' as const }
-        : CUSTODY_REFUSE
-    if (
-      accessResolution === CUSTODY_REFUSE ||
-      accessResolution === CUSTODY_EXCLUDED
-    ) {
-      throw new ResetTargetResolutionError(
-        'token_unavailable',
-        `Fallback account ${accountKey} has no usable access token.`,
-      )
-    }
+    if (!resolved.access) throw noToken()
 
     const freshStorage = await deps.loadAccounts({
       configPath: deps.accountStoragePath,
@@ -640,18 +674,8 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     return {
       accountKey,
       label: resolved.label ?? accountKey,
-      accessToken: accessResolution.token,
+      accessToken: resolved.access,
       chatgptAccountId: freshAccount.accountId,
-      onAuthFailure:
-        accessResolution.provenance === 'local'
-          ? undefined
-          : async (status: number) => {
-              await deps.reportAuthFailure?.({
-                handle: accessResolution.provenance.handle,
-                providerStatus: status,
-                recordVersion: accessResolution.provenance.recordVersion,
-              })
-            },
     }
   }
 }
@@ -723,12 +747,13 @@ export {
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
 
-// The account-pool migration ships switched off in the release that first
-// understands the migrated layout, so every install runs that release (a safe
-// version to go back to) before any credential moves. The next release turns
-// this on; the version fence then waits for every running process to be on
-// it before migrating.
-const POOL_MIGRATION_ENABLED = false
+// Moves the main login from OpenCode's slot into the account pool. The version
+// fence holds the move until every running OpenCode process with this plugin
+// runs a version that understands the pool, so an older process never sees a
+// placeholder it would send. Going back to a version without pool support
+// after the move leaves main unusable there. Kept as a constant so tests and
+// the OpenCode 2 entry share one switch.
+export const POOL_MIGRATION_ENABLED = true
 
 interface CodexAuthPluginOptions {
   /**
@@ -751,22 +776,32 @@ interface CodexAuthPluginOptions {
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
   responsesLite?: boolean
-  custody?: {
-    /** Test seam: the transport backing the loader-owned runtime. */
-    transport: ClaustrumCacheTransportLike
-    /** Test seam: override the connection-file detection result. */
-    detection?: 'available' | 'absent'
-    /** Test seam: observes the loader-owned runtime for explicit ticks. */
-    onRuntime?: (runtime: CustodyRuntime) => void
-    /** Test seam: controls the runtime clock for expiry-bound scenarios. */
-    now?: () => number
-    /** Test seam: controls bounded host-write observation without real timers. */
+  /**
+   * Test seams for the Claustrum vault: its connections and the directory its
+   * token and roster live in.
+   */
+  vault?: Partial<
+    Pick<
+      ConstructorParameters<typeof OpenAiVault>[0],
+      | 'stateDir'
+      | 'connectionFile'
+      | 'connectScoped'
+      | 'connectEnrollment'
+      | 'pollIntervalMs'
+    >
+  > & {
+    /**
+     * Longest an adoption or the pool source's first quota polls wait for
+     * the vault's first roster; `VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS` by
+     * default.
+     */
+    firstRosterWaitMs?: number
+  }
+  /** Test seams for the OAuth logins of the auth methods. */
+  login?: {
+    /** Controls the wait for the host's slot write without real timers. */
     sleep?: (ms: number) => Promise<void>
-    /** Test seam: observes a host-write observation deadline warning. */
-    warn?: (message: string) => void
-    /** Test seam: observes the account lock around custody binding checks. */
-    withFallbackAccountLock?: OpenCodeMenuContext['withFallbackAccountLock']
-    /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
+    /** Replaces external OAuth I/O while preserving the hook callback. */
     authorize?: {
       browser?: () => Promise<{
         url: string
@@ -788,12 +823,14 @@ interface CodexSessionMetadata {
   windowID: string
   turnStartedAt?: number
   input?: unknown[]
+  canonicalInput?: CanonicalInput
   /**
    * The `reasoning.effort` this session opened with. Held so a later change can
    * be carried as a `configuration_update` item instead of as a different
    * request-level value. See `applyMidConversationEffort`.
    */
   pinnedEffort?: string
+  effortUpdates?: Array<{ anchor: number; fingerprint: string; effort: string }>
 }
 
 interface PersistedCodexSessions {
@@ -897,18 +934,14 @@ function isMessageWithRole(item: unknown, role: string) {
   )
 }
 
-function hasInputPrefix(prefix: unknown[], input: unknown[]) {
-  if (prefix.length > input.length) return false
-  for (let index = 0; index < prefix.length; index++) {
-    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
-      return false
-  }
-  return true
-}
-
-function startsHttpUserTurn(metadata: CodexSessionMetadata, input: unknown[]) {
+function startsHttpUserTurn(
+  metadata: CodexSessionMetadata,
+  input: unknown[],
+  canonical: CanonicalInput,
+) {
   if (!metadata.input) return input.length > 0
-  if (!hasInputPrefix(metadata.input, input)) return true
+  const prior = metadata.canonicalInput ?? canonicalInput(metadata.input)
+  if (canonicalPrefixLength(prior, canonical) === undefined) return true
   const suffix = input.slice(metadata.input.length)
   return suffix.some(
     (item) =>
@@ -921,13 +954,25 @@ function updateHttpTurnMetadata(
   body: Record<string, unknown> | undefined,
 ) {
   const input = Array.isArray(body?.input) ? body.input : undefined
-  if (input && (startsHttpUserTurn(metadata, input) || !metadata.turnID)) {
+  const canonical = input
+    ? canonicalInput(input, metadata.canonicalInput)
+    : undefined
+  if (
+    input &&
+    canonical &&
+    (startsHttpUserTurn(metadata, input, canonical) || !metadata.turnID)
+  ) {
     metadata.turnID = uuidV7()
     metadata.turnStartedAt = Date.now()
   } else if (!metadata.turnStartedAt) {
     metadata.turnStartedAt = Date.now()
   }
-  if (input) metadata.input = input
+  // Copy the host input before effort updates are inserted, so the next tool
+  // request compares against host history and does not start a false user turn.
+  if (input && canonical) {
+    metadata.input = input.slice()
+    metadata.canonicalInput = retainedInput(canonical)
+  }
 }
 
 function prepareCodexRequest(input: {
@@ -939,6 +984,10 @@ function prepareCodexRequest(input: {
   responsesLite: boolean
   dumpSessionID?: string
 }): PreparedCodexRequest {
+  // Read and remove the internal agent header before any early return, so it
+  // cannot reach outgoing headers, cachekeep captures or request dumps.
+  const agent = input.headers.get(OPENAI_AGENT_HEADER)
+  input.headers.delete(OPENAI_AGENT_HEADER)
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
   if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
@@ -994,7 +1043,7 @@ function prepareCodexRequest(input: {
   parsed.parallel_tool_calls ??= true
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
-  applyMidConversationEffort(parsed, input.metadata)
+  applyMidConversationEffort(parsed, input.metadata, agent)
   if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
@@ -1082,39 +1131,11 @@ function stampWindowCheckedAt(
   return { ...window, checkedAt: entryCheckedAt }
 }
 
-import {
-  __createCustodyRuntimeForTest,
-  type ClaustrumCacheTransportLike,
-  type CustodyRuntime,
-  custodyMinTtlMs,
-} from './core/custody-runtime.ts'
-
-export {
-  __createCustodyRuntimeForTest,
-  __resetSweepFailureLogDedupeForTest,
-  type ClaustrumCacheTransportLike,
-  type CustodyRuntime,
-  type CustodyRuntimeOptions,
-} from './core/custody-runtime.ts'
-
-function lookupManifestHandle(
-  manifest: ReturnType<typeof readCustodyManifest> extends Promise<infer R>
-    ? R
-    : never,
-  accountId: string,
-): string | undefined {
-  return custodyManifestHandles(manifest).get(accountId)
-}
-
 export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
   now = Date.now(),
   mainAccountIdentity = store.mainAccountId,
-  projectCustody?: (
-    account: FallbackAccount,
-    now: number,
-  ) => SidebarAccountCustody | undefined,
 ): SidebarMachineState {
   const mainEntry = qm.getMain()
   const mainQuota = mainEntry?.quota
@@ -1147,11 +1168,6 @@ export function buildSidebarMachineState(
       .map((account) => {
         const fallbackEntry = qm.getFallback(account.id)
         const fallbackQuota = fallbackEntry?.quota
-        // Sync projection: the loader pre-resolves custody state once per write
-        // (cache peek is async; the runtime owns the map) and threads a sync
-        // lookup in. An absent callback leaves `custody` unset, which is the
-        // pre-custody shape — the normalizer drops it without rendering.
-        const custodyProjection = projectCustody?.(account, now)
         return {
           id: account.id,
           label: (account as { label?: string }).label,
@@ -1179,7 +1195,6 @@ export function buildSidebarMachineState(
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
             ? { resetCredits: fallbackQuota.resetCreditsAvailable }
             : {}),
-          ...(custodyProjection ? { custody: custodyProjection } : {}),
         }
       }),
     route: store.routing?.mode ?? 'main-first',
@@ -1241,15 +1256,35 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-function stripResponsesLiteImageDetails(value: unknown) {
+// The input saved to detect the next HTTP user turn (`metadata.input`) holds
+// the same item objects as this request body. Copy only the paths that change,
+// so removing image details from what is sent leaves that saved history as the
+// host sent it; otherwise every later request would look like a new turn.
+function stripResponsesLiteImageDetails(value: unknown): unknown {
   if (Array.isArray(value)) {
-    for (const item of value) stripResponsesLiteImageDetails(item)
-    return
+    let next = value
+    for (let index = 0; index < value.length; index++) {
+      const nested = stripResponsesLiteImageDetails(value[index])
+      if (nested === value[index]) continue
+      if (next === value) next = value.slice()
+      next[index] = nested
+    }
+    return next
   }
-  if (!isRecord(value)) return
-  if (value.type === 'input_image') delete value.detail
-  for (const nested of Object.values(value))
-    stripResponsesLiteImageDetails(nested)
+  if (!isRecord(value)) return value
+  let next = value
+  for (const key of Object.keys(value)) {
+    if (value.type === 'input_image' && key === 'detail') {
+      if (next === value) next = { ...value }
+      delete next[key]
+      continue
+    }
+    const nested = stripResponsesLiteImageDetails(value[key])
+    if (nested === value[key]) continue
+    if (next === value) next = { ...value }
+    next[key] = nested
+  }
+  return next
 }
 
 // Models where a `configuration_update` item is both accepted and shown to change
@@ -1264,70 +1299,116 @@ function stripResponsesLiteImageDetails(value: unknown) {
 // September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
 // too weak to tell from noise, on a model people already run, where the
 // request-level effort change it uses today is known to work.
-const MID_CONVERSATION_EFFORT_MODELS = new Set([
+export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-astra',
   'gpt-6-sol',
   'gpt-6-luna',
   'gpt-6.1-sol',
 ])
 
+// OpenCode's built-in definitions (packages/opencode/src/agent/agent.ts in the
+// OpenCode repository) mark title, compaction and summary as hidden helpers,
+// not the conversation's agent loop. chat.headers supplies the
+// host's agent name; missing tags retain compatibility with other fetch callers.
+const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'
+const HIDDEN_EFFORT_AGENTS = new Set(['title', 'compaction', 'summary'])
+
 /**
- * Change reasoning effort mid-session without disturbing the replayed prefix.
- *
- * Sending a different request-level `reasoning.effort` works, and is what the
- * host does on its own. The cost is that the effort is part of what the backend
- * keys its prefix cache on, so raising effort on turn 20 asks it to re-read the
- * whole conversation. Pinning the request-level value to whatever the session
- * opened with, and carrying the change as a `configuration_update` item
- * instead, leaves the prefix byte-identical.
- *
- * The item is re-asserted on every request rather than written into history:
- * the host owns the history and will not replay an item this plugin injected,
- * so an update recorded once would be gone by the next turn. Re-asserting also
- * places it immediately before the final entry — the new user message — which
- * is past the cached prefix, and makes two updates landing adjacent impossible.
- * The API rejects adjacent updates.
- *
- * The response keeps reporting the request-level effort rather than the updated
- * one, so usage records will show the pinned value. That is the documented
- * behaviour, not a bug to chase.
+ * Keep the request-level effort fixed for prefix caching. The host does not
+ * replay injected items, so remember each change at its original user message
+ * and rebuild the same prefix before the WebSocket pool trims continuations.
+ * Fingerprints detect compaction/revert at an anchor; a rewritten conversation
+ * starts a new pin rather than replaying instructions into unrelated history.
+ * Usage still reports the pinned request-level effort, not the effective one.
  */
 function applyMidConversationEffort(
   parsed: Record<string, unknown>,
   metadata: CodexSessionMetadata,
+  agent: string | null,
 ) {
+  if (agent !== null && HIDDEN_EFFORT_AGENTS.has(agent)) return
   const model = typeof parsed.model === 'string' ? parsed.model : ''
   if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return
   const reasoning = isRecord(parsed.reasoning) ? parsed.reasoning : undefined
   const effort =
     typeof reasoning?.effort === 'string' ? reasoning.effort : undefined
   if (!effort) return
-  if (metadata.pinnedEffort === undefined) {
+  const input = Array.isArray(parsed.input) ? parsed.input : undefined
+  metadata.effortUpdates ??= []
+  const updates = metadata.effortUpdates
+  const fingerprint = (item: unknown) =>
+    createHash('sha256')
+      .update(stableStringify(item))
+      .digest('hex')
+      .slice(0, 16)
+  if (
+    metadata.pinnedEffort === undefined ||
+    updates.some(
+      (update) =>
+        !input ||
+        !isMessageWithRole(input[update.anchor], 'user') ||
+        fingerprint(input[update.anchor]) !== update.fingerprint,
+    )
+  ) {
     metadata.pinnedEffort = effort
+    metadata.effortUpdates = []
     return
   }
-  if (effort === metadata.pinnedEffort) return
-  const input = Array.isArray(parsed.input) ? parsed.input : undefined
-  // With nothing to sit in front of, an update would be the whole request; let
-  // the request-level value stand rather than send a bare instruction.
   if (!input || input.length === 0) return
+  const anchor = input.findLastIndex((item) => isMessageWithRole(item, 'user'))
+  const latest = updates.at(-1)
+  const effective = latest?.effort ?? metadata.pinnedEffort
+  if (anchor >= 0 && effort !== effective) {
+    if (latest?.anchor === anchor) {
+      const before = updates.at(-2)?.effort ?? metadata.pinnedEffort
+      if (effort === before) updates.pop()
+      else latest.effort = effort
+    } else {
+      updates.push({ anchor, fingerprint: fingerprint(input[anchor]), effort })
+    }
+  } else if (anchor < 0 && effort !== effective) {
+    // No user turn can carry a new instruction; leave the host's effort alone.
+    return
+  }
+  // Anchors only ever grow, because a new one is the latest user message and
+  // an older anchor that moved fails its fingerprint first. Should that ever
+  // not hold, start over from this request's effort rather than fail the
+  // request or send two updates side by side, which the API refuses.
+  if (
+    updates.some(
+      (update, i) => i > 0 && update.anchor <= (updates[i - 1]?.anchor ?? -1),
+    )
+  ) {
+    metadata.pinnedEffort = effort
+    metadata.effortUpdates = []
+    return
+  }
   parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
-  input.splice(input.length - 1, 0, {
-    type: 'configuration_update',
-    reasoning: { effort },
-  })
+  // Anchors are indices into the host's input. Inserting from the highest
+  // anchor down keeps the lower ones valid. Each update goes in front of a
+  // different user message, so that message always separates it from the
+  // next update: the API refuses two updates side by side.
+  for (let i = updates.length - 1; i >= 0; i--) {
+    const update = updates[i]
+    if (!update) continue
+    input.splice(update.anchor, 0, {
+      type: 'configuration_update',
+      reasoning: { effort: update.effort },
+    })
+  }
 }
 
 // Responses Lite trades capabilities for Codex's compact request shape. It is
 // opt-in because it disables parallel tool calls and excludes hosted tools.
-function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
+export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
   reasoning.context = 'all_turns'
   parsed.reasoning = reasoning
   parsed.parallel_tool_calls = false
 
-  const input = Array.isArray(parsed.input) ? parsed.input : []
-  stripResponsesLiteImageDetails(input)
+  const input = stripResponsesLiteImageDetails(
+    Array.isArray(parsed.input) ? parsed.input : [],
+  ) as unknown[]
   const tools = Array.isArray(parsed.tools)
     ? parsed.tools.filter(
         (tool) => !(isRecord(tool) && tool.type === 'web_search'),
@@ -1388,6 +1469,7 @@ export async function CodexAuthPlugin(
   const codexSessions = loadCodexSessions()
   const persistCodexSessions = () => saveCodexSessions(codexSessions)
   let websocketFetchInstalled = false
+  let codexFetchInstalled = false
   const websocketFetches: Array<
     ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>
   > = []
@@ -1396,17 +1478,15 @@ export async function CodexAuthPlugin(
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
   let cmdCtx: OpenCodeMenuContext | null = null
-  const hostAuth = input.client.auth as unknown as {
-    all(): Promise<Record<string, unknown>>
-    get(input: { path: { id: string } }): Promise<unknown>
-    set(input: {
-      path: { id: string }
-      body: { type: 'oauth'; access: string; refresh: string; expires: number }
-    }): Promise<unknown>
-  }
+  // OpenCode's `openai` login slot, for the account-pool migration, the
+  // adoption of later logins and the wait for a login's write. OpenCode 1's
+  // plugin client can write the slot but not read it, so it is read from
+  // OpenCode's `auth.json` (`core/host-slot.ts`).
+  const hostSlot = opencode1SlotForClient(input.client)
   const ownedCacheKeepManagers = new Map<string, OpenAICacheKeepManager>()
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
+  let missingPoolMainLogged = false
   let sidebarStateFileForEvents: string | undefined
   // Sticky-balanced session-to-account pins this process placed and is using,
   // whose writes may not have reached the sidebar file yet (see
@@ -1417,35 +1497,81 @@ export async function CodexAuthPlugin(
   // Background writer for the sidebar updates requests make (routing display,
   // pushed quota, sticky pins); the loader installs one per run.
   let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
-  // Custody runtime — assigned inside the loader so dispose can close the
-  // vendored client and clear the custody tick timer after the loader has
-  // returned. Built unconditionally so a custody-disabled process still has
-  // a runtime to dispose (no-op tick + close).
-  let custodyRuntimeRef: CustodyRuntime | undefined
+  // The vault state belongs to the host, not the project, so every project
+  // this process loads shares one vault consumer (`core/shared-vault.ts`).
+  // This instance holds a reference and releases it on dispose; the consumer
+  // closes when the last project releases. All of them route over the same
+  // pool store, the one `getConfigPath()` names for this process.
+  const vaultLease = acquireOpenCodeVault(
+    {
+      host: 'opencode',
+      stateDir:
+        options.vault?.stateDir ??
+        vaultStateDir(getAccountPaths(getConfigPath()).statePath),
+      ...(input.directory ? { projectRoot: input.directory } : {}),
+      reservedRouteIds: () =>
+        poolAccountSource?.peek().rows.map((row) => row.id) ?? [],
+      ...(options.vault?.connectionFile
+        ? { connectionFile: options.vault.connectionFile }
+        : {}),
+      ...(options.vault?.connectScoped
+        ? { connectScoped: options.vault.connectScoped }
+        : {}),
+      ...(options.vault?.connectEnrollment
+        ? { connectEnrollment: options.vault.connectEnrollment }
+        : {}),
+      ...(options.vault?.pollIntervalMs !== undefined
+        ? { pollIntervalMs: options.vault.pollIntervalMs }
+        : {}),
+      fetchImpl: () => fetch,
+    },
+    getAccountPaths(getConfigPath()),
+  )
+  const vault = vaultLease.vault
+  // Until the vault's first account list arrives, a local pool row signed in
+  // as an account the vault holds looks like this host's own and could be
+  // served or adopted twice. Login adoption and first-sight quota polls wait
+  // for that shared first read (bounded); plugin setup and the loader never
+  // do, so OpenCode's startup does not depend on the vault.
+  const vaultFirstRoster = vaultLease.firstRoster
+  const vaultNotUsed = Promise.withResolvers<void>()
+  const vaultReadyForAdoption = Promise.race([
+    vaultFirstRoster,
+    vaultNotUsed.promise,
+  ])
+  const vaultRosterWaitMs =
+    options.vault?.firstRosterWaitMs ?? VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS
   // This instance's entry in the per-process heartbeat directory, written by
   // the first loader run and dropped on dispose.
   let processHeartbeat: Promise<ProcessHeartbeatHandle> | undefined
   // The account pool as the request path's source of accounts once the
   // install is migrated; the loader installs one per run.
   let poolAccountSource: PoolAccountSource | undefined
-  // Background account-pool migration and adoption of later host-slot
-  // logins. Needs the host slot's full adapter (get, set and all); a client
-  // without it (some embedders and tests) runs without the pool migration.
+  // Background account-pool migration, and adoption into the pool of logins
+  // that land in OpenCode's slot after it. A client that cannot write the
+  // slot runs without both and logs why: a migration that is off without a
+  // word is indistinguishable from one that ran.
   const { enabled: poolMigrationEnabled, ...poolMigrationDeps } =
     options.poolMigration ?? {}
+  const poolMigrationOn = poolMigrationEnabled ?? POOL_MIGRATION_ENABLED
+  if (poolMigrationOn && 'reason' in hostSlot)
+    (poolMigrationDeps.log ?? createLogger('pool')).warn(
+      'account pool migration is off for this OpenCode client',
+      { reason: hostSlot.reason },
+    )
   const poolLifecycle: PoolLifecycle | undefined =
-    (poolMigrationEnabled ?? POOL_MIGRATION_ENABLED) &&
-    typeof (hostAuth as Partial<typeof hostAuth>).get === 'function' &&
-    typeof (hostAuth as Partial<typeof hostAuth>).all === 'function'
+    poolMigrationOn && 'slot' in hostSlot
       ? createPoolLifecycle({
           paths: () => getAccountPaths(getConfigPath()),
-          slot: {
-            get: (request) => hostAuth.get(request),
-            set: (request) => hostAuth.set(request as never),
-            all: () => hostAuth.all(),
-          },
+          slot: hostSlot.slot,
           version: PackageVersion,
           ...poolMigrationDeps,
+          // While the vault serves this host its accounts, a login in the slot
+          // is not adopted (the request path refuses it instead).
+          runDeps: {
+            vaultServes: () => vault.serves(),
+            ...poolMigrationDeps.runDeps,
+          },
           // After a migration or an adoption run the pool may hold a row this
           // process has never polled (or the install just turned migrated).
           // Re-reading it now starts those first quota polls at once, so an
@@ -1458,7 +1584,16 @@ export async function CodexAuthPlugin(
             void poolAccountSource?.load()
             return outcome
           },
+          // Until the vault's first roster read has settled, `vaultServes` is
+          // false even on a host the vault serves, so an adoption waits for
+          // it. Only this background run waits, never the loader, and only
+          // for a bounded time: past it the run adopts nothing and ends
+          // retryable, so the lifecycle stays free and tries again later.
           adopt: async (deps) => {
+            if (
+              !(await settlesWithin(vaultReadyForAdoption, vaultRosterWaitMs))
+            )
+              return { status: 'retry', reason: 'vault-roster-pending' }
             const outcome = await (
               poolMigrationDeps.adopt ?? adoptHostSlotLogin
             )(deps)
@@ -1467,12 +1602,8 @@ export async function CodexAuthPlugin(
           },
         })
       : undefined
-  // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
-  // allowing the runtime path to open a second Claustrum connection.
-  const custodyBootstrap: CustodyBootstrap = {}
-  const custodyOptions = options.custody
-  const custodyLogger = createLogger('custody')
-  const custodyAuthorize = (
+  /** A test's OAuth flow, in the result shape OpenCode's auth hook expects. */
+  const authorizeWith = (
     start:
       | (() => Promise<{
           url: string
@@ -1508,98 +1639,6 @@ export async function CodexAuthPlugin(
         }
       : undefined
 
-  function createCustodyRuntime(
-    storage: AccountStorage | null,
-    auth?: CustodyHostAuth,
-  ): CustodyRuntime {
-    return __createCustodyRuntimeForTest({
-      storage,
-      configPath: getConfigPath(),
-      loadAccounts,
-      mutateAccounts,
-      withAccountStoreTransaction,
-      readCustodyManifest,
-      acquireRefreshFileLock,
-      auth,
-      ...(custodyOptions
-        ? {
-            detectClaustrumConnection: async () =>
-              custodyOptions.detection === 'absent'
-                ? { status: 'absent' as const, path: 'test' }
-                : {
-                    status: 'available' as const,
-                    schema: 1,
-                    wireVersion: 1,
-                    endpoints: [],
-                  },
-            cacheConnector: async () => custodyOptions.transport,
-          }
-        : {}),
-      logger: {
-        info: (msg, meta) =>
-          custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
-        warn: (msg, meta) =>
-          custodyLogger.warn(msg, meta ?? {}) as unknown as undefined,
-        debug: (msg, meta) =>
-          custodyLogger.debug(msg, meta ?? {}) as unknown as undefined,
-        error: (msg, meta) =>
-          custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
-      },
-      now: custodyOptions?.now,
-    })
-  }
-
-  const factoryStorage = await loadAccounts(getAccountPaths(getConfigPath()))
-  const factoryManifest = await readCustodyManifest()
-  const factoryAuth = input.client.auth as {
-    get?: (input: { path: { id: string } }) => Promise<unknown>
-    all?: () => Promise<Record<string, unknown>>
-    set: CustodyHostAuth['set']
-  }
-  if (factoryAuth.get && factoryAuth.all) {
-    if (claustrumMode(factoryStorage ?? {}) === 'claustrum') {
-      custodyRuntimeRef = createCustodyRuntime(factoryStorage, {
-        all: factoryAuth.all,
-        get: factoryAuth.get,
-        set: factoryAuth.set,
-      })
-      custodyOptions?.onRuntime?.(custodyRuntimeRef)
-      await custodyRuntimeRef.boot()
-    }
-    const factoryCache = custodyRuntimeRef?.getCache()
-    if (factoryCache) custodyBootstrap.cache = factoryCache
-    custodyBootstrap.mainVerdict = await reconcileMainSlotBeforeHooks({
-      client: { auth: factoryAuth },
-      mode: claustrumMode(factoryStorage ?? {}),
-      manifest: factoryManifest,
-      mainAccountId: factoryStorage?.mainAccountId,
-      getCredential: factoryCache
-        ? async (handle) => {
-            const credential = await factoryCache.get(
-              handle,
-              custodyMinTtlMs(factoryStorage),
-            )
-            return { access: credential.payload.access }
-          }
-        : undefined,
-      isReauth: factoryCache
-        ? (handle) => factoryCache.isReauth(handle)
-        : undefined,
-      now: Date.now,
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    })
-    if (custodyBootstrap.mainVerdict) {
-      const sidebar = await getSidebarState()
-      await setSidebarMachineState({
-        ...sidebar,
-        main: {
-          ...sidebar.main,
-          custody: projectCustodyForSidebar(custodyBootstrap.mainVerdict),
-        },
-      })
-    }
-  }
-
   // Per-loader poller: each plugin invocation owns its timer and callback, so
   // one loader disposing or re-starting never stops or overwrites another's
   // background refresh (a module-level singleton let the last loader win and
@@ -1616,86 +1655,63 @@ export async function CodexAuthPlugin(
     getAuth: async () => loaderGetAuth?.(),
     fetchImpl: fetch,
     dependencies: {
-      ...(custodyOptions?.authorize
+      ...(options.login?.authorize
         ? {
-            authorizeBrowser: custodyAuthorize(
-              custodyOptions.authorize.browser,
+            authorizeBrowser: authorizeWith(
+              options.login.authorize.browser,
               'Complete authorization in your browser. This window will close automatically.',
             ),
-            authorizeHeadless: custodyAuthorize(
-              custodyOptions.authorize.headless,
-            ),
+            authorizeHeadless: authorizeWith(options.login.authorize.headless),
           }
         : {}),
     },
+    vault,
     onMainSlotWritten: async () => {
       await poolLifecycle?.requestAdoption()
     },
   })
-  const wrapCustodyAuthorize =
+  /**
+   * After a successful login through these methods OpenCode writes the
+   * credential into its own slot. Once it is there, a migrated install moves
+   * it into the account pool; the write is watched for (for five seconds)
+   * rather than left for the next adoption tick.
+   */
+  const adoptAfterHostWrite =
     (
       authorize: (inputs?: Record<string, string>) => Promise<AuthOAuthResult>,
     ) =>
     async (inputs?: Record<string, string>): Promise<AuthOAuthResult> => {
-      const mutex = await acquireCustodyTransitionMutex()
-      try {
-        const flow = await authorize(inputs)
-        if (flow.method !== 'auto') {
-          await mutex.release()
-          return flow
-        }
-        return {
-          ...flow,
-          callback: async () => {
-            try {
-              const result = await flow.callback()
-              if (result.type !== 'success' || !('refresh' in result)) {
-                await mutex.release()
-                return result
-              }
-              void releaseCustodyLoginLeaseAfterHostWrite({
-                accessToken: result.access ?? '',
-                refreshToken: result.refresh,
-                getAuth: async () => {
-                  const auth = await hostAuth.get({ path: { id: 'openai' } })
-                  return isRecord(auth) &&
-                    typeof auth.access === 'string' &&
-                    typeof auth.refresh === 'string'
-                    ? { access: auth.access, refresh: auth.refresh }
-                    : undefined
-                },
-                onObserved: ({ access, refresh }) => {
-                  // The host has written this login into its slot; on a
-                  // migrated install it moves into the pool (not awaited).
-                  void poolLifecycle?.requestAdoption()
-                  return recordVerifiedInProcessMainLogin({
-                    type: 'oauth',
-                    access,
-                    refresh,
-                  })
-                },
-                release: () => mutex.release(),
-                warn: (message) =>
-                  custodyOptions?.warn?.(message) ??
-                  custodyLogger.warn(message),
-                now: custodyOptions?.now ?? Date.now,
-                sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
-              }).catch(() => mutex.release())
-              return result
-            } catch (error) {
-              await mutex.release()
-              throw error
-            }
-          },
-        }
-      } catch (error) {
-        await mutex.release()
-        throw error
+      const flow = await authorize(inputs)
+      if (flow.method !== 'auto') return flow
+      return {
+        ...flow,
+        callback: async () => {
+          const result = await flow.callback()
+          if (result.type === 'success' && 'refresh' in result)
+            void watchHostWrite(result.refresh)
+          return result
+        },
       }
     }
-  const custodyAuthMethods = authMethods.map((method) =>
+  async function watchHostWrite(refresh: string): Promise<void> {
+    if (!poolLifecycle || !('slot' in hostSlot)) return
+    const sleep = options.login?.sleep ?? ((ms: number) => Bun.sleep(ms))
+    for (let waited = 0; waited < 5_000; waited += 100) {
+      try {
+        const auth = await hostSlot.slot.get({ path: { id: 'openai' } })
+        if (isRecord(auth) && auth.refresh === refresh) {
+          await poolLifecycle.requestAdoption()
+          return
+        }
+      } catch {
+        // A failed read of the slot is tried again until the deadline.
+      }
+      await sleep(100)
+    }
+  }
+  const loginAuthMethods = authMethods.map((method) =>
     method.type === 'oauth'
-      ? { ...method, authorize: wrapCustodyAuthorize(method.authorize) }
+      ? { ...method, authorize: adoptAfterHostWrite(method.authorize) }
       : method,
   )
 
@@ -1724,11 +1740,11 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      vaultLease.release()
       poolLifecycle?.dispose()
       poolAccountSource?.dispose()
       backgroundQuotaRefresh.stop()
       sidebarBookkeeping?.stop()
-      custodyRuntimeRef?.dispose()
       activeFallbackManager?.stopBackgroundRefresh()
       activeFallbackManager = undefined
       for (const websocketFetch of websocketFetches) websocketFetch.close()
@@ -1773,11 +1789,13 @@ export async function CodexAuthPlugin(
       if (sidebarStateFileForEvents) {
         const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
           ?.accounts
+        // OpenCode discards event-hook promises. The writer already logs a
+        // failure; keep deletion cleanup running without rejecting the hook.
         await removeSidebarActiveRouting(
           info.id,
           accounts,
           sidebarStateFileForEvents,
-        )
+        ).catch(() => {})
       }
       for (const websocketFetch of websocketFetches)
         websocketFetch.remove(info.id)
@@ -1803,17 +1821,11 @@ export async function CodexAuthPlugin(
 
         return Object.fromEntries(
           Object.entries(provider.models)
-            .filter(([, model]) => {
-              if (model.options.reasoningMode === 'pro') return false
-              if (ALLOWED_MODELS.has(model.api.id)) return true
-              if (DISALLOWED_MODELS.has(model.api.id)) return false
-              // The minor is optional: a major-only id like gpt-6-astra carries
-              // no decimal, and requiring one silently dropped it from the
-              // catalogue even though the backend serves it.
-              const match = model.api.id.match(/^gpt-(\d+(?:\.\d+)?)/)
-              const version = match?.[1]
-              return version ? parseFloat(version) > 5.4 : false
-            })
+            .filter(
+              ([, model]) =>
+                model.options.reasoningMode !== 'pro' &&
+                codexOAuthModelListed(model.api.id),
+            )
             .map(([modelID, model]) => [
               modelID,
               {
@@ -1823,76 +1835,7 @@ export async function CodexAuthPlugin(
                   : (catalog?.[model.api.id] ??
                     catalog?.[modelID] ??
                     model.cost),
-                limit: model.id.includes('gpt-5.5')
-                  ? {
-                      context: 400_000,
-                      input: 272_000,
-                      output: 128_000,
-                    }
-                  : // gpt-6-astra pays no long-context surcharge on the Codex
-                    // backend, so it keeps the full window that backend reports.
-                    // Per OpenAI's enterprise rate card, read 2026-09-05 at
-                    // help.openai.com/en/articles/20001415 — section "GPT-6 Astra
-                    // — Codex long-context exception": "GPT-6 Astra usage in
-                    // Codex does not incur additional long-context multipliers
-                    // above 272K input tokens." The exemption is per-surface:
-                    // the same model billed through the platform API does pay it
-                    // (developers.openai.com/api/docs/models/gpt-6-astra).
-                    //
-                    // That makes this correct for the DEFAULT endpoint. A
-                    // `codexApiEndpoint` override pointed at a relay or a
-                    // differently-billed surface inherits this window without
-                    // inheriting the exemption, which is the operator's to
-                    // re-check.
-                    //
-                    // 872k is the Codex backend's own reported
-                    // max_context_window, from
-                    // GET /backend-api/codex/models?client_version=<v>. The
-                    // configured window follows that reported number rather than
-                    // the hard ceiling probing found just above it (876,934
-                    // input tokens accepted on 2026-09-04), since the reported
-                    // number is the one the backend maintains. Input and output
-                    // draw on one shared budget, so `input` is that window minus
-                    // the 128k output reserve.
-                    model.id.includes('gpt-6-astra')
-                    ? {
-                        context: 872_000,
-                        input: 744_000,
-                        output: 128_000,
-                      }
-                    : // The 5.6 family is NOT exempt — same rate card, same date:
-                      // above 272k input tokens it costs 2x input and 1.5x
-                      // output ON THE WHOLE REQUEST, so
-                      // `input` is held under that line at 244k and `context` is
-                      // that cap plus the 128k output reserve. This is a cost
-                      // decision, never a capability one — gpt-5.6-sol accepted
-                      // 861,550 input tokens when measured — so do not "correct"
-                      // these numbers upward to that ceiling without re-reading
-                      // the rate card first.
-                      //
-                      // gpt-6-sol and gpt-6-luna are NOT exempt either, even
-                      // though they share astra's 872k reported window. The rate
-                      // card, re-read 2026-09-25, names only GPT-6 Astra in its
-                      // Codex long-context exception; the surcharge row applies
-                      // to everything else. Checking the model family is the
-                      // wrong test - it is the rate card's named list.
-                      //
-                      // gpt-6.1-sol is held here too. Its published pricing,
-                      // read 2026-09-29 at developers.openai.com/api/docs/models/
-                      // gpt-6.1-sol, charges 2x input and 1.5x output on the full
-                      // request above 272K input tokens, and nothing names it in a
-                      // Codex exception. (The rate card itself could not be
-                      // fetched that day; re-check it before raising this.)
-                      model.id.includes('gpt-5.6') ||
-                        model.id.includes('gpt-6-sol') ||
-                        model.id.includes('gpt-6-luna') ||
-                        model.id.includes('gpt-6.1-sol')
-                      ? {
-                          context: 372_000,
-                          input: 244_000,
-                          output: 128_000,
-                        }
-                      : model.limit,
+                limit: codexOAuthModelLimit(model.id) ?? model.limit,
               },
             ]),
         )
@@ -1912,18 +1855,29 @@ export async function CodexAuthPlugin(
         // here, and it cannot throw.
         poolLifecycle?.start()
         const auth = await getAuth()
-        if (auth.type !== 'oauth') return {}
+        if (auth.type !== 'oauth') {
+          // No OAuth login, so this instance never starts the vault. Release
+          // its own login-adoption wait; the shared first read stays pending
+          // for the other projects that do use the vault.
+          vaultNotUsed.resolve()
+          return {}
+        }
 
-        const mainSlot = classifyMainAuthSlot(auth)
-        const recognizedMainTombstone =
-          mainSlot.kind === 'tombstone' || mainSlot.kind === 'empty'
+        // A tombstone the removed vault custody left in the slot is not a
+        // credential: nothing is seeded or derived from it.
+        const slotTombstoned = classifyMainAuthSlot(auth).kind === 'tombstone'
+        // The vault polls in the background whether or not this host is
+        // enrolled, so an enrollment finished in another process (`opencode
+        // auth login`) is picked up without a restart. Nothing here waits for
+        // its first roster read; `vaultFirstRoster` reports when it settles.
+        vaultLease.start()
         const rpcDir = input.directory
           ? await resolveRpcDir(input.directory)
           : undefined
         const cacheKeepKey = rpcDir?.dir ?? getConfigPath()
 
         // Migration: seed the multi-account store from the existing token (idempotent)
-        if (!recognizedMainTombstone) {
+        if (!slotTombstoned) {
           await migrateIfNeeded(
             {
               type: 'oauth',
@@ -1947,6 +1901,21 @@ export async function CodexAuthPlugin(
             { cause: err },
           )
         })
+
+        if (
+          await poolPlaceholderWithoutMain(
+            getAccountPaths(getConfigPath()),
+            auth,
+          )
+        ) {
+          if (poolLifecycle) poolLifecycle.noticePlaceholderWithoutMain()
+          else if (!missingPoolMainLogged) {
+            missingPoolMainLogged = true
+            createLogger('pool-migration').warn(POOL_LOGIN_REQUIRED_MESSAGE, {
+              reason: 'placeholder-without-main',
+            })
+          }
+        }
 
         let requestStorageCache:
           | {
@@ -2013,7 +1982,7 @@ export async function CodexAuthPlugin(
         // (migrateIfNeeded only sets it once on first run). The CLI add path
         // rejects against the persisted value — acceptable because the plugin
         // refreshes it here each time the auth loader runs.
-        if (storage && auth.access && !recognizedMainTombstone) {
+        if (storage && auth.access && !slotTombstoned) {
           const liveAccountId = extractAccountId({
             id_token: '',
             access_token: auth.access,
@@ -2125,6 +2094,9 @@ export async function CodexAuthPlugin(
             }
             return observationFromSnapshot(snapshot, checkedAt, true)
           },
+          vaultIdentities: () => vault.identities(),
+          vaultFirstRoster,
+          vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
         })
         poolAccountSource = poolSource
@@ -2138,157 +2110,22 @@ export async function CodexAuthPlugin(
               now: opts.now,
             }),
           quotaManager,
-          custody: { readManifest: readCustodyManifest },
           onFallbackStorageChanged: invalidateRequestStorageCache,
           // On a migrated install the roster rows are pool rows, which the
           // pool source refreshes; this background refresh must not.
           backgroundRefreshPaused: () => poolSource.active(),
         })
-        // -------------------------------------------------------------------
-        // Custody runtime — vendored client, cache, completion sweep, tick.
-        // Constructed unconditionally so the boot sweep can resolve before
-        // the background refresh is armed and so dispose() can close the
-        // cache + transport regardless of whether custody is enabled.
-        // -------------------------------------------------------------------
-        const custodyRuntime =
-          custodyRuntimeRef ?? createCustodyRuntime(storage)
-        if (!custodyRuntimeRef) {
-          custodyOptions?.onRuntime?.(custodyRuntime)
-          await custodyRuntime.boot()
-          custodyRuntimeRef = custodyRuntime
-        }
-        if (recognizedMainTombstone) {
-          const manifest = await readCustodyManifest()
-          const handle = lookupManifestHandle(manifest, 'main')
-          const cache = custodyRuntime.getCache()
-          if (handle && cache) {
-            try {
-              const credential = await cache.get(
-                handle,
-                custodyMinTtlMs(storage),
-              )
-              const servedMainAccountId = mainAccountIdFromServedCredential(
-                credential.payload.access,
-              )
-              if (
-                servedMainAccountId &&
-                servedMainAccountId !== storage?.mainAccountId
-              ) {
-                await writeLoaderSettings((current) => {
-                  current.mainAccountId = servedMainAccountId
-                })
-                if (storage) storage.mainAccountId = servedMainAccountId
-                custodyBootstrap.mainAccountId = servedMainAccountId
-                invalidateRequestStorageCache()
-              }
-            } catch {
-              // The factory verdict already records vault cold/reauth; the loader
-              // must preserve its inert state instead of turning it into a crash.
-            }
-          }
-        }
-        // The loader owns the detached first tick so direct runtime callers
-        // can observe boot completion without background work racing them.
-        void custodyRuntime.runTick().catch((error) =>
-          custodyLogger.warn('custody first tick failed', {
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        )
-        custodyRuntimeRef = custodyRuntime
         // Start background refresh only when fallback accounts are configured;
         // single-account paths must not create extra token refresh traffic.
-        // The boot order above guarantees the initial completion sweep has
-        // resolved — any `enrolling` account has been tombstoned before the
-        // background loop starts gating on `refreshInert`.
         if (storage && storage.accounts.length > 0) {
           fallbackManager.startBackgroundRefresh()
         }
 
-        // -------------------------------------------------------------------
-        // Custody deps for the four quota constructions (spec §6.6). One
-        // builder, used everywhere; omission at any one site fails closed
-        // via `custody-deps-incomplete` (the poller's own guard). Each
-        // closure captures `storage` and the live custodyRuntime so the
-        // resolver and reporter see fresh state per invocation.
-        // -------------------------------------------------------------------
-        const custodyRuntimeForDeps = custodyRuntime
-        async function isFallbackAccountRefreshInert(
-          account: OAuthAccount,
-          _currentStorage: AccountStorage,
-        ): Promise<boolean> {
-          const manifest = await readCustodyManifest()
-          return refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)
-        }
-        async function resolveAccountAccessForCustody(
-          account: OAuthAccount,
-          currentStorage: AccountStorage,
-        ): ReturnType<typeof resolveFallbackAccess> {
-          const manifest = await readCustodyManifest()
-          const cache = custodyRuntimeForDeps.getCache()
-          const handle = lookupManifestHandle(manifest, account.id)
-          if (!cache || !handle) {
-            return resolveFallbackAccess(account, currentStorage, manifest)
-          }
-          return resolveFallbackAccess(account, currentStorage, manifest, {
-            cache,
-            manifestHandle: handle,
-            requestPath: true,
-            now: custodyOptions?.now ?? Date.now,
-            refreshBeforeExpiryMs:
-              (currentStorage.refresh?.refreshBeforeExpiryMinutes ?? 240) *
-              60_000,
-            completeEnrollmentDeps: {
-              loadAccounts,
-              readCustodyManifest,
-              acquireRefreshFileLock,
-              configPath: getConfigPath(),
-              paths: getAccountPaths(getConfigPath()),
-              cache,
-              minTtlMs: custodyMinTtlMs(currentStorage),
-              mutateAccounts,
-              provider: CUSTODY_OWNING_PROVIDER,
-              now: Date.now,
-            },
-          })
-        }
-        async function resolveMainAccessForCustody(
-          currentStorage: Awaited<ReturnType<typeof loadAccounts>>,
-        ): ReturnType<typeof resolveFallbackAccess> {
-          if (claustrumMode(currentStorage) !== 'claustrum') {
-            return CUSTODY_EXCLUDED
-          }
-          const manifest = await readCustodyManifest()
-          const handle = lookupManifestHandle(manifest, 'main')
-          const cache = custodyRuntimeForDeps.getCache()
-          const refuse = (
-            reason: 'no-handle' | 'blocked' | 'reauth' | 'cache-miss',
-          ): typeof CUSTODY_REFUSE => {
-            custodyLogger.warn('custody main request refused', { reason })
-            return CUSTODY_REFUSE
-          }
-          if (!handle || !cache) return refuse('no-handle')
-          const now = (custodyOptions?.now ?? Date.now)()
-          if (cache.isBlocked(handle)) return refuse('blocked')
-          if (cache.isReauth(handle, now)) return refuse('reauth')
-          const served = await cache.peek(handle)
-          if (!served || served.expiresAtMs <= now) return refuse('cache-miss')
-          return {
-            token: served.payload.access,
-            provenance: { handle, recordVersion: served.recordVersion },
-          }
-        }
-        async function reportAuthFailureForCustody(params: {
-          handle: string
-          providerStatus: number
-          recordVersion: number
-        }): Promise<void> {
-          const cache = custodyRuntimeForDeps.getCache()
-          if (!cache) return
-          await cache.reportAuthFailure({
-            handle: params.handle,
-            providerStatus: params.providerStatus,
-            recordVersion: params.recordVersion,
-          })
+        // The bearer a legacy roster row sends with: its stored access token,
+        // or none for a row holding a tombstone (or no token at all).
+        function localAccountAccess(account: OAuthAccount): string | undefined {
+          if (isTombstoned(account)) return undefined
+          return account.access || undefined
         }
         function buildRefreshAllQuotaDeps(
           overrides: Partial<
@@ -2319,10 +2156,6 @@ export async function CodexAuthPlugin(
             storageMainAccountId: storage?.mainAccountId,
             isOAuthAccountFn: isOAuthAccount,
             whamFn: whamUsageFn,
-            isFallbackRefreshInert: isFallbackAccountRefreshInert,
-            resolveFallbackAccess: resolveAccountAccessForCustody,
-            resolveMainAccess: resolveMainAccessForCustody,
-            reportCustodyAuthFailure: reportAuthFailureForCustody,
             ...(respectBackoff === undefined ? {} : { respectBackoff }),
             ...(skipFresherThanMs === undefined ? {} : { skipFresherThanMs }),
           }
@@ -2460,8 +2293,9 @@ export async function CodexAuthPlugin(
         }
 
         // The refresh token in a slot value, or a throw when the value must not
-        // be refreshed: the pool placeholder (main lives in the pool row), a
-        // custody tombstone, or a slot with no refresh token.
+        // be refreshed: the pool placeholder or the old custody tombstone (main
+        // lives in the pool row), any other tombstone, or a slot with no
+        // refresh token.
         function refreshableMainToken(auth: {
           type: string
           access?: string
@@ -2470,21 +2304,7 @@ export async function CodexAuthPlugin(
         }): string {
           if (isPoolMainPlaceholder(auth)) throw new MainAccountInPoolError()
           if (auth.type !== 'oauth') throw new Error('not oauth')
-          if (
-            tombstoned(
-              {
-                id: 'main',
-                type: 'oauth',
-                access: auth.access ?? '',
-                refresh: auth.refresh ?? '',
-                expires: auth.expires ?? 0,
-                addedAt: 0,
-              },
-              CUSTODY_OWNING_PROVIDER,
-            )
-          ) {
-            throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
-          }
+          if (isTombstoned(auth)) throw new TombstoneRefreshError()
           if (!auth.refresh) {
             throw new Error('Token refresh failed: missing refresh token')
           }
@@ -2586,6 +2406,18 @@ export async function CodexAuthPlugin(
                 await fileLock.release().catch(() => {})
                 throw error
               }
+
+              // A pending-transfer record left by a migration run that never
+              // finished would keep this refresh standing down for good; once
+              // it has expired, and dropping it cannot leave a second
+              // refresher of this token, it goes and the refresh proceeds.
+              await reclaimExpiredPoolTransfer(
+                getAccountPaths(getConfigPath()),
+                current.refresh,
+                current.access !== undefined
+                  ? { slotAccess: current.access }
+                  : {},
+              ).catch(() => false)
 
               const refreshTokenHash = hashRefreshToken(current.refresh)
               const leaseId = crypto.randomUUID()
@@ -2696,12 +2528,10 @@ export async function CodexAuthPlugin(
           return resolvePoolMainAccess({
             storage: currentStorage,
             now: Date.now,
-            isRefreshInert: isFallbackAccountRefreshInert,
             refreshAccount: (account, accountStorage) =>
               fallbackManager.refreshAccount(account, accountStorage, {
                 asPoolMain: true,
               }),
-            resolveAccess: resolveAccountAccessForCustody,
             warn: (message, meta) =>
               logR.warn(message, { pid: process.pid, ...meta }),
           })
@@ -2745,6 +2575,7 @@ export async function CodexAuthPlugin(
         cacheKeepManagers.get(cacheKeepKey)?.stop()
         const cacheKeepManager = createCacheKeepManager({
           fetchImpl: fetch,
+          vault,
           getMainToken: async () => {
             // A migrated install's main account is the pool row `main`; the
             // slot is never read for it.
@@ -2787,34 +2618,12 @@ export async function CodexAuthPlugin(
               version: 1 as const,
               accounts: [account],
             }
-            let resolved = account
-            if (
-              !(await isFallbackAccountRefreshInert(account, currentStorage))
-            ) {
-              resolved = await fallbackManager.refreshAccount(
-                account,
-                currentStorage,
-              )
-            }
-            const access = await resolveAccountAccessForCustody(
-              resolved,
-              currentStorage,
-            )
-            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
-              throw new Error(`no access token for ${accountId}`)
-            return {
-              token: access.token,
-              onAuthFailure:
-                access.provenance === 'local'
-                  ? undefined
-                  : async (status: number) => {
-                      await reportAuthFailureForCustody({
-                        handle: access.provenance.handle,
-                        providerStatus: status,
-                        recordVersion: access.provenance.recordVersion,
-                      })
-                    },
-            }
+            const resolved = isTombstoned(account)
+              ? account
+              : await fallbackManager.refreshAccount(account, currentStorage)
+            const token = localAccountAccess(resolved)
+            if (!token) throw new Error(`no access token for ${accountId}`)
+            return { token }
           },
           codexResponsesUrl: codexApiEndpoint,
           // The account the session routes to now: a session moved to another
@@ -2985,9 +2794,12 @@ export async function CodexAuthPlugin(
           explicitResetAt?: number,
         ): number {
           const quota =
-            accountKey === 'main'
+            windowsFromQuotaMap(
+              vault.routes().find((route) => route.id === accountKey)?.quota,
+            ) ??
+            (accountKey === 'main'
               ? quotaManager.peekMainForPolicy()?.quota
-              : quotaManager.peekFallbackForPolicy(accountKey)?.quota
+              : quotaManager.peekFallbackForPolicy(accountKey)?.quota)
           return resolveMidStreamRateLimitResetAt(
             quota,
             window,
@@ -2997,6 +2809,23 @@ export async function CodexAuthPlugin(
           )
         }
 
+        // Quota and rate-limit frames for a vault account arrive on the
+        // WebSocket while the response body streams, after the fetch call has
+        // returned. So each vault send gets a unique key, passed to the
+        // WebSocket pool in its quota-account header and mapped here to the
+        // vault account and its quota receipt (which credential and account
+        // the vault served this send with, so a quota reading is recorded
+        // against the right one) until the body finishes or is cancelled. Two
+        // sends at once, even on the same account, therefore never share a
+        // receipt. The pool
+        // removes the header before the request goes out, and still reuses
+        // sockets by ChatGPT account, not by this key.
+        const vaultStreams = new Map<
+          string,
+          { id: string; receipt: QuotaReceipt }
+        >()
+        const vaultMarks = new Map<string, number>()
+
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
@@ -3005,6 +2834,13 @@ export async function CodexAuthPlugin(
               // pool and threaded here so the frame is attributed to the
               // connection's own account, not the shared mutable globals.
               onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
+                const served = accountId
+                  ? vaultStreams.get(accountId)
+                  : undefined
+                if (served) {
+                  void vault.recordSnapshot(served.id, s, true, served.receipt)
+                  return
+                }
                 const isMainBucket = !accountId || accountId === 'main'
                 pushQuota(
                   s,
@@ -3028,14 +2864,22 @@ export async function CodexAuthPlugin(
                     { pid: process.pid, window },
                   )
                 }
-                const accountKey = accountId ?? 'main'
+                const served = accountId
+                  ? vaultStreams.get(accountId)
+                  : undefined
+                const accountKey = served?.id ?? accountId ?? 'main'
                 const resetAt = midStreamRateLimitResetAt(
                   accountKey,
                   window,
                   explicitResetAt,
                 )
                 quotaManager.markRateLimited(accountKey, resetAt)
-                poolSource.markRateLimited(accountKey, resetAt)
+                if (served) {
+                  vaultMarks.set(
+                    accountKey,
+                    Math.max(vaultMarks.get(accountKey) ?? 0, resetAt),
+                  )
+                } else poolSource.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
                   accountId: accountKey,
@@ -3093,19 +2937,9 @@ export async function CodexAuthPlugin(
               store,
               Date.now(),
               mainAccountIdentity,
-              runtimeCustodyProjection,
             ),
             boundSidebarFile,
           )
-        }
-        // Closure-resolved once per loader; the runtime owns the cached
-        // projection map, the writer reads it sync.
-        function runtimeCustodyProjection(
-          account: FallbackAccount,
-          currentNow: number,
-        ): SidebarAccountCustody | undefined {
-          if (!isOAuthAccount(account)) return undefined
-          return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 
         // -------------------------------------------------------------------
@@ -3209,82 +3043,6 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
-        const defaultWithFallbackAccountLock = async <T>(
-          accountId: string,
-          action: () => Promise<T>,
-        ): Promise<T> => {
-          // A refresh of the row may hold the lock for a moment; wait for it
-          // as long as a store write would before giving up.
-          const deadline = Date.now() + POOL_LOCK_DEFAULTS.timeoutMs
-          let lock: Awaited<ReturnType<typeof acquireRefreshFileLock>> = null
-          for (;;) {
-            lock = await acquireRefreshFileLock({
-              name: fallbackRefreshLockName(accountId),
-              ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-              path: getConfigPath(),
-              renew: true,
-            })
-            if (lock || Date.now() >= deadline) break
-            await new Promise((resolve) => setTimeout(resolve, 50))
-          }
-          if (!lock) throw new Error('Fallback account lock unavailable')
-          try {
-            return await action()
-          } finally {
-            await lock.release()
-          }
-        }
-        const withFallbackAccountLock =
-          custodyOptions?.withFallbackAccountLock ??
-          defaultWithFallbackAccountLock
-        const checkUsableCustodyBinding = async (account: OAuthAccount) => {
-          const manifest = await readCustodyManifest()
-          if (!manifest.ok) {
-            return {
-              ready: false as const,
-              reason: 'manifest-unreadable' as const,
-            }
-          }
-          const handle = lookupManifestHandle(manifest, account.id)
-          if (!handle)
-            return { ready: false as const, reason: 'no-handle' as const }
-          const cache = custodyRuntime.getCache()
-          if (!cache) {
-            return { ready: false as const, reason: 'vault-cold' as const }
-          }
-          if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
-            return { ready: false as const, reason: 'vault-reauth' as const }
-          }
-          if (cache.isBlocked(handle)) {
-            return { ready: false as const, reason: 'vault-cold' as const }
-          }
-          try {
-            const credential = await cache.get(handle, custodyMinTtlMs(storage))
-            const accountId = mainAccountIdFromServedCredential(
-              credential.payload.access,
-            )
-            if (
-              !accountId ||
-              (account.accountId && account.accountId !== accountId)
-            ) {
-              return {
-                ready: false as const,
-                reason: 'identity-mismatch' as const,
-              }
-            }
-            return { ready: true as const, accountId }
-          } catch {
-            return {
-              ready: false as const,
-              reason: cache.isReauth(
-                handle,
-                custodyOptions?.now?.() ?? Date.now(),
-              )
-                ? ('vault-reauth' as const)
-                : ('vault-cold' as const),
-            }
-          }
-        }
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
         const menuPaths = getAccountPaths(getConfigPath())
@@ -3295,8 +3053,6 @@ export async function CodexAuthPlugin(
           quotaManager,
           loadAccounts,
           beginAccountLogin,
-          withFallbackAccountLock,
-          checkUsableCustodyBinding,
           // The files this loader run serves, fixed now: the menu works on
           // them even if another project's run changes the environment.
           store: () => openAccountPool(menuPaths),
@@ -3327,127 +3083,7 @@ export async function CodexAuthPlugin(
           // Re-read the pool after a change, so requests route across the
           // changed rows at once and a newly added row gets its first poll.
           afterWrite: () => poolSource.load(),
-          enterClaustrumMode: async () => {
-            const current = await loadAccounts(getAccountPaths(getConfigPath()))
-            const accountIds = (current?.accounts ?? [])
-              .filter(
-                (account): account is OAuthAccount =>
-                  account.type === 'oauth' && account.enabled !== false,
-              )
-              .map((account) => account.id)
-            return enterClaustrumMode({
-              accountIds,
-              acquireLock: ({ name, renew }) =>
-                acquireRefreshFileLock({
-                  name,
-                  ttlMs:
-                    name === MAIN_REFRESH_LOCK_NAME
-                      ? MAIN_REFRESH_LOCK_TTL_MS
-                      : FALLBACK_REFRESH_LOCK_TTL_MS,
-                  path: getConfigPath(),
-                  renew,
-                }),
-              withStoreTransaction: (action) =>
-                withAccountStoreTransaction(
-                  action,
-                  getAccountPaths(getConfigPath()),
-                ),
-              readManifest: readCustodyManifest,
-              preflight: async ({ accountId, handle }) => {
-                custodyLogger.info('preflight probing participant', {
-                  accountId,
-                  hasHandle: handle.length > 0,
-                })
-                const cache = await custodyRuntime.ensureCache()
-                const blocked = cache?.isBlocked(handle)
-                if (!cache || blocked) {
-                  custodyLogger.warn('preflight vault-cold', {
-                    accountId,
-                    hasCache: cache !== undefined,
-                    blocked,
-                  })
-                  return 'vault-cold'
-                }
-                if (
-                  cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
-                ) {
-                  return 'vault-reauth'
-                }
-                try {
-                  const credential = await cache.get(
-                    handle,
-                    custodyMinTtlMs(current),
-                  )
-                  const servedAccountId = mainAccountIdFromServedCredential(
-                    credential.payload.access,
-                  )
-                  if (
-                    !servedAccountId ||
-                    (accountId && accountId !== servedAccountId)
-                  ) {
-                    return 'identity-mismatch'
-                  }
-                  return 'ready'
-                } catch {
-                  return cache.isReauth(
-                    handle,
-                    custodyOptions?.now?.() ?? Date.now(),
-                  )
-                    ? 'vault-reauth'
-                    : 'vault-cold'
-                }
-              },
-              auth: {
-                all: async () => {
-                  if (typeof hostAuth.all === 'function') return hostAuth.all()
-                  const dataHome =
-                    process.env.XDG_DATA_HOME ??
-                    join(os.homedir(), '.local', 'share')
-                  const authPath = join(dataHome, 'opencode', 'auth.json')
-                  try {
-                    const parsed: unknown = JSON.parse(
-                      readFileSync(authPath, 'utf8'),
-                    )
-                    return isRecord(parsed) ? parsed : {}
-                  } catch {
-                    return {}
-                  }
-                },
-                get: async (value) => {
-                  if (typeof hostAuth.get === 'function') {
-                    return hostAuth.get(value)
-                  }
-                  if (value.path.id !== 'openai' || !loaderGetAuth) {
-                    custodyLogger.warn('auth.get unavailable for slot', {
-                      id: value.path.id,
-                      hasLoaderGetAuth: loaderGetAuth !== undefined,
-                    })
-                    return undefined
-                  }
-                  return loaderGetAuth()
-                },
-                set: async (value) => {
-                  await hostAuth.set(value)
-                },
-              },
-              warn: (message) => custodyLogger.warn(message),
-            })
-          },
-          leaveClaustrumMode: () =>
-            leaveClaustrumMode({
-              acquireLock: ({ name, renew }) =>
-                acquireRefreshFileLock({
-                  name,
-                  ttlMs: MAIN_REFRESH_LOCK_TTL_MS,
-                  path: getConfigPath(),
-                  renew,
-                }),
-              withStoreTransaction: (action) =>
-                withAccountStoreTransaction(
-                  action,
-                  getAccountPaths(getConfigPath()),
-                ),
-            }),
+          vault,
           resolveResetTarget: createResetTargetResolver({
             getAuth,
             refreshMainWithLease,
@@ -3466,9 +3102,6 @@ export async function CodexAuthPlugin(
             accountStoragePath: getConfigPath(),
             accountStatePath: getAccountStatePath(getConfigPath()),
             now: Date.now,
-            isFallbackRefreshInert: isFallbackAccountRefreshInert,
-            resolveFallbackAccess: resolveAccountAccessForCustody,
-            reportAuthFailure: reportAuthFailureForCustody,
           }),
           ...buildResetRedemptionDeps(),
           cacheKeepManager,
@@ -3509,12 +3142,25 @@ export async function CodexAuthPlugin(
             await writeMachineSidebarState(quotaManager, store)
           },
           // On a migrated install every row is polled through the pool
-          // source, the same path its background poll takes.
+          // source, the same path its background poll takes, and every vault
+          // account through the vault.
           refreshAllQuota: async () => {
             if (await poolSource.active()) {
-              const results = await pollPoolRows()
+              const [results, vaultResults] = await Promise.all([
+                pollPoolRows(),
+                vault.pollStale(0),
+              ])
               await writeMachineSidebarState(quotaManager, lastRequestStorage)
-              return results
+              return [
+                ...results,
+                ...vaultResults.map((result) => ({
+                  account: result.id,
+                  ok: result.ok,
+                  ...(result.error !== undefined
+                    ? { error: result.error }
+                    : {}),
+                })),
+              ]
             }
             return refreshAllQuota(buildRefreshAllQuotaDeps())
           },
@@ -3576,45 +3222,20 @@ export async function CodexAuthPlugin(
         // sendWithAccessToken — the one primitive that both main and fallback
         // sends call.  Wraps the existing Codex transform + send.
         // -------------------------------------------------------------------
-        const responseVaultProvenance = new WeakMap<Response, VaultProvenance>()
-
-        function observeVaultAuthFailure(response: Response, url: URL): void {
-          const provenance = responseVaultProvenance.get(response)
-          if (
-            !provenance ||
-            url.hostname !== 'chatgpt.com' ||
-            !url.pathname.startsWith('/backend-api/codex/')
-          ) {
-            return
-          }
-          if (response.status >= 200 && response.status < 300) {
-            custodyRuntimeForDeps
-              .getCache()
-              ?.markVaultSuccess(provenance.handle)
-            return
-          }
-          if (response.status !== 401) return
-          void reportAuthFailureForCustody({
-            handle: provenance.handle,
-            providerStatus: response.status,
-            recordVersion: provenance.recordVersion,
-          }).catch(() => {})
-        }
-
         async function sendWithAccessToken(
           requestInput: RequestInfo | URL,
           init: RequestInit | undefined,
           accessToken: string,
           accountId?: string,
           keepwarmAccountKey: string = 'main',
-          provenance?: VaultProvenance | 'local',
+          vaultReceipt?: QuotaReceipt,
         ): Promise<Response> {
           // Nothing may leave here without a credential. An empty token is
           // always a local defect, but on the wire it becomes `Bearer ` and
           // comes back as a provider 401 - indistinguishable from an expired
           // or revoked account, so whoever debugs it starts at the provider
-          // and not at the bug. That cost a day when a tombstoned main
-          // resolved its vault credential and then dropped it. Refusing here
+          // and not at the bug. That cost a day when a main account served
+          // from the vault resolved its credential and then dropped it. Refusing here
           // makes the whole class say where it came from, once, for every
           // path that reaches the wire.
           //
@@ -3626,7 +3247,6 @@ export async function CodexAuthPlugin(
             logT.warn('refusing to send a request with no access token', {
               account: keepwarmAccountKey,
               accountId,
-              hasProvenance: Boolean(provenance && provenance !== 'local'),
             })
             throw new Error(EMPTY_BEARER_MESSAGE)
           }
@@ -3670,16 +3290,6 @@ export async function CodexAuthPlugin(
             parsed.pathname.includes('/chat/completions')
               ? new URL(codexApiEndpoint)
               : parsed
-          const stamp = (response: Response) => {
-            const stamped = stampVaultProvenance(
-              response,
-              provenance,
-              responseVaultProvenance,
-            )
-            observeVaultAuthFailure(stamped, url)
-            return stamped
-          }
-
           const prepared = prepareCodexRequest({
             init: {
               ...init,
@@ -3733,12 +3343,59 @@ export async function CodexAuthPlugin(
                 },
               })
             }
-            return stamp(await websocketFetch(url, requestInit))
+            if (!vaultReceipt) return websocketFetch(url, requestInit)
+            const key = `vault-stream:${randomUUID()}`
+            vaultStreams.set(key, {
+              id: keepwarmAccountKey,
+              receipt: vaultReceipt,
+            })
+            const scopedHeaders = new Headers(requestInit?.headers)
+            scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
+            const release = () => vaultStreams.delete(key)
+            try {
+              const response = await websocketFetch(url, {
+                ...requestInit,
+                headers: scopedHeaders,
+              })
+              if (!response.body) {
+                release()
+                return response
+              }
+              const reader = response.body.getReader()
+              return new Response(
+                new ReadableStream<Uint8Array>({
+                  async pull(controller) {
+                    try {
+                      const chunk = await reader.read()
+                      if (chunk.done) {
+                        release()
+                        controller.close()
+                      } else controller.enqueue(chunk.value)
+                    } catch (error) {
+                      release()
+                      controller.error(error)
+                    }
+                  },
+                  cancel(reason) {
+                    release()
+                    return reader.cancel(reason)
+                  },
+                }),
+                {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers,
+                },
+              )
+            } catch (error) {
+              release()
+              throw error
+            }
           }
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
           if (typeof finalInit?.body !== 'string') {
-            return stamp(await fetch(url, finalInit))
+            return fetch(url, finalInit)
           }
 
           // Keepwarm capture: track every request body for idle
@@ -3775,7 +3432,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return stamp(response)
+            return response
           } catch (error) {
             await dumpCodexRequest({
               sessionID,
@@ -4040,7 +3697,6 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         type FallbackCandidate = {
           access: string
-          provenance: VaultProvenance | 'local'
           accountId?: string
           keepwarmAccountKey: string
           quotaAccountId: string
@@ -4060,7 +3716,6 @@ export async function CodexAuthPlugin(
           accountId: string
           wireAccountId?: string
           access: string
-          provenance?: VaultProvenance | 'local'
           keepwarmAccountKey: string
           fallback?: FallbackAccount
           quota: AccountQuota | null | undefined
@@ -4096,8 +3751,7 @@ export async function CodexAuthPlugin(
           sidebarState: SidebarState
           primaryAccess: string
           mainAccountIdentity?: string
-          mainCustodyRefused: boolean
-          primaryProvenance?: VaultProvenance
+          mainUnavailable: boolean
         }): Promise<StickyRouteCandidate[]> {
           const killswitchEnabled = isKillswitchEnabled(input.storage)
           const killswitchNow = Date.now()
@@ -4123,14 +3777,13 @@ export async function CodexAuthPlugin(
                 killswitchNow,
               )
             : undefined
-          const roster: StickyRouteCandidate[] = input.mainCustodyRefused
+          const roster: StickyRouteCandidate[] = input.mainUnavailable
             ? []
             : [
                 {
                   accountId: 'main',
                   wireAccountId: input.mainAccountIdentity,
                   access: input.primaryAccess,
-                  provenance: input.primaryProvenance,
                   keepwarmAccountKey: 'main',
                   quota: mainFreshest.quota,
                   quotaCheckedAt: mainFreshest.quotaCheckedAt,
@@ -4148,12 +3801,8 @@ export async function CodexAuthPlugin(
             await fallbackManager.getUsableFallbackAccounts(input.storage)
           if (!input.storage) return roster
           for (const fallback of usableFallbacks) {
-            const access = await resolveAccountAccessForCustody(
-              fallback,
-              input.storage,
-            )
-            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
-              continue
+            const access = localAccountAccess(fallback)
+            if (!access) continue
             const fileEntry = input.sidebarState.fallbacks.find(
               (account) => account.id === fallback.id,
             )
@@ -4179,8 +3828,7 @@ export async function CodexAuthPlugin(
             roster.push({
               accountId: fallback.id,
               wireAccountId: fallback.accountId,
-              access: access.token,
-              provenance: access.provenance,
+              access,
               keepwarmAccountKey: fallback.id,
               fallback,
               quota: freshest.quota,
@@ -4442,15 +4090,10 @@ export async function CodexAuthPlugin(
           if (!fallbackStorage)
             return { current: [], retained: [], skipped: [] }
           for (const fb of usableFallbacks) {
-            const access = await resolveAccountAccessForCustody(
-              fb,
-              fallbackStorage,
-            )
-            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
-              continue
+            const access = localAccountAccess(fb)
+            if (!access) continue
             candidates.push({
-              access: access.token,
-              provenance: access.provenance,
+              access,
               accountId: fb.accountId,
               keepwarmAccountKey: fb.id,
               quotaAccountId: fb.id,
@@ -4576,7 +4219,6 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
-                candidate.provenance,
               )
             } catch (error) {
               // A caller abort and an indeterminate transport failure both
@@ -4655,7 +4297,6 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
-                candidate.provenance,
               )
             } catch (error) {
               if (
@@ -4723,7 +4364,7 @@ export async function CodexAuthPlugin(
           // above already polls every pool row, and the legacy seed would
           // refresh and poll the same rows a second way.
           if (!(await poolSource.active())) {
-            void refreshAllQuota(
+            bootQuotaSeedPromise = refreshAllQuota(
               buildRefreshAllQuotaDeps({ respectBackoff: true }),
             ).catch((error) =>
               logQ.warn('boot quota seed failed', {
@@ -4731,6 +4372,8 @@ export async function CodexAuthPlugin(
                 error: errorMessage(error),
               }),
             )
+          } else {
+            bootQuotaSeedPromise = Promise.resolve()
           }
         }
 
@@ -4802,37 +4445,80 @@ export async function CodexAuthPlugin(
           const mainRow = poolSource
             .peek()
             .rows.find((row) => row.id === 'main')
+          const slot = !mainRow ? await getAuth() : undefined
+          const missingTombstoneMain =
+            !mainRow && slot?.type === 'oauth' && isTombstoned(slot)
+          const loginRequired =
+            !mainRow &&
+            (await poolPlaceholderWithoutMain(
+              getAccountPaths(getConfigPath()),
+              slot,
+            ))
           if (generation === mainIdentityGeneration) {
             currentMainIdentity = mainRow?.identity
           }
           const sidebarSnapshot = await sidebarCache.get()
           const { response, servedId } = await servePoolRequest({
             source: poolSource,
+            ...(vault.enrolled()
+              ? {
+                  vault: {
+                    routes: () => vault.routes(),
+                    identities: () => vault.identities(),
+                    send: (id, dispatch) =>
+                      vault.send(id, dispatch, {
+                        site: 'model',
+                        ...(init?.signal ? { signal: init.signal } : {}),
+                      }),
+                    requestReading: (id) => vault.requestReading(id),
+                    rateLimitMarks: () => {
+                      for (const [id, until] of vaultMarks) {
+                        if (until <= Date.now()) vaultMarks.delete(id)
+                      }
+                      return vaultMarks
+                    },
+                  },
+                }
+              : {}),
             storage: reqStorage,
             mode,
             sessionId,
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,
-            send: (row, token) =>
+            send: (target, token, attempt) =>
               sendWithAccessToken(
                 requestInput,
                 init,
                 token,
-                row.identity,
-                row.id,
+                target.identity,
+                target.id,
+                attempt,
               ),
-            recordQuota: (served, row, token) => {
+            recordQuota: (served, target, token, attempt) => {
               try {
+                const snapshot = normalizeQuotaHeaders(
+                  served.headers,
+                ) as Record<string, unknown>
+                const complete = isCompleteQuotaHeaderFrame(served.headers)
+                // A vault account's quota lives in the vault roster, and is
+                // kept only with the receipt the response was served under.
+                if (!target.row) {
+                  if (attempt)
+                    void vault.recordSnapshot(
+                      target.id,
+                      snapshot,
+                      complete,
+                      attempt,
+                    )
+                  return
+                }
                 pushQuota(
-                  normalizeQuotaHeaders(served.headers) as Record<
-                    string,
-                    unknown
-                  >,
+                  snapshot,
                   token,
-                  row.id === 'main' ? undefined : row.id,
-                  row.id === 'main' ? row.identity : undefined,
-                  isCompleteQuotaHeaderFrame(served.headers),
+                  target.id === 'main' ? undefined : target.id,
+                  target.id === 'main' ? target.identity : undefined,
+                  complete,
                 )
               } catch {
                 // Quota push is advisory; preserve the provider response.
@@ -4840,15 +4526,33 @@ export async function CodexAuthPlugin(
             },
             placePin: (placement) =>
               placeStickyPin({ ...placement, sidebarSnapshot }),
-            blocked: (block, quotas) =>
-              block.reason === 'no-credential'
-                ? new Response(null, { status: 401 })
-                : killswitchBlockedResponse(
-                    reqStorage,
-                    block.reason,
-                    block.resetAtMs,
-                    quotas,
-                  ),
+            blocked: (block, quotas, cause) => {
+              if (block.reason === 'no-credential') {
+                // Routing has already tried every row that could serve, so
+                // a missing main must not prevent a healthy fallback send.
+                if (loginRequired && cause !== 'vault-refused')
+                  throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
+                return new Response(
+                  LOCAL_CREDENTIAL_REFUSALS[
+                    cause === 'vault-refused'
+                      ? cause
+                      : missingTombstoneMain
+                        ? 'missing-main'
+                        : (cause ?? 'unusable')
+                  ],
+                  {
+                    status: 401,
+                    headers: { 'content-type': 'text/plain; charset=utf-8' },
+                  },
+                )
+              }
+              return killswitchBlockedResponse(
+                reqStorage,
+                block.reason,
+                block.resetAtMs,
+                quotas,
+              )
+            },
             resetCredits: (id) =>
               resetCreditsApplicable(
                 id === 'main'
@@ -4877,6 +4581,7 @@ export async function CodexAuthPlugin(
         // Fetch override that selects the active account, refreshes if
         // needed, sends the transformed Codex request, and records quota.
         // -------------------------------------------------------------------
+        codexFetchInstalled = true
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
@@ -4896,16 +4601,20 @@ export async function CodexAuthPlugin(
               expires?: number
             } = await getAuth()
             const myGeneration = ++mainIdentityGeneration
-            if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+            if (currentAuth.type !== 'oauth') {
+              requestHeaders.delete(OPENAI_AGENT_HEADER)
+              return fetch(requestInput, { ...init, headers: requestHeaders })
+            }
             init = await materializeRequestInit(requestInput, init)
-            // A migrated install whose slot holds the pool placeholder is
-            // served from the account pool. A real login in the slot (not yet
-            // adopted) and a custody install keep the path below.
-            if (
-              isPoolMainPlaceholder(currentAuth) &&
-              claustrumMode(reqStorage) !== 'claustrum' &&
-              (await poolSource.current()).active
-            ) {
+            // A migrated install whose slot holds the pool placeholder (or the
+            // tombstone the removed vault custody left, which says the same:
+            // main lives elsewhere) is served from the account pool and the
+            // vault. A real login in the slot of a migrated install keeps the
+            // path below while it is adopted into the pool, unless the vault
+            // serves this host its accounts: then it is refused, since
+            // serving either would silently pick one of two accounts.
+            const migrated = (await poolSource.current()).active
+            if (isPoolMainPlaceholder(currentAuth) && migrated) {
               return servePooled(
                 requestInput,
                 init,
@@ -4915,15 +4624,12 @@ export async function CodexAuthPlugin(
                 myGeneration,
               )
             }
-            const mainCustodyOwned =
-              recognizedMainTombstone &&
-              claustrumMode(reqStorage) === 'claustrum'
+            if (migrated) vault.assertHostSlot(currentAuth)
             let primaryAccess = ''
-            let primaryProvenance: VaultProvenance | undefined
-            // True when main has no credential to send: custody refused it, or
-            // main lives in the account pool and its row has no usable token.
-            // Main is then skipped and the fallbacks serve.
-            let mainCustodyRefused = false
+            // True when main has no credential to send: the slot holds a
+            // tombstone, or main lives in the account pool and its row has no
+            // usable token. Main is then skipped and the fallbacks serve.
+            let mainUnavailable = false
             // Set when the slot holds the account-pool placeholder, so main is
             // the pool row `main` (and that row is not also a fallback).
             let pooledMain: PoolMainAccess | undefined
@@ -4943,13 +4649,9 @@ export async function CodexAuthPlugin(
               pooledMain = await resolvePooledMain(storage)
               if (pooledMain) {
                 primaryAccess = pooledMain.token
-                primaryProvenance =
-                  pooledMain.provenance === 'local'
-                    ? undefined
-                    : pooledMain.provenance
               } else {
                 primaryAccess = ''
-                mainCustodyRefused = true
+                mainUnavailable = true
                 logA.warn('main account in the pool has no usable token', {
                   pid: process.pid,
                 })
@@ -4958,15 +4660,10 @@ export async function CodexAuthPlugin(
 
             if (mainInPool) {
               await usePooledMain()
-            } else if (mainCustodyOwned) {
-              const access = await resolveMainAccessForCustody(reqStorage)
-              if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
-                mainCustodyRefused = true
-              } else {
-                primaryAccess = access.token
-                primaryProvenance =
-                  access.provenance === 'local' ? undefined : access.provenance
-              }
+            } else if (isTombstoned(currentAuth)) {
+              // A tombstone that is not the canonical one the pool path
+              // recognises: still never a credential.
+              mainUnavailable = true
             } else {
               // Refresh expired main tokens and mirror them into opencode's slot.
               if (
@@ -5046,8 +4743,7 @@ export async function CodexAuthPlugin(
                 sidebarState,
                 primaryAccess,
                 mainAccountIdentity,
-                mainCustodyRefused,
-                primaryProvenance,
+                mainUnavailable,
               })
               let stickyCandidate = resolveStickyRouteCandidate({
                 sessionId: sidebarSessionId,
@@ -5096,7 +4792,6 @@ export async function CodexAuthPlugin(
                   stickyCandidate.access,
                   stickyCandidate.wireAccountId,
                   stickyCandidate.keepwarmAccountKey,
-                  stickyCandidate.provenance,
                 )
 
                 const pushStickyQuota = (
@@ -5160,7 +4855,6 @@ export async function CodexAuthPlugin(
                       replacement.access,
                       replacement.wireAccountId,
                       replacement.keepwarmAccountKey,
-                      replacement.provenance,
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement
@@ -5309,7 +5003,7 @@ export async function CodexAuthPlugin(
                 )
               } else {
                 // Send through the main account.
-                response = mainCustodyRefused
+                response = mainUnavailable
                   ? new Response(null, { status: 401 })
                   : await sendWithAccessToken(
                       requestInput,
@@ -5317,7 +5011,6 @@ export async function CodexAuthPlugin(
                       primaryAccess,
                       mainAccountIdentity,
                       'main',
-                      primaryProvenance,
                     )
               }
             }
@@ -5370,6 +5063,20 @@ export async function CodexAuthPlugin(
               }
             }
 
+            // A transfer may have filled main while this request waited for
+            // its refresh lock. The original snapshot can still lack the row,
+            // so a token resolved from the newer snapshot counts as available.
+            if (
+              mainInPool &&
+              mainUnavailable &&
+              !fallbackServed &&
+              (await poolPlaceholderWithoutMain(
+                getAccountPaths(getConfigPath()),
+                await getAuth(),
+              ))
+            )
+              throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
+
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
@@ -5405,7 +5112,7 @@ export async function CodexAuthPlugin(
           },
         }
       },
-      methods: custodyAuthMethods,
+      methods: loginAuthMethods,
     },
     'chat.headers': async (input, output) => {
       if (input.model.providerID !== 'openai') return
@@ -5413,6 +5120,9 @@ export async function CodexAuthPlugin(
       output.headers['User-Agent'] =
         `${buildUserAgent(PackageVersion)} (${os.platform()} ${os.release()}; ${os.arch()})`
       output.headers['session-id'] = input.sessionID
+      // Only our Codex fetch removes the agent header; API-key requests use the
+      // host's fetch instead and must never receive this internal header.
+      if (codexFetchInstalled) output.headers[OPENAI_AGENT_HEADER] = input.agent
       // Temporary fetch-layer hack: title generation currently shares the conversation
       // session ID, so the OpenAI plugin marks it for HTTP fallback until transport
       // context can be passed directly instead of smuggled through headers.

@@ -3,7 +3,8 @@
  * cache, diagnostics and the provider extras, built on the shared command
  * menu (`@cortexkit/common-auth/commands`). Both hosts build their menu with
  * `createOpenAiMenu`; each supplies what only it has (OpenCode its cache
- * keep-warm manager, dumps and Claustrum mode, Pi its own login and pool).
+ * keep-warm manager and dumps, Pi its own login and pool; both their
+ * connection to the Claustrum vault).
  *
  * The menu works on the account pool, so it needs a migrated install. Until
  * then `/openai` shows only why (`migrationNoticeMenu`).
@@ -17,6 +18,7 @@ import {
   type CommandApplyRequest,
   type CommandApplyResult,
   type CommandDialogPayload,
+  CommandError,
   type CommandInvocation,
   type CommandMenu,
   type CommandMenuModel,
@@ -33,7 +35,6 @@ import type {
 } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
-  type ClaustrumMode,
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
   type mutateAccounts as defaultMutateAccounts,
@@ -58,6 +59,15 @@ import {
   selectCreditToSpend,
 } from './reset-credits'
 import { isRecord } from './util/record.ts'
+import {
+  type OpenAiVault,
+  type VaultWaitOptions,
+  vaultApprovalInstructions,
+  vaultConnectOutcome,
+  vaultEnrollmentLine,
+} from './vault'
+import type { MenuVault } from './vault-account-menu'
+import { createVaultCommandMenu, menuStore } from './vault-command-menu'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -67,6 +77,16 @@ export const OPENAI_MENU_TITLE = 'OpenAI accounts'
 
 /** The row the main account lives in once the install is migrated. */
 const MAIN_ROW_ID = 'main'
+
+/**
+ * Why a login of the main account's ChatGPT account is not added as a row:
+ * row `main` already holds that account (it is the host's own sign-in), so a
+ * second row would be the same account twice. Thrown
+ * as a `CommandError` so the menu shows it: the menu shows only a generic
+ * line for any other thrown error.
+ */
+const MAIN_ACCOUNT_REFUSAL =
+  'that account is already your main account, so it was not added again'
 
 const log = createLogger('commands')
 
@@ -126,9 +146,12 @@ const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
  * the older reader applied to it: its own thresholds when it had an entry,
  * else the `main` thresholds, and the default for a window neither names.
  * The main account (judged against `main`) becomes row `main`. Accounts the
- * older reader covered implicitly are written explicitly, because in the new
- * vocabulary an account without an entry has no floor. The same quota
- * therefore blocks the same requests before and after.
+ * older reader covered implicitly are written explicitly, and the floors it
+ * gave an account without an entry (the `main` thresholds) become the
+ * block's `defaults`, which the new reader applies to every account without
+ * an entry. A row added after this rewrite, or while it runs (the roster is
+ * read before the settings lock), is therefore judged as it was before. The
+ * same quota blocks the same requests before and after.
  */
 export function killswitchInFloors(
   block: Record<string, unknown>,
@@ -151,9 +174,13 @@ export function killswitchInFloors(
     )
     accounts[id] = { primary: floors.primary, secondary: floors.secondary }
   }
+  // With no account named, the older reader returns what it gave every
+  // account without an entry of its own.
+  const fallback = getKillswitchThresholdsForAccount(legacy, undefined)
   const next: Settings = { ...block }
   delete next.main
   next.accounts = accounts
+  next.defaults = { primary: fallback.primary, secondary: fallback.secondary }
   next.schema = KILLSWITCH_FLOORS_SCHEMA
   return next
 }
@@ -161,7 +188,8 @@ export function killswitchInFloors(
 /**
  * A killswitch block created in the shared vocabulary, marked as such, with
  * the default floors (`DEFAULT_KILLSWITCH_THRESHOLDS`) written for row
- * `main` and every row in `rosterIds` the block does not name. Floors the
+ * `main` and every row in `rosterIds` the block does not name, and as the
+ * block's `defaults` for any row added later. Floors (and defaults) the
  * block already holds are kept as they are.
  */
 export function killswitchWithDefaultFloors(
@@ -178,7 +206,13 @@ export function killswitchWithDefaultFloors(
       secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
     }
   }
-  return { ...block, accounts, schema: KILLSWITCH_FLOORS_SCHEMA }
+  const defaults = isRecord(block.defaults)
+    ? block.defaults
+    : {
+        primary: DEFAULT_KILLSWITCH_THRESHOLDS.primary,
+        secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
+      }
+  return { ...block, accounts, defaults, schema: KILLSWITCH_FLOORS_SCHEMA }
 }
 
 /**
@@ -228,7 +262,8 @@ async function rosterIdsOf(store: PoolStore): Promise<string[]> {
  * Every other member is the store's own.
  *
  * The roster is read just before the locked write; a row added in between
- * gets no killswitch floors from the migration.
+ * gets no entry of its own from the migration, and is judged by the block's
+ * `defaults` instead.
  */
 export function withSettingsMigration(store: PoolStore): PoolStore {
   const readSettings: PoolStore['readSettings'] = async () => {
@@ -277,14 +312,6 @@ export interface AccountRules {
    * re-login becomes).
    */
   rowLocks?(id: string): readonly PoolLockSpec[]
-  /**
-   * Wraps enabling row `id`. `enable` does the store write with the given
-   * locks (the row's locks when none are given). The default enables at once.
-   */
-  enableRow?(
-    id: string,
-    enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
-  ): Promise<{ id: string }>
 }
 
 /**
@@ -322,9 +349,7 @@ export function withAccountRules(
       ? oauth.find((row) => row.identity === input.identity)
       : undefined
     if (sameAccount?.id === MAIN_ROW_ID)
-      throw new Error(
-        'that account is already your main account, so it was not added again',
-      )
+      throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
     const existing =
       sameAccount ??
       oauth.find((row) => row.id === input.id && row.id !== MAIN_ROW_ID)
@@ -343,16 +368,8 @@ export function withAccountRules(
       credential: replaced.credential,
     }
   }
-  const enable: PoolStore['enable'] = (id, options) => {
-    const run = (extraLocks?: readonly PoolLockSpec[]) =>
-      store.enable(id, {
-        ...(options ?? {}),
-        ...((extraLocks ?? locksFor(id, options?.extraLocks))
-          ? { extraLocks: extraLocks ?? locksFor(id, options?.extraLocks) }
-          : {}),
-      })
-    return rules.enableRow ? rules.enableRow(id, run) : run()
-  }
+  const enable: PoolStore['enable'] = (id, options) =>
+    store.enable(id, withLocks(id, options))
   const members: Partial<Record<keyof PoolStore, unknown>> = {
     add,
     replace,
@@ -555,8 +572,6 @@ export interface MenuLoginFlow {
 export interface MenuLoginDeps {
   /** Starts a browser login, or a device-code login when `headless`. */
   begin(options: { label?: string; headless: boolean }): Promise<MenuLoginFlow>
-  /** Why no account can be added now (Claustrum mode); undefined allows it. */
-  refusal?(): Promise<string | undefined>
   /** The main account's ChatGPT identity; a login of that account is refused. */
   mainIdentity?(): Promise<string | undefined>
 }
@@ -592,8 +607,6 @@ export function menuLogin(
       },
     ],
     run: async (values) => {
-      const refusal = await deps.refusal?.()
-      if (refusal) return { status: 'cancelled', message: refusal }
       const label =
         typeof values.label === 'string' && values.label.trim().length > 0
           ? values.label.trim()
@@ -611,9 +624,7 @@ export function menuLogin(
         if (account.accountId && main && account.accountId === main) {
           // The internal id only: the ChatGPT identity is sensitive.
           log.warn('account add rejected (main identity)', { id: account.id })
-          throw new Error(
-            'that account is already your main account, so it was not added again',
-          )
+          throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
         }
         log.info('account added', { id: account.id })
         return loginAddInput(account)
@@ -670,72 +681,149 @@ export function sessionSection(deps: SessionSectionDeps): PluginExtraSection {
   }
 }
 
-export interface ClaustrumSectionDeps {
-  mode(): Promise<ClaustrumMode>
-  enter?(): Promise<{
-    status: 'completed' | 'incomplete' | 'aborted'
-    outcomes: Record<string, string>
-    reason?: string
-  }>
-  leave?(): Promise<void>
+export interface VaultSectionDeps {
+  vault: Pick<
+    OpenAiVault,
+    | 'name'
+    | 'status'
+    | 'connectStep'
+    | 'waitForApproval'
+    | 'disconnect'
+    | 'decline'
+    | 'accept'
+    | 'routes'
+    | 'snapshot'
+  >
+  /** Runs after the vault accounts this host may route change (connected, disconnected, one disabled or enabled). */
+  changed?(): unknown
+  /** How Connect polls for the operator's approval (tests shorten it). */
+  wait?: VaultWaitOptions
 }
 
-/** Claustrum mode: accounts served from the vault, and back to local. */
-export function claustrumSection(
-  deps: ClaustrumSectionDeps,
-): PluginExtraSection {
+/**
+ * The Claustrum vault: whether this host is connected, the OpenAI accounts
+ * the vault serves it, Connect (enrollment, approved by the operator with
+ * `ck`), Disconnect (forget this host's token), and enabling or disabling
+ * each vault account here (a disabled one is declined: it stays listed and
+ * never routes).
+ */
+export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
+  const { vault } = deps
   return {
-    id: 'claustrum',
-    title: 'Claustrum',
+    id: 'vault',
+    title: 'Vault',
     build: async () => {
-      const mode = await deps.mode()
-      const unavailable =
-        'The custody runtime is not ready. Try again after OpenAI auth finishes initializing.'
+      const status = await vault.status()
+      const connected = status.enrollment.state === 'approved'
+      const routing = vault.routes().length
       return {
-        lines: [`Mode: ${mode}.`],
-        actions:
-          mode === 'local'
+        lines: [
+          vaultEnrollmentLine(status.host, status.name, status.enrollment),
+          ...vaultApprovalInstructions(status.name, status.enrollment),
+          ...(connected
             ? [
-                {
-                  id: 'enter',
-                  label: 'Enter Claustrum mode',
-                  description:
-                    'Do not run a login in another OpenCode window during the transition.',
-                  run: async () => {
-                    if (!deps.enter) return { ok: false, text: unavailable }
-                    const result = await deps.enter()
-                    log.info('claustrum transition finished', {
-                      status: result.status,
-                      reason: result.reason,
-                      outcomes: result.outcomes,
-                    })
-                    const rows = Object.entries(result.outcomes).map(
-                      ([id, outcome]) => `${id}: ${outcome}`,
-                    )
-                    return {
-                      ok: result.status === 'completed',
-                      text: [
-                        `Claustrum ${result.status}.`,
-                        ...(rows.length > 0
-                          ? rows
-                          : ['No enabled OAuth accounts.']),
-                        ...(result.reason ? [`Reason: ${result.reason}`] : []),
-                      ].join('\n'),
-                    }
-                  },
-                },
+                status.accounts.length === 0
+                  ? 'The vault serves no OpenAI account to this host yet.'
+                  : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
-            : [
-                {
-                  id: 'leave',
-                  label: 'Return to local mode',
+            : []),
+          // A list with records this host could not read removes nothing:
+          // an account it did not list is kept as it was.
+          ...(connected && vault.snapshot()?.complete === false
+            ? [
+                "The vault's last list had records this host could not read; accounts it did not list are kept as they were until a complete list arrives.",
+              ]
+            : []),
+          ...(status.lastError ? [`Last error: ${status.lastError}`] : []),
+        ],
+        items: status.accounts.map((row) => ({
+          id: row.routeId,
+          label: row.label,
+          detail: [
+            row.credentialType === 'api_key' ? 'API key' : 'login',
+            row.state === 'active' ? 'active' : `vault state ${row.state}`,
+            row.enabled ? 'enabled' : 'disabled here',
+          ].join(', '),
+          actions: [
+            row.enabled
+              ? {
+                  id: 'disable',
+                  label: 'Disable on this host',
+                  description:
+                    'It stays in the vault and in this list, and is never sent from this host until enabled again.',
                   run: async () => {
-                    if (!deps.leave) return { ok: false, text: unavailable }
-                    await deps.leave()
-                    return 'Claustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.'
+                    await vault.decline(row.routeId)
+                    await deps.changed?.()
+                    return `${row.label} is disabled on this host.`
+                  },
+                }
+              : {
+                  id: 'enable',
+                  label: 'Enable on this host',
+                  run: async () => {
+                    await vault.accept(row.routeId)
+                    await deps.changed?.()
+                    return `${row.label} is enabled on this host.`
                   },
                 },
-              ],
+          ],
+        })),
+        actions: connected
+          ? [
+              {
+                id: 'disconnect',
+                label: 'Disconnect',
+                description:
+                  "Forgets this host's vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.",
+                confirm:
+                  'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
+                run: async () => {
+                  await vault.disconnect()
+                  await deps.changed?.()
+                  return `Disconnected: ${vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${vault.name}\` to revoke it in the vault too.`
+                },
+              },
+            ]
+          : [
+              {
+                id: 'connect',
+                label: 'Connect',
+                description:
+                  'Asks the vault to enroll this host; you approve the request with `ck`.',
+                run: async ({ invocation }) => {
+                  const step = await vault.connectStep()
+                  if (step.state !== 'pending' && step.state !== 'busy') {
+                    await deps.changed?.()
+                    return vaultConnectOutcome(vault, step)
+                  }
+                  // The approval happens outside this menu; keep polling for
+                  // it and report the outcome to the session that asked.
+                  void vault
+                    .waitForApproval(deps.wait)
+                    .then(async (final) => {
+                      await deps.changed?.()
+                      const outcome = vaultConnectOutcome(vault, final)
+                      invocation.notify(
+                        outcome.text,
+                        outcome.ok ? 'info' : 'warning',
+                      )
+                    })
+                    .catch((error: unknown) => {
+                      invocation.notify(
+                        `Connecting to the vault failed: ${error instanceof Error ? error.message : String(error)}`,
+                        'error',
+                      )
+                    })
+                  return {
+                    ok: true,
+                    text: [
+                      ...vaultApprovalInstructions(vault.name, step),
+                      'Waiting for the approval; you are told here when it lands.',
+                    ].join('\n'),
+                  }
+                },
+              },
+            ],
       }
     },
   }
@@ -783,6 +871,8 @@ async function spendResetCredit(
     // and the attempt is a new spend, refuses. So with one saved, or for a
     // retry, nothing is previewed: the request goes to the account's current identity and
     // the coordinator decides from the saved state, even after a restart.
+    // The coordinator also refuses to send a pair minted under another
+    // ChatGPT account than this current one.
     const saved = (
       await deps.loadAccounts({
         configPath: deps.configPath,
@@ -909,6 +999,12 @@ export function resetCreditsSection(
 
 export interface OpenAiMenuOptions {
   store: PoolStore
+  vault?: MenuVault
+  /**
+   * Set when the host's `quotaCheck` already polls the vault accounts, so the
+   * menu's quota check does not poll them a second time.
+   */
+  quotaCheckIncludesVault?: boolean
   /**
    * The legacy locks the menu's writes that name no single row take (the
    * roster order, settings, a new account).
@@ -916,8 +1012,6 @@ export interface OpenAiMenuOptions {
   extraLocks?: readonly PoolLockSpec[]
   /** The legacy locks a write of one row takes; see `AccountRules`. */
   rowLocks?: AccountRules['rowLocks']
-  /** Wraps enabling a row (OpenCode's Claustrum binding check). */
-  enableRow?: AccountRules['enableRow']
   /** Whether the install is migrated; absent means it always is (Pi). */
   migration?(): Promise<MenuMigrationState>
   login?: MenuLoginDeps
@@ -953,14 +1047,15 @@ export const FLOOR_LABELS = ['primary', 'secondary'] as const
  * the notice and `apply` changes nothing.
  */
 export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
-  const menu = createCommandMenu({
+  const menuOptions = {
     command: OPENAI_COMMAND_NAME,
     title: OPENAI_MENU_TITLE,
-    store: withSettingsMigration(
-      withAccountRules(options.store, {
-        ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
-        ...(options.enableRow ? { enableRow: options.enableRow } : {}),
-      }),
+    store: menuStore(
+      withSettingsMigration(
+        withAccountRules(options.store, {
+          ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
+        }),
+      ),
     ),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     accounts: {
@@ -978,7 +1073,14 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     ...(options.extras ? { extras: options.extras } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.now ? { now: options.now } : {}),
-  })
+  }
+  const menu = options.vault
+    ? createVaultCommandMenu(
+        menuOptions,
+        options.vault,
+        options.quotaCheckIncludesVault,
+      )
+    : createCommandMenu(menuOptions)
   // A copy of the caller's context taken before the first await, as the
   // shared menu does: work left running reports through this copy even if
   // the host rebinds its context object for another session meanwhile.
@@ -1229,6 +1331,8 @@ function resetErrorPayload(
     const messages: Record<string, string> = {
       identity_mismatch:
         'The account identity changed before redemption. Reopen the reset account list.',
+      pair_identity_mismatch:
+        'Nothing was sent: the saved redemption was started while this account was signed in as a different ChatGPT account. Sign this account back in as that ChatGPT account and retry, or wait until five minutes after the saved redemption started and spend a new credit.',
       invalid_account_key:
         'The selected account key is reserved. Reopen the reset account list.',
       cooldown_active:
@@ -1369,10 +1473,13 @@ export async function renderResetCoordinatorResult(
     )
   }
   if (code === 'ambiguous' || code === 'http_error') {
+    const refused = result.refused
+      ? ' The server refused the request; five minutes after the redemption started, "Spend a reset credit" starts a new one instead.'
+      : ''
     return resetResultPayload(
       accountKey,
       code,
-      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with "Retry the last redemption" on this account. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with "Retry the last redemption" on this account. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.${refused}`,
       {
         retryGuidance: result.retrySafety,
         chatgptAccountId: boundChatgptAccountId,
