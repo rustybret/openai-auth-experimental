@@ -1324,14 +1324,14 @@ test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\squota\slists\sthe\ssame\saccounts\sand\sdates\sstale\sreadings\sin\sboth\ssections$']
+expect_red = ['^vault\scommand\smenu\squota\slists\sthe\ssame\saccounts\sand\sdates\sstale\sreadings\sin\sQuota$']
 
 [[control]]
 id = "menu-quota-age"
 guards = "a reading older than fifteen minutes cannot appear as current"
-file = "packages/core/src/vault-account-menu.ts"
-old = "  if (age <= 15 * 60_000) return undefined"
-new = "  if (true) return undefined // NON-VACUITY BREAK"
+file = "packages/core/src/vault-command-menu.ts"
+old = "    const now = (options.now ?? Date.now)()"
+new = "    const now = 0 // NON-VACUITY BREAK: stale readings appear current."
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1354,8 +1354,8 @@ expect_red = ['^vault\scommand\smenu\sunlabelled\srows\suse\stheir\sids\seven\sw
 id = "menu-vault-quota-poll"
 guards = "quota checks of vault accounts go through vault.pollQuota rather than local credentials"
 file = "packages/core/src/vault-command-menu.ts"
-old = "                    const result = await vault.pollQuota(id)"
-new = "                    const result = { ok: true } // NON-VACUITY BREAK"
+old = "          const result = await vault.pollQuota(routeId)"
+new = "          const result = { ok: true } // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1426,8 +1426,8 @@ expect_red = ['^vault\scommand\smenu\sin\svault\smode\sno\slocal\srow\sis\sliste
 id = "menu-vault-mode-no-local-quota-check"
 guards = "Check now in vault mode polls the vault accounts only and never runs the host's local quota check"
 file = "packages/core/src/vault-command-menu.ts"
-old = "                  const selected = String(values.account)\n"
-new = "                  const selected = String(values.account)\n                  await options.quota?.check?.([], { notify() {} }) // NON-VACUITY BREAK\n"
+old = "        const current = await readVaultMenu(vault)\n"
+new = "        const current = await readVaultMenu(vault)\n        await options.quota?.check?.([], { notify() {} }) // NON-VACUITY BREAK\n"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1438,7 +1438,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "the shared menu requires the published common-auth replacement-slot release"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.11.8"'
+old = '"@cortexkit/common-auth": "^0.13.0"'
 new = '"@cortexkit/common-auth": "^0.11.4"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1760,3 +1760,253 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\sin\\svault\\smode\\sleaves\\sa\\sslot\\slogin\\swhere\\sit\\sis,\\sunused\\sand\\snot\\sadopted,\\sthe\\slocal\\sfiles\\sbyte-identical,\\sand\\sroutes\\sthe\\svault\\sonly$"]
+
+# OpenCode renders only actionable options; quota wording comes from the shared formatter.
+[[control]]
+id = "dialog-no-inert-options"
+guards = "action-less items are header text and never selectable options"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "item.actions.length > 0"
+new = "item.actions.length >= 0 /* NON-VACUITY BREAK: offer inert items. */"
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sno\sdialog\soption\sis\san\sinert\stext\srow$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-group-category"
+guards = "group headers and section summaries are categories, not options"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "...(item.group ? { category: item.group } : {}),"
+new = "// NON-VACUITY BREAK: omit item group headers."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sgroup\sheaders\smap\sto\scategory\sabove\sactionable\srows$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-status-footer"
+guards = "item status is drawn as the option footer"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "...(item.status ? { footer: item.status } : {}),"
+new = "// NON-VACUITY BREAK: omit item status."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sitem\sstatus\smaps\sto\sfooter$']
+expect_message = "Expected path:"
+
+[[control]]
+id = "dialog-shared-quota"
+guards = "vault quota rows use shared compact status and full detail, and check only their own account"
+file = "packages/core/src/vault-command-menu.ts"
+old = "projectQuota(row.quota, options.quota?.scope)"
+new = "projectQuota(undefined, options.quota?.scope) /* NON-VACUITY BREAK: discard the account reading. */"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sdialog\squota\stext\smatches\sthe\sshared\sformatter\sand\seach\srow\schecks\sonly\sits\saccount$']
+expect_message = "expect(received).toBe(expected)"
+
+[[control]]
+id = "sidebar-shared-quota"
+guards = "sidebar row and collapsed figures match shared compact percent-left text"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "usedPercent: window.usedPercent,"
+new = "usedPercent: 100 - window.usedPercent, // NON-VACUITY BREAK: reverse usage and quota left."
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
+expect_message = "expect(received).toBe(expected)"
+
+[[control]]
+id = "pi-per-account-quota"
+guards = "selecting one pool account checks only that account, not Pi login or another row"
+file = "packages/pi/src/commands.ts"
+old = "if (ids.length === 1) {"
+new = "if (false) { // NON-VACUITY BREAK: poll every account for a single-row action."
+test_file = "packages/pi/src/tests/pool-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\s/openai\son\sthe\saccount\spool\sa\sper-account\squota\scheck\spolls\sonly\sthe\schosen\spool\srow$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-item-context-not-options"
+guards = "an item's facts and detail are context rather than selectable text rows"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "  return [\n    ...item.actions.map((action) => ({"
+new = "  return [\n    ...factLines(item.facts).map((title) => ({ title, value: 'line:fact' })), // NON-VACUITY BREAK: offer read-only facts.\n    ...item.actions.map((action) => ({"
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sno\sdialog\soption\sis\san\sinert\stext\srow$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "sidebar-window-formatter"
+guards = "expanded sidebar rows format each window's own reading, just like the dialog footer"
+file = "packages/opencode/src/tui.tsx"
+old = "limits: projection.limits.filter((limit) => limit.label === row.key),"
+new = "limits: projection.limits.filter((limit) => limit.label !== row.key), // NON-VACUITY BREAK: format the other window."
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
+expect_message = "expect(received).toEqual(expected)"
+
+# Vault-only activation must not need an OAuth login or replace a host login.
+
+[[control]]
+id = "vault-login-oc1-offer"
+guards = "an unenrolled OpenCode 1 host is not offered vault activation"
+file = "packages/opencode/src/auth/methods.ts"
+old = "...(vault?.enrolled()"
+new = "...(vault /* NON-VACUITY BREAK: offer activation without enrollment */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\snot\senrolled\shides\sthe\smethod\sand\srefuses\sa\spreviously\soffered\scallback$']
+expect_message = "Received: true"
+
+[[control]]
+id = "vault-login-oc1-authority"
+guards = "OpenCode 1 rechecks authority before returning a placeholder"
+file = "packages/opencode/src/auth/methods.ts"
+old = "(await enrollmentAuthority(vault.paths, vault.name)) !==\n                  'vault'"
+new = "false /* NON-VACUITY BREAK: bypass activation authority */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\snot\senrolled\shides\sthe\smethod\sand\srefuses\sa\spreviously\soffered\scallback$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-unreadable-enrollment"
+guards = "unreadable enrollment is not mistaken for vault authority on OpenCode 1"
+file = "packages/opencode/src/auth/methods.ts"
+old = "(await enrollmentAuthority(vault.paths, vault.name)) !==\n                  'vault'"
+new = "(await enrollmentAuthority(vault.paths, vault.name)) === 'local' /* NON-VACUITY BREAK */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sunreadable\senrollment\srefuses\sactivation\swithout\stouching\sfiles$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-existing-slot"
+guards = "even an invalid openai record prevents OpenCode 1 activation"
+file = "packages/opencode/src/auth/methods.ts"
+old = "Object.hasOwn(map, 'openai')"
+new = "false /* NON-VACUITY BREAK: ignore an existing host record */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\sinvalid\srecord\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-malformed-file"
+guards = "malformed auth JSON is refused rather than treated as an empty slot"
+file = "packages/opencode/src/auth/methods.ts"
+old = "if ((error as NodeJS.ErrnoException).code !== 'ENOENT')"
+new = "if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== 'ENOENT') // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\smalformed\sJSON\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-non-object-file"
+guards = "a JSON array cannot authorize an empty OpenCode 1 slot"
+file = "packages/opencode/src/auth/methods.ts"
+old = "Array.isArray(map) ||"
+new = "false /* NON-VACUITY BREAK: accept arrays */ ||"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\snon-object\sJSON\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-unreadable-file"
+guards = "an auth path that cannot be read is refused on OpenCode 1"
+file = "packages/opencode/src/auth/methods.ts"
+old = "if ((error as NodeJS.ErrnoException).code !== 'ENOENT')"
+new = "if ((error as NodeJS.ErrnoException).code !== 'EISDIR') // NON-VACUITY BREAK: ignore a failed disk read"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sunreadable\sauth\sfile\srefuses\swithout\stouching\spool\sfiles$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-placeholder"
+guards = "OpenCode 1 activation uses the exact migration placeholder"
+file = "packages/opencode/src/auth/methods.ts"
+old = "return { ...POOL_PLACEHOLDER, type: 'success' }"
+new = "return { ...POOL_PLACEHOLDER, type: 'success', refresh: 'wrong-placeholder' } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\senrolled\sempty\sslot\sreturns\sonly\sthe\splaceholder\swithout\stouching\spool\sfiles$']
+expect_message = "wrong-placeholder"
+
+[[control]]
+id = "vault-login-oc2-authority"
+guards = "OpenCode 2 activation refuses an unenrolled host before any placeholder is issued"
+file = "packages/opencode/src/v2/login.ts"
+old = "if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')"
+new = "if (false) // NON-VACUITY BREAK: bypass activation authority"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\svault\sactivation\snot\senrolled\sactivation\srefuses\swith\sfixed\scredential-free\stext$']
+expect_message = "VAULT_ACTIVATION_REFUSAL"
+
+[[control]]
+id = "vault-login-oc2-unreadable-enrollment"
+guards = "unreadable enrollment is not mistaken for vault authority on OpenCode 2"
+file = "packages/opencode/src/v2/login.ts"
+old = "if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')"
+new = "if ((await enrollmentAuthority(vault.paths, vault.name)) === 'local') // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\svault\sactivation\sunreadable\senrollment\sactivation\srefuses\swith\sfixed\scredential-free\stext$']
+expect_message = "VAULT_ACTIVATION_REFUSAL"
+
+[[control]]
+id = "vault-login-oc2-registration"
+guards = "OpenCode 2 setup registers vault activation independently of pool OAuth logins"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    vault: vaultLoginMethod(vault),\n"
+new = "    // NON-VACUITY BREAK: omit the vault activation method\n"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sactivation\sis\sregistered\sand\sreturns\sonly\sthe\shost\splaceholder\swithout\sa\spool\swrite$']
+expect_message = "missing vault activation method"
