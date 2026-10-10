@@ -61,6 +61,7 @@ import {
   shouldFallbackStatus,
   type TokenResponse,
   TombstoneRefreshError,
+  vaultModeNoRouteCause,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -102,6 +103,7 @@ import {
   PoolAccountSource,
   settlesWithin,
   VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+  VAULT_FIRST_ROSTER_WAIT_MS,
 } from './core/pool-account-source'
 import {
   migratedPoolRows,
@@ -133,13 +135,17 @@ import {
 } from './core/pool-migration'
 import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
+  isVaultModeRefusal,
   LOCAL_CREDENTIAL_REFUSALS,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
 } from './core/pool-request'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from './core/pool-routing'
-import { buildPoolSidebarMachineState } from './core/pool-sidebar'
+import {
+  buildPoolSidebarMachineState,
+  buildVaultSidebarMachineState,
+} from './core/pool-sidebar'
 import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
@@ -1566,12 +1572,16 @@ export async function CodexAuthPlugin(
           slot: hostSlot.slot,
           version: PackageVersion,
           ...poolMigrationDeps,
-          // While the vault serves this host its accounts, a login in the slot
-          // is not adopted (the request path refuses it instead).
+          // Each run is told whether the vault serves this host its accounts
+          // (`PoolMigrationDeps.vaultServes`).
           runDeps: {
             vaultServes: () => vault.serves(),
             ...poolMigrationDeps.runDeps,
           },
+          // In vault mode neither the migration nor an adoption runs: a login
+          // in the slot stays there, unused, and the local files stay as they
+          // are until the host disconnects.
+          paused: () => vault.enrolled(),
           // After a migration or an adoption run the pool may hold a row this
           // process has never polled (or the install just turned migrated).
           // Re-reading it now starts those first quota polls at once, so an
@@ -1876,8 +1886,13 @@ export async function CodexAuthPlugin(
           : undefined
         const cacheKeepKey = rpcDir?.dir ?? getConfigPath()
 
+        // In vault mode (this host enrolled with the Claustrum vault) no local
+        // account file is written, so the two loader-time writes below wait
+        // until the host disconnects.
+        const loaderVaultMode = vault.enrolled()
+
         // Migration: seed the multi-account store from the existing token (idempotent)
-        if (!slotTombstoned) {
+        if (!slotTombstoned && !loaderVaultMode) {
           await migrateIfNeeded(
             {
               type: 'oauth',
@@ -1982,7 +1997,7 @@ export async function CodexAuthPlugin(
         // (migrateIfNeeded only sets it once on first run). The CLI add path
         // rejects against the persisted value — acceptable because the plugin
         // refreshes it here each time the auth loader runs.
-        if (storage && auth.access && !slotTombstoned) {
+        if (storage && auth.access && !slotTombstoned && !loaderVaultMode) {
           const liveAccountId = extractAccountId({
             id_token: '',
             access_token: auth.access,
@@ -2095,6 +2110,8 @@ export async function CodexAuthPlugin(
             return observationFromSnapshot(snapshot, checkedAt, true)
           },
           vaultIdentities: () => vault.identities(),
+          // In vault mode no pool row is refreshed, polled or sent with.
+          vaultMode: () => vault.enrolled(),
           vaultFirstRoster,
           vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
@@ -2112,8 +2129,10 @@ export async function CodexAuthPlugin(
           quotaManager,
           onFallbackStorageChanged: invalidateRequestStorageCache,
           // On a migrated install the roster rows are pool rows, which the
-          // pool source refreshes; this background refresh must not.
-          backgroundRefreshPaused: () => poolSource.active(),
+          // pool source refreshes; this background refresh must not. In vault
+          // mode no local account is refreshed at all.
+          backgroundRefreshPaused: async () =>
+            vault.enrolled() || (await poolSource.active()),
         })
         // Start background refresh only when fallback accounts are configured;
         // single-account paths must not create extra token refresh traffic.
@@ -2825,6 +2844,14 @@ export async function CodexAuthPlugin(
           { id: string; receipt: QuotaReceipt }
         >()
         const vaultMarks = new Map<string, number>()
+        // A vault account's quota reading lands in the vault roster; in vault
+        // mode the sidebar lists those accounts, so it is rewritten after one.
+        function queueVaultSidebarWrite() {
+          if (!vault.enrolled()) return
+          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
+            writeMachineSidebarState(quotaManager, lastRequestStorage),
+          )
+        }
 
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
@@ -2838,7 +2865,9 @@ export async function CodexAuthPlugin(
                   ? vaultStreams.get(accountId)
                   : undefined
                 if (served) {
-                  void vault.recordSnapshot(served.id, s, true, served.receipt)
+                  void vault
+                    .recordSnapshot(served.id, s, true, served.receipt)
+                    .then(queueVaultSidebarWrite)
                   return
                 }
                 const isMainBucket = !accountId || accountId === 'main'
@@ -2912,6 +2941,21 @@ export async function CodexAuthPlugin(
           store: Awaited<ReturnType<typeof loadAccounts>>,
           mainAccountIdentity = store?.mainAccountId,
         ) {
+          // Vault mode: the sidebar lists the vault accounts that serve this
+          // host, with the quota the vault roster holds for each. No local
+          // account is read for it.
+          if (vault.enrolled()) {
+            await setSidebarMachineState(
+              buildVaultSidebarMachineState(
+                vault.snapshot()?.rows ?? [],
+                new Set(vault.routes().map((route) => route.id)),
+                store,
+                Date.now(),
+              ),
+              boundSidebarFile,
+            )
+            return
+          }
           // A migrated install's accounts are the pool's rows: row `main` is
           // the main account and the rest follow in roster order, with the
           // quota the pool holds for each.
@@ -3143,8 +3187,18 @@ export async function CodexAuthPlugin(
           },
           // On a migrated install every row is polled through the pool
           // source, the same path its background poll takes, and every vault
-          // account through the vault.
+          // account through the vault. In vault mode only the vault accounts
+          // are polled.
           refreshAllQuota: async () => {
+            if (vault.enrolled()) {
+              const vaultResults = await vault.pollStale(0)
+              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              return vaultResults.map((result) => ({
+                account: result.id,
+                ok: result.ok,
+                ...(result.error !== undefined ? { error: result.error } : {}),
+              }))
+            }
             if (await poolSource.active()) {
               const [results, vaultResults] = await Promise.all([
                 pollPoolRows(),
@@ -3165,6 +3219,13 @@ export async function CodexAuthPlugin(
             return refreshAllQuota(buildRefreshAllQuotaDeps())
           },
           refreshResetTargetQuota: async (accountKey) => {
+            if (vault.enrolled())
+              return {
+                account: accountKey,
+                ok: false,
+                error:
+                  'local accounts are not polled while this host is connected to the vault',
+              }
             if (await poolSource.active()) {
               const [result] = await pollPoolRows([accountKey])
               return (
@@ -4358,12 +4419,22 @@ export async function CodexAuthPlugin(
 
           // Immediate: show persisted quota so the sidebar isn't blank
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
+          // In vault mode the sidebar lists the vault's accounts, which are
+          // known once the vault's first account list has been read.
+          void vaultFirstRoster
+            .then(() =>
+              vault.enrolled()
+                ? writeMachineSidebarState(quotaManager, lastRequestStorage)
+                : undefined,
+            )
+            .catch(() => {})
 
           // Background: refresh from the API, then the sidebar shows fresh
           // numbers. A migrated install skips it: the pool source's load
           // above already polls every pool row, and the legacy seed would
-          // refresh and poll the same rows a second way.
-          if (!(await poolSource.active())) {
+          // refresh and poll the same rows a second way. Vault mode skips it
+          // too: no local account is polled.
+          if (!vault.enrolled() && !(await poolSource.active())) {
             bootQuotaSeedPromise = refreshAllQuota(
               buildRefreshAllQuotaDeps({ respectBackoff: true }),
             ).catch((error) =>
@@ -4379,6 +4450,13 @@ export async function CodexAuthPlugin(
 
         backgroundQuotaRefresh.start(
           async () => {
+            // Vault mode polls no local account. The vault's own accounts are
+            // polled by the shared vault consumer; the sidebar is rewritten
+            // so it shows their latest quota.
+            if (vault.enrolled()) {
+              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              return
+            }
             // A migrated install refreshes and polls its pool rows through
             // the pool source, under the same cross-process lease; the
             // legacy pass below would read the same rows as a main slot
@@ -4442,14 +4520,18 @@ export async function CodexAuthPlugin(
           generation: number,
         ): Promise<Response> {
           const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
-          const mainRow = poolSource
-            .peek()
-            .rows.find((row) => row.id === 'main')
-          const slot = !mainRow ? await getAuth() : undefined
+          // Vault mode routes the vault's accounts alone, so neither the pool
+          // row `main` nor OpenCode's slot is read for this request.
+          const vaultMode = vault.enrolled()
+          const mainRow = vaultMode
+            ? undefined
+            : poolSource.peek().rows.find((row) => row.id === 'main')
+          const slot = !mainRow && !vaultMode ? await getAuth() : undefined
           const missingTombstoneMain =
             !mainRow && slot?.type === 'oauth' && isTombstoned(slot)
           const loginRequired =
             !mainRow &&
+            !vaultMode &&
             (await poolPlaceholderWithoutMain(
               getAccountPaths(getConfigPath()),
               slot,
@@ -4460,11 +4542,17 @@ export async function CodexAuthPlugin(
           const sidebarSnapshot = await sidebarCache.get()
           const { response, servedId } = await servePoolRequest({
             source: poolSource,
-            ...(vault.enrolled()
+            ...(vaultMode
               ? {
                   vault: {
                     routes: () => vault.routes(),
-                    identities: () => vault.identities(),
+                    awaitRoster: async () => {
+                      await settlesWithin(
+                        vaultFirstRoster,
+                        VAULT_FIRST_ROSTER_WAIT_MS,
+                      )
+                    },
+                    noRouteCause: () => vaultModeNoRouteCause(vault),
                     send: (id, dispatch) =>
                       vault.send(id, dispatch, {
                         site: 'model',
@@ -4505,12 +4593,9 @@ export async function CodexAuthPlugin(
                 // kept only with the receipt the response was served under.
                 if (!target.row) {
                   if (attempt)
-                    void vault.recordSnapshot(
-                      target.id,
-                      snapshot,
-                      complete,
-                      attempt,
-                    )
+                    void vault
+                      .recordSnapshot(target.id, snapshot, complete, attempt)
+                      .then(queueVaultSidebarWrite)
                   return
                 }
                 pushQuota(
@@ -4530,11 +4615,11 @@ export async function CodexAuthPlugin(
               if (block.reason === 'no-credential') {
                 // Routing has already tried every row that could serve, so
                 // a missing main must not prevent a healthy fallback send.
-                if (loginRequired && cause !== 'vault-refused')
+                if (loginRequired && !isVaultModeRefusal(cause))
                   throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
                 return new Response(
                   LOCAL_CREDENTIAL_REFUSALS[
-                    cause === 'vault-refused'
+                    isVaultModeRefusal(cause)
                       ? cause
                       : missingTombstoneMain
                         ? 'missing-main'
@@ -4571,7 +4656,11 @@ export async function CodexAuthPlugin(
             parentSessionId,
             servedId,
             mode,
-            reqStorage?.accounts,
+            // In vault mode the served account is a vault account, so the
+            // routing entries are checked against those, not the local rows.
+            vaultMode
+              ? vault.routes().map((route) => ({ id: route.id }))
+              : reqStorage?.accounts,
             applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
           )
           return response
@@ -4615,6 +4704,23 @@ export async function CodexAuthPlugin(
             // resolves a per-session pin from sidebar state before sending.
             const reqStorage = await loadRequestAccounts()
 
+            // Vault mode (this host is enrolled with the Claustrum vault):
+            // only the vault's accounts serve. OpenCode's slot, the pool rows
+            // and any legacy fallback are not read for routing, refreshed or
+            // sent with, whether or not the install has migrated; a request
+            // no vault account can serve is refused locally.
+            if (vault.enrolled()) {
+              init = await materializeRequestInit(requestInput, init)
+              return servePooled(
+                requestInput,
+                init,
+                reqStorage,
+                sidebarSessionId,
+                sidebarParentSessionId,
+                ++mainIdentityGeneration,
+              )
+            }
+
             // Main primary uses opencode's auth slot.
             const currentAuth: {
               type: string
@@ -4630,11 +4736,11 @@ export async function CodexAuthPlugin(
             init = await materializeRequestInit(requestInput, init)
             // A migrated install whose slot holds the pool placeholder (or the
             // tombstone the removed vault custody left, which says the same:
-            // main lives elsewhere) is served from the account pool and the
-            // vault. A real login in the slot of a migrated install keeps the
-            // path below while it is adopted into the pool, unless the vault
-            // serves this host its accounts: then it is refused, since
-            // serving either would silently pick one of two accounts.
+            // main lives elsewhere) is served from the account pool. A real
+            // login in the slot of a migrated install keeps the path below
+            // while it is adopted into the pool. Vault mode was served above;
+            // the host-slot guard below only catches an enrollment that
+            // landed while this request was starting.
             const migrated = (await poolSource.current()).active
             if (isPoolMainPlaceholder(currentAuth) && migrated) {
               return servePooled(

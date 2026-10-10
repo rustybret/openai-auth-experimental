@@ -25,11 +25,11 @@
 //    credential is read, copied or moved. Real host credentials pass through.
 // 3. This host's Claustrum vault connection (`OpenAiVault` in the core
 //    package, enrolled as `openai-auth-opencode`, the name OpenCode 1 uses),
-//    whose OpenAI accounts are routed beside the pool rows. Nothing above
-//    waits for its first roster read, but what would act on a local row
-//    signing in as a vault account does: the source's first-sight quota
-//    polls and the lifecycle's adoptions wait for it in the background, a
-//    request's token step for at most two seconds.
+//    While this host is enrolled (vault mode) its OpenAI accounts are the
+//    only ones routed: no pool row is sent with, refreshed or polled. Nothing
+//    above waits for its first roster read; the lifecycle's adoptions wait
+//    for it in the background, and a vault-mode request for at most two
+//    seconds before it is refused.
 // 4. The hooks recipe (`installOpenCode2Auth`) with openai-auth's adapter
 //    (`adapter.ts`): account choice, credential headers, request rewrites,
 //    quota, refusals.
@@ -61,6 +61,7 @@ import {
   PoolAccountSource,
   settlesWithin,
   VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+  VAULT_FIRST_ROSTER_WAIT_MS,
 } from '../core/pool-account-source'
 import { poolMigrated } from '../core/pool-accounts'
 import {
@@ -289,6 +290,9 @@ export async function setupOpenAIAuth(
     // source neither refreshes that row's token nor polls quota with it
     // (request routing already skips it). OpenCode 1 wires the same set.
     vaultIdentities: () => vault.identities(),
+    // In vault mode (this host enrolled with the vault) no pool row is
+    // refreshed, polled or sent with; disconnecting restores them.
+    vaultMode: () => vault.enrolled(),
     vaultFirstRoster,
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
@@ -321,9 +325,11 @@ export async function setupOpenAIAuth(
         slot: migrationSlot,
         version,
         fence,
-        // Adoption restores the host placeholder even with vault accounts;
-        // the source excludes pool identities owned by the vault.
         runDeps: { vaultServes: () => vault.serves() },
+        // In vault mode neither the migration nor an adoption runs: a login
+        // in OpenCode 1's slot stays there, unused, and the local files stay
+        // as they are until the host disconnects.
+        paused: () => vault.enrolled(),
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those
         // polls at once.
@@ -358,6 +364,9 @@ export async function setupOpenAIAuth(
     storage: () => loadAccounts(paths()),
     pins,
     vault,
+    awaitVaultRoster: async () => {
+      await settlesWithin(vaultFirstRoster, VAULT_FIRST_ROSTER_WAIT_MS)
+    },
     responsesLite: () => getSettings().responsesLite,
     codexEndpoint: () => getSettings().codexApiEndpoint,
     log,
@@ -368,6 +377,12 @@ export async function setupOpenAIAuth(
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
     if (poolMigrated(paths().configPath)) return
+    // The migration does not run in vault mode (it writes the local files),
+    // so it is not waited for.
+    if (vault.enrolled())
+      throw new Error(
+        'This host is connected to the credential vault, which serves its OpenAI accounts, so the local accounts are not moved to the shared account pool and the login was not stored. Disconnect this host from the vault to add a local login.',
+      )
     await lifecycle?.idle()
     if (poolMigrated(paths().configPath)) return
     if (
