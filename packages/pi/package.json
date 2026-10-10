@@ -31,14 +31,14 @@
   },
   "scripts": {
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external '@earendil-works/pi-ai' --external '@earendil-works/pi-ai/*' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-coding-agent/*' --external '@earendil-works/pi-tui' --external '@earendil-works/pi-tui/*' --minify && bun run build:types",
-    "build:types": "cd ../core && bun run build && cd ../pi && tsdown --config tsdown.config.ts",
+    "build:types": "cd ../core && bun run build && cd ../pi && tsdown --config tsdown.config.ts --config-loader native",
     "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc"
   },
   "devDependencies": {
     "@cortexkit/claustrum-client": "^0.6.2",
-    "@cortexkit/common-auth": "^0.13.0",
+    "@cortexkit/common-auth": "^0.14.1",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "peerDependencies": {
