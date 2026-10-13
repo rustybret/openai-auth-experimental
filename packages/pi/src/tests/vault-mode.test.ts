@@ -6,7 +6,7 @@
 //
 // Pi resolves auth before calling a provider's stream. The real model-runtime
 // tests therefore swap the stored login before reloading Pi's auth snapshot.
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   chmodSync,
   existsSync,
@@ -19,7 +19,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { openPiSlot } from '@cortexkit/common-auth/pi-slot'
+import { openPiSlot, type PiSlot } from '@cortexkit/common-auth/pi-slot'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -48,6 +48,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { createPiMenu } from '../commands.ts'
 import { registerPiProvider } from '../index.ts'
+import { PiPoolSource } from '../pool-source.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 import {
@@ -176,7 +177,7 @@ function vault(
   })
 }
 
-function runtimeWith(target: OpenAiVault): PiOpenAIRuntime {
+function runtimeWith(target: OpenAiVault, slot?: PiSlot): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
     createStream: createAssistantMessageEventStream,
@@ -186,12 +187,14 @@ function runtimeWith(target: OpenAiVault): PiOpenAIRuntime {
     // is back, so a local request is not refused for want of a reading.
     firstReadingWaitMs: 2_000,
     vault: target,
-    slot: openPiSlot({
-      authPath: join(dir, 'auth.json'),
-      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
-      provider: 'openai-codex',
-      placeholderKey: VAULT_PLACEHOLDER_KEY,
-    }),
+    slot:
+      slot ??
+      openPiSlot({
+        authPath: join(dir, 'auth.json'),
+        stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+        provider: 'openai-codex',
+        placeholderKey: VAULT_PLACEHOLDER_KEY,
+      }),
   })
 }
 
@@ -200,6 +203,7 @@ async function send(
   sessionId?: string,
 ): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = []
+  await runtime.readAuthority()
   const stream = runtime.stream(MODEL, CONTEXT, {
     transport: 'sse',
     fetch: fakeFetch,
@@ -264,6 +268,150 @@ function poolFiles(): string[] {
 }
 
 describe('Pi in vault mode', () => {
+  test('unknown authority blocks synchronous local observation until a fresh read', async () => {
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      expect(runtime.vaultMode()).toBe(true)
+      expect(runtime.main.currentToken()).toBeUndefined()
+      expect(whamTokens).toEqual([])
+      await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+      await runtime.main.pending()
+      expect(runtime.vaultMode()).toBe(false)
+      expect(whamTokens).toEqual([NATIVE_ACCESS])
+    } finally {
+      target.close()
+    }
+  })
+
+  for (const state of ['missing-token', 'unreadable'] as const) {
+    test(`${state} enrollment disables local work and retains menu Disconnect`, async () => {
+      writeNativeLogin()
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+      writeFileSync(
+        vaultPaths(stateDir, 'pi').statePath,
+        state === 'unreadable'
+          ? '{invalid'
+          : JSON.stringify({
+              version: 1,
+              phase: 'approved',
+              proposedName: 'openai-auth-pi',
+              tokenGeneration: 1,
+              updatedAt: Date.now(),
+            }),
+        { mode: 0o600 },
+      )
+      const target = vault()
+      const runtime = runtimeWith(target)
+      try {
+        await runtime.syncVaultSlot()
+        expect(await runtime.readAuthority()).toBe(
+          state === 'unreadable' ? 'unreadable' : 'vault',
+        )
+        await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+        await runtime.commandSupport().refreshAllQuota()
+        const events = await send(runtime)
+        expect(errorOf(events)).toBeDefined()
+        expect(codexTokens).toEqual([])
+        expect(whamTokens).toEqual([])
+        expect(refreshes).toBe(0)
+        const command = createPiMenu(runtime.commandSupport())
+        const { menu } = await command.open({ notify() {} })
+        expect(
+          menu.sections
+            .find((section) => section.id === 'vault')
+            ?.actions.some((action) => action.id === 'disconnect'),
+        ).toBe(true)
+        const add = await command.apply(
+          {
+            command: 'openai',
+            sectionId: 'accounts',
+            actionId: 'add',
+            confirmed: true,
+          },
+          { notify() {} },
+        )
+        expect(add.ok).toBe(false)
+        const disconnected = await command.apply(
+          {
+            command: 'openai',
+            sectionId: 'vault',
+            actionId: 'disconnect',
+            confirmed: true,
+          },
+          { notify() {} },
+        )
+        expect(disconnected.ok).toBe(true)
+        expect(await runtime.readAuthority()).toBe('local')
+      } finally {
+        target.close()
+      }
+    })
+  }
+
+  test('approval during request storage read never polls the native login', async () => {
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const storage = spyOn(
+      runtime as unknown as { storage(): Promise<null> },
+      'storage',
+    ).mockImplementation(async () => {
+      enroll()
+      return null
+    })
+    try {
+      await send(runtime)
+      await runtime.main.pending()
+      expect(runtime.vaultMode()).toBe(true)
+      expect(whamTokens).toEqual([])
+      expect(runtime.main.currentToken()).toBeUndefined()
+      expect(codexTokens).toEqual([])
+    } finally {
+      storage.mockRestore()
+      target.close()
+    }
+  })
+
+  test('approval during refresh-all storage read never polls the native login', async () => {
+    const target = vault()
+    const runtime = runtimeWith(target)
+    await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+    await runtime.main.pending()
+    whamTokens = []
+    const storage = spyOn(
+      runtime as unknown as { storage(): Promise<null> },
+      'storage',
+    ).mockImplementation(async () => {
+      enroll()
+      return null
+    })
+    try {
+      const results = await runtime.commandSupport().refreshAllQuota()
+      expect(runtime.vaultMode()).toBe(true)
+      expect(whamTokens).toEqual([])
+      expect(results).toEqual([])
+    } finally {
+      storage.mockRestore()
+      target.close()
+    }
+  })
+
+  test('a native quota poll queued before approval refuses to send in vault mode', async () => {
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+      await runtime.main.pending()
+      whamTokens = []
+      enroll()
+      const result = await runtime.main.pollNow()
+      expect(result.ok).toBe(false)
+      expect(whamTokens).toEqual([])
+    } finally {
+      target.close()
+    }
+  })
+
   test("neither Pi's login nor a pool row the vault does not hold is sent with, refreshed or polled, and the pool files stay byte-identical", async () => {
     daemon = await startMockDaemon({
       directory: dir,
@@ -289,7 +437,7 @@ describe('Pi in vault mode', () => {
         expect(events[0]?.type).toBe('start')
       }
       const support = runtime.commandSupport()
-      support.observeLogin(NATIVE_ACCESS)
+      await support.observeLogin(NATIVE_ACCESS)
       await support.refreshAllQuota()
       await runtime.pool.settled()
 
@@ -298,6 +446,58 @@ describe('Pi in vault mode', () => {
       expect(refreshes).toBe(0)
       expect(poolFiles()).toEqual(before)
     } finally {
+      target.close()
+    }
+  })
+
+  test('the pool source sets local work aside before invoking its providers', async () => {
+    await addExpiredLocalRow()
+    await openPoolStore({
+      provider: 'openai',
+      configPath: paths.configPath,
+      statePath: paths.statePath,
+      quota: quotaCodec,
+    }).add({
+      id: 'valid-local',
+      credential: {
+        type: 'oauth',
+        access: 'valid-local-bearer',
+        refresh: 'valid-local-refresh',
+        expires: Date.now() + 3_600_000,
+      },
+    })
+    const before = poolFiles()
+    enroll()
+    const target = vault()
+    let providerCalls = 0
+    // PiOpenAIRuntime also checks enrollment inside refresh and quota callbacks.
+    // Plain callbacks prove the pool source refuses before invoking either one.
+    const source = new PiPoolSource({
+      paths: () => paths,
+      vaultMode: () => target.enrolled(),
+      vaultAuthority: () => target.authority(),
+      refreshProvider: async () => {
+        providerCalls++
+        throw new Error('local refresh must not start')
+      },
+      pullQuota: async () => {
+        providerCalls++
+        throw new Error('local quota must not start')
+      },
+    })
+    try {
+      const view = await source.load()
+      const row = view.rows.find((row) => row.id === 'valid-local')
+      if (!row) throw new Error('missing local row')
+      expect(source.usableToken(row)).toBeUndefined()
+      await source.refreshDueTokens(view.rows, null)
+      expect(await source.pollRows(null)).toEqual([])
+      await source.settled()
+      expect(providerCalls).toBe(0)
+      expect(poolFiles()).toEqual(before)
+    } finally {
+      source.dispose()
+      await source.settled()
       target.close()
     }
   })
@@ -465,6 +665,350 @@ describe("Pi's real model runtime in vault mode", () => {
 })
 
 describe('Pi vault slot lifecycle', () => {
+  test('steady local and vault sync ticks take no Pi auth locks', async () => {
+    const locks = await import(
+      new URL(
+        './lock.js',
+        import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+      ).href
+    )
+    const acquire = spyOn(locks, 'acquirePiLock')
+    const authPath = join(dir, 'auth.json')
+    const count = () =>
+      acquire.mock.calls.filter((args) => args[0] === authPath).length
+    writeNativeLogin()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      for (let tick = 0; tick < 10; tick++) await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+      enroll()
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      for (let tick = 0; tick < 10; tick++) await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+    } finally {
+      acquire.mockRestore()
+      target.close()
+    }
+  })
+
+  test('explicit slot sync and recovery after failure take Pi auth locks', async () => {
+    const locks = await import(
+      new URL(
+        './lock.js',
+        import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+      ).href
+    )
+    const acquire = spyOn(locks, 'acquirePiLock')
+    const authPath = join(dir, 'auth.json')
+    const count = () =>
+      acquire.mock.calls.filter((args) => args[0] === authPath).length
+    const slot = openPiSlot({
+      authPath,
+      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+      provider: 'openai-codex',
+      placeholderKey: VAULT_PLACEHOLDER_KEY,
+    })
+    writeNativeLogin()
+    const target = vault()
+    const runtime = runtimeWith(target, slot)
+    const inspect = spyOn(slot, 'inspect')
+    try {
+      await runtime.syncVaultSlot()
+      acquire.mockClear()
+      await runtime.syncVaultSlot(undefined, true)
+      expect(count()).toBeGreaterThan(0)
+      inspect.mockRejectedValueOnce(new Error('slot inspection failed'))
+      await expect(runtime.syncVaultSlot(undefined, true)).rejects.toThrow(
+        'slot inspection failed',
+      )
+      acquire.mockClear()
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+      await runtime.disconnectVault()
+      expect(count()).toBeGreaterThan(0)
+    } finally {
+      inspect.mockRestore()
+      acquire.mockRestore()
+      target.close()
+    }
+  })
+
+  test('disconnect failure between token and ceremony removal keeps vault authority', async () => {
+    writeNativeLogin()
+    enroll()
+    writeFileSync(
+      vaultPaths(stateDir, 'pi').statePath,
+      JSON.stringify({
+        version: 1,
+        phase: 'approved',
+        proposedName: 'openai-auth-pi',
+        tokenGeneration: 1,
+        updatedAt: Date.now(),
+      }),
+      { mode: 0o600 },
+    )
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const disconnect = spyOn(target, 'disconnect').mockImplementation(
+      async () => {
+        rmSync(target.paths.tokenPath)
+        throw new Error('ceremony removal failed')
+      },
+    )
+    try {
+      await runtime.syncVaultSlot()
+      await expect(runtime.disconnectVault()).rejects.toThrow(
+        'ceremony removal failed',
+      )
+      expect(await runtime.readAuthority()).toBe('vault')
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        true,
+      )
+      await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+      expect(whamTokens).toEqual([])
+    } finally {
+      disconnect.mockRestore()
+      target.close()
+    }
+  })
+
+  test('a slot restore rejection before moving leaves the original stash and vault routing', async () => {
+    writeNativeLogin()
+    enroll()
+    const target = vault()
+    const slot = openPiSlot({
+      authPath: join(dir, 'auth.json'),
+      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+      provider: 'openai-codex',
+      placeholderKey: VAULT_PLACEHOLDER_KEY,
+    })
+    const runtime = runtimeWith(target, slot)
+    const restore = spyOn(slot, 'exitVault').mockRejectedValue(
+      new Error('restore failed'),
+    )
+    const disconnect = spyOn(target, 'disconnect')
+    try {
+      await runtime.syncVaultSlot()
+      const stashBefore = readFileSync(
+        join(stateDir, 'pi-openai-codex-login.json'),
+      )
+      await expect(runtime.disconnectVault()).rejects.toThrow('restore failed')
+      expect(disconnect).not.toHaveBeenCalled()
+      expect(runtime.vaultMode()).toBe(true)
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+      expect(
+        readFileSync(join(stateDir, 'pi-openai-codex-login.json')),
+      ).toEqual(stashBefore)
+    } finally {
+      restore.mockRestore()
+      disconnect.mockRestore()
+      target.close()
+    }
+  })
+
+  test('disconnect failure before enrollment removal re-stashes the restored login', async () => {
+    writeNativeLogin()
+    const before = readFileSync(join(dir, 'auth.json'))
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const disconnect = spyOn(target, 'disconnect').mockRejectedValue(
+      new Error('enrollment removal failed'),
+    )
+    try {
+      await runtime.syncVaultSlot()
+      const command = createPiMenu(runtime.commandSupport())
+      const result = await command.apply(
+        {
+          command: 'openai',
+          sectionId: 'vault',
+          actionId: 'disconnect',
+          confirmed: true,
+        },
+        { notify() {} },
+      )
+      expect(result.ok).toBe(false)
+      expect(runtime.vaultMode()).toBe(true)
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        true,
+      )
+      expect(result.text).toContain('still enrolled')
+      disconnect.mockRestore()
+      await runtime.disconnectVault()
+      expect(readFileSync(join(dir, 'auth.json'))).toEqual(before)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        false,
+      )
+    } finally {
+      disconnect.mockRestore()
+      target.close()
+    }
+  })
+
+  test('disconnect failure after enrollment removal keeps the original login and reloads Pi', async () => {
+    writeNativeLogin()
+    const before = readFileSync(join(dir, 'auth.json'))
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const remove = target.disconnect.bind(target)
+    const disconnect = spyOn(target, 'disconnect').mockImplementation(
+      async () => {
+        await remove()
+        throw new Error('roster refresh failed')
+      },
+    )
+    let reloads = 0
+    try {
+      await runtime.syncVaultSlot(() => {
+        reloads++
+      })
+      const command = createPiMenu(runtime.commandSupport(), {
+        afterApply: () =>
+          runtime.syncVaultSlot(() => {
+            reloads++
+          }),
+      })
+      const result = await command.apply(
+        {
+          command: 'openai',
+          sectionId: 'vault',
+          actionId: 'disconnect',
+          confirmed: true,
+        },
+        { notify() {} },
+      )
+      expect(result.ok).toBe(false)
+      expect(runtime.vaultMode()).toBe(false)
+      expect(readFileSync(join(dir, 'auth.json'))).toEqual(before)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        false,
+      )
+      expect(reloads).toBe(2)
+      expect(result.text).toContain('local accounts are active')
+    } finally {
+      disconnect.mockRestore()
+      target.close()
+    }
+  })
+
+  test('a slot restore rejection keeps enrollment and reconciles the restored login', async () => {
+    writeNativeLogin()
+    enroll()
+    const target = vault()
+    const slot = openPiSlot({
+      authPath: join(dir, 'auth.json'),
+      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+      provider: 'openai-codex',
+      placeholderKey: VAULT_PLACEHOLDER_KEY,
+    })
+    const runtime = runtimeWith(target, slot)
+    const exit = slot.exitVault.bind(slot)
+    const restore = spyOn(slot, 'exitVault').mockImplementation(async () => {
+      await exit()
+      throw new Error('restore completion failed')
+    })
+    const disconnect = spyOn(target, 'disconnect')
+    try {
+      await runtime.syncVaultSlot()
+      await expect(runtime.disconnectVault()).rejects.toThrow(
+        'restore completion failed',
+      )
+      expect(disconnect).not.toHaveBeenCalled()
+      expect(runtime.vaultMode()).toBe(true)
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        true,
+      )
+    } finally {
+      restore.mockRestore()
+      disconnect.mockRestore()
+      target.close()
+    }
+  })
+
+  test('a second runtime restoring during approval preserves the original login exactly once', async () => {
+    writeNativeLogin()
+    const before = readFileSync(join(dir, 'auth.json'))
+    enroll()
+    const firstVault = vault()
+    const secondVault = vault()
+    const slot = openPiSlot({
+      authPath: join(dir, 'auth.json'),
+      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+      provider: 'openai-codex',
+      placeholderKey: VAULT_PLACEHOLDER_KEY,
+    })
+    const first = runtimeWith(firstVault)
+    const second = runtimeWith(secondVault, slot)
+    let release!: () => void
+    let entered!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const restoring = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const exit = slot.exitVault.bind(slot)
+    const restore = spyOn(slot, 'exitVault').mockImplementation(async () => {
+      entered()
+      await held
+      return exit()
+    })
+    try {
+      await Promise.all([first.syncVaultSlot(), second.syncVaultSlot()])
+      await firstVault.disconnect()
+      const pending = second.syncVaultSlot()
+      await restoring
+      enroll()
+      await first.syncVaultSlot()
+      release()
+      await pending
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        true,
+      )
+      restore.mockRestore()
+      await first.disconnectVault()
+      await second.syncVaultSlot()
+      expect(readFileSync(join(dir, 'auth.json'))).toEqual(before)
+      expect(existsSync(join(stateDir, 'pi-openai-codex-login.json'))).toBe(
+        false,
+      )
+    } finally {
+      release()
+      restore.mockRestore()
+      firstVault.close()
+      secondVault.close()
+    }
+  })
+
   test('the vault slot uses Pi auth.json independently of pool file overrides', async () => {
     const previousAgentDir = process.env.PI_AGENT_DIR
     const previousCodingAgentDir = process.env.PI_CODING_AGENT_DIR

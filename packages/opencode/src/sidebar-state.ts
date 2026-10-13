@@ -876,7 +876,10 @@ function usableRoutingAccountIds(
 // state file, as it always has, so drainSidebarWrites waits for all of them.
 let sidebarWriteChain: Promise<void> = Promise.resolve()
 
-type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'>
+type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'> & {
+  /** Whether this snapshot may still be written; checked again after lock waits. */
+  canWrite?: () => boolean
+}
 
 function enqueueSidebarWrite(operation: () => Promise<void>): Promise<void> {
   const result = sidebarWriteChain.then(operation)
@@ -968,12 +971,26 @@ function writeMergedSidebarState(
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
   // Every state reaches disk normalized, as each write has always been.
+  const refused = Symbol('sidebar authority changed')
   return logWriteFailure(
     file,
-    sidebarFileFor(file).update((latest) => {
-      const next = merge(latest)
-      return next === undefined ? undefined : normalizeSidebarState(next)
-    }, hooks),
+    sidebarFileFor(file)
+      .update(
+        (latest) => {
+          if (hooks?.canWrite && !hooks.canWrite()) return undefined
+          const next = merge(latest)
+          return next === undefined ? undefined : normalizeSidebarState(next)
+        },
+        {
+          beforeRecheck: async (...args) => {
+            await hooks?.beforeRecheck?.(...args)
+            if (hooks?.canWrite && !hooks.canWrite()) throw refused
+          },
+        },
+      )
+      .catch((error: unknown) => {
+        if (error !== refused) throw error
+      }),
   )
 }
 
@@ -1179,6 +1196,7 @@ export function setSidebarMachineState(
         const latestFallbacks = new Map(
           latest.fallbacks.map((account) => [account.id, account]),
         )
+        const vaultMode = machineState.vaultAccounts !== undefined
         // A same-identity merge combines the freshest of each window across the
         // two sides; a differing or unknown identity whole-picks the fresher
         // snapshot so windows from two accounts are never combined.
@@ -1198,41 +1216,47 @@ export function setSidebarMachineState(
         return {
           ...latest,
           ...machineState,
-          main: {
-            ...machineState.main,
-            quota: mergedMainQuota,
-            // On a whole-pick the identity follows the winning snapshot, so a
-            // reader never pairs one account's id with another account's quota
-            // (a re-login race would otherwise resurrect the stale-account bug).
-            // On a same-identity merge both sides already agree, so the incoming
-            // id is the shared one.
-            mainAccountId: mainSameIdentity
-              ? machineState.main.mainAccountId
-              : mergedMainQuota === latest.main.quota &&
-                  mergedMainQuota !== machineState.main.quota
-                ? latest.main.mainAccountId
-                : machineState.main.mainAccountId,
-          },
-          fallbacks: machineState.fallbacks.map((account) => {
-            const existing = latestFallbacks.get(account.id)
-            const fallbackSameIdentity = sameAccountIdentity(
-              account.accountId,
-              existing?.accountId,
-            )
-            const mergedQuota = fallbackSameIdentity
-              ? mergeQuotaByWindow(account.quota, existing?.quota ?? null)
-              : freshestQuota(account.quota, existing?.quota ?? null)
-            return {
-              ...account,
-              quota: mergedQuota,
-              accountId: fallbackSameIdentity
-                ? account.accountId
-                : mergedQuota === existing?.quota &&
-                    mergedQuota !== account.quota
-                  ? existing?.accountId
-                  : account.accountId,
-            }
-          }),
+          // Vault snapshots replace local account fields; local snapshots merge
+          // quota windows so concurrent refreshes do not discard fresher readings.
+          main: vaultMode
+            ? machineState.main
+            : {
+                ...machineState.main,
+                quota: mergedMainQuota,
+                // On a whole-pick the identity follows the winning snapshot, so a
+                // reader never pairs one account's id with another account's quota
+                // (a re-login race would otherwise resurrect the stale-account bug).
+                // On a same-identity merge both sides already agree, so the incoming
+                // id is the shared one.
+                mainAccountId: mainSameIdentity
+                  ? machineState.main.mainAccountId
+                  : mergedMainQuota === latest.main.quota &&
+                      mergedMainQuota !== machineState.main.quota
+                    ? latest.main.mainAccountId
+                    : machineState.main.mainAccountId,
+              },
+          fallbacks: vaultMode
+            ? machineState.fallbacks
+            : machineState.fallbacks.map((account) => {
+                const existing = latestFallbacks.get(account.id)
+                const fallbackSameIdentity = sameAccountIdentity(
+                  account.accountId,
+                  existing?.accountId,
+                )
+                const mergedQuota = fallbackSameIdentity
+                  ? mergeQuotaByWindow(account.quota, existing?.quota ?? null)
+                  : freshestQuota(account.quota, existing?.quota ?? null)
+                return {
+                  ...account,
+                  quota: mergedQuota,
+                  accountId: fallbackSameIdentity
+                    ? account.accountId
+                    : mergedQuota === existing?.quota &&
+                        mergedQuota !== account.quota
+                      ? existing?.accountId
+                      : account.accountId,
+                }
+              }),
           activeId: latest.activeId,
           activeRouting: latest.activeRouting,
           stickyAssignments,
@@ -1294,14 +1318,19 @@ export function upsertSidebarActiveRouting(
 export function setSidebarLegacyRouting(
   input: ActiveRoutingEntry,
   file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
 ): Promise<void> {
   return enqueueSidebarWrite(async () => {
-    await writeMergedSidebarState(file, (latest) => ({
-      ...latest,
-      activeId: input.activeId,
-      route: input.route,
-      lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
-    }))
+    await writeMergedSidebarState(
+      file,
+      (latest) => ({
+        ...latest,
+        activeId: input.activeId,
+        route: input.route,
+        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+      }),
+      hooks,
+    )
   })
 }
 

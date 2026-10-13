@@ -34,8 +34,12 @@ export * from './quota-normalize'
 export * from './refresh-all-quota'
 export * from './reset-credits'
 export * from './tombstone'
+export * from './util/credential-redaction'
 export * from './util/error'
 export * from './util/open-url'
 export * from './util/record'
 export * from './vault'
-export { runVaultAccountMenu } from './vault-account-menu'
+export {
+  runVaultAccountMenu,
+  VAULT_LOCAL_ACTION_REFUSAL,
+} from './vault-account-menu'

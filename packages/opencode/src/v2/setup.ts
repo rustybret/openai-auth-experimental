@@ -41,6 +41,8 @@ import {
   installOpenCode2Auth,
   type OpenCode2AuthAdapter,
   OpenCode2AuthError,
+  type OpenCode2HookContext,
+  placeholderSecret,
   type RequestScope,
   registerOpenCode2AuthMethods,
 } from '@cortexkit/common-auth/opencode2'
@@ -51,10 +53,15 @@ import {
   extractAccountId,
   loadAccounts,
   type OpenAiVaultOptions,
+  redactCredentialError,
+  redactCredentialFrame,
+  redactCredentialResponse,
+  redactCredentialText,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
+import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { getConfigPath, getSettings } from '../config'
 import { getAccountPaths } from '../core/account-paths'
 import {
@@ -89,6 +96,7 @@ import {
 } from './adapter'
 import { opencode1HostSlot } from './host-slot'
 import {
+  assertLocalPoolLogin,
   type BeginLogin,
   chatgptLoginMethods,
   isLeftoverCredential,
@@ -151,24 +159,143 @@ type SetupContext = Pick<
   'session' | 'event' | 'integration' | 'model'
 >
 
-function installPoolHooks<Q, A>(
+async function installPoolHooks<Q, A>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
 ) {
-  return installOpenCode2Auth(ctx, adapter, {
-    gateOnPlaceholder: {
-      credential: (headers) => {
-        const authorization = headers.get('authorization')
-        return authorization?.startsWith('Bearer ')
-          ? authorization.slice('Bearer '.length)
-          : undefined
+  // Receive/retry hooks have no request object to identify the send they answer.
+  // They answer the last handshake or send for this session, so remember its
+  // bearer. A send using another integration's login is not ours to rewrite.
+  const sockets = new Map<string, string>()
+  const latest = new Map<string, string>()
+  const forget = (sessionID: string) => {
+    latest.delete(sessionID)
+    for (const key of sockets.keys())
+      if (key.startsWith(`${sessionID}:`)) sockets.delete(key)
+  }
+  const context: OpenCode2HookContext = {
+    session: {
+      hook: (name, callback, options) =>
+        ctx.session.hook(
+          name,
+          async (draft) => {
+            const request =
+              name === 'http.request'
+                ? (draft as SessionHooks['http.request'])
+                : undefined
+            const handshake =
+              name === 'experimental.ws.handshake'
+                ? (draft as SessionHooks['experimental.ws.handshake'])
+                : undefined
+            const prepared = request
+              ? request.request.headers
+              : handshake
+                ? new Headers(handshake.headers)
+                : undefined
+            const owned =
+              prepared?.get('authorization') ===
+              `Bearer ${placeholderSecret(adapter.providerID)}`
+            try {
+              await callback(draft)
+            } catch (error) {
+              if (owned && !(error instanceof OpenCode2AuthError))
+                throw redactCredentialError(error)
+              throw error
+            }
+            if (request || handshake) {
+              const scope = request ?? handshake
+              if (!scope) return
+              const headers = request
+                ? request.request.headers
+                : new Headers(
+                    (scope as SessionHooks['experimental.ws.handshake'])
+                      .headers,
+                  )
+              const bearer = headers
+                .get('authorization')
+                ?.replace(/^Bearer /, '')
+              if (owned && bearer) latest.set(scope.sessionID, bearer)
+              else latest.delete(scope.sessionID)
+              if (handshake) {
+                const key = `${handshake.sessionID}:${handshake.kind}`
+                if (owned && bearer) sockets.set(key, bearer)
+                else sockets.delete(key)
+              }
+              if (latest.size > 512) {
+                const oldest = latest.keys().next().value
+                if (oldest) latest.delete(oldest)
+              }
+              if (sockets.size > 512) {
+                const oldest = sockets.keys().next().value
+                if (oldest) sockets.delete(oldest)
+              }
+            } else if (name === 'experimental.ws.receive') {
+              const received = draft as SessionHooks['experimental.ws.receive']
+              const token = sockets.get(
+                `${received.sessionID}:${received.kind}`,
+              )
+              if (token)
+                received.frame = redactCredentialFrame(received.frame, token)
+            } else if (name === 'retry') {
+              const retry = draft as SessionHooks['retry']
+              const token = latest.get(retry.sessionID)
+              if (token)
+                Object.assign(retry.error, {
+                  message: redactCredentialText(retry.error.message, token),
+                })
+            }
+          },
+          options,
+        ),
+    },
+    event: {
+      subscribe: (options) =>
+        (async function* () {
+          for await (const event of ctx.event.subscribe(options)) {
+            if (event.type === 'session.deleted') forget(event.data.sessionID)
+            yield event
+          }
+        })(),
+    },
+  }
+  const installation = await installOpenCode2Auth(
+    context,
+    {
+      ...adapter,
+      rewriteResponse: async (input) => {
+        const response =
+          (await adapter.rewriteResponse?.(input)) ?? input.response
+        return redactCredentialResponse(
+          response,
+          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'event-stream',
+        )
       },
     },
-    logger: {
-      warn: (message, data) => log.warn(message, { data }),
+    {
+      gateOnPlaceholder: {
+        credential: (headers) => {
+          const authorization = headers.get('authorization')
+          return authorization?.startsWith('Bearer ')
+            ? authorization.slice('Bearer '.length)
+            : undefined
+        },
+      },
+      logger: {
+        warn: (message, data) => log.warn(message, { data }),
+      },
     },
-  })
+  )
+  const dispose = installation.dispose
+  return {
+    ...installation,
+    dispose: async () => {
+      latest.clear()
+      sockets.clear()
+      await dispose()
+    },
+  }
 }
 
 export function createOpenAIAuthPlugin(
@@ -220,8 +347,8 @@ export async function setupOpenAIAuth(
 
   // The vault serves nothing until this host is enrolled as
   // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
-  // Until then each poll only checks for the enrollment token file, so an
-  // enrollment another process finished is picked up. It is built before the
+  // Each poll reads the shared enrollment authority, so an enrollment
+  // completed by another process is picked up. It is built before the
   // pool source, whose first load already asks which accounts it holds, and
   // started further down.
   //
@@ -255,6 +382,13 @@ export async function setupOpenAIAuth(
     paths(),
   )
   const vault = vaultLease.vault
+  let setupComplete = false
+  using _leaseRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) vaultLease.release()
+    },
+  }
+  await vault.authority()
   const vaultFirstRoster = vaultLease.firstRoster
 
   const source = new PoolAccountSource({
@@ -294,6 +428,7 @@ export async function setupOpenAIAuth(
     // In vault mode (this host enrolled with the vault) no pool row is
     // refreshed, polled or sent with; disconnecting restores them.
     vaultMode: () => vault.enrolled(),
+    vaultAuthority: () => vault.authority(),
     vaultFirstRoster,
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
@@ -330,7 +465,7 @@ export async function setupOpenAIAuth(
         // In vault mode neither the migration nor an adoption runs: a login
         // in OpenCode 1's slot stays there, unused, and the local files stay
         // as they are until the host disconnects.
-        paused: () => vault.enrolled(),
+        paused: async () => (await vault.authority()) !== 'local',
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those
         // polls at once.
@@ -377,13 +512,8 @@ export async function setupOpenAIAuth(
 
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
+    await assertLocalPoolLogin(vault)
     if (poolMigrated(paths().configPath)) return
-    // The migration does not run in vault mode (it writes the local files),
-    // so it is not waited for.
-    if (vault.enrolled())
-      throw new Error(
-        'This host is connected to the credential vault, which serves its OpenAI accounts, so the local accounts are not moved to the shared account pool and the login was not stored. Disconnect this host from the vault to add a local login.',
-      )
     await lifecycle?.idle()
     if (poolMigrated(paths().configPath)) return
     if (
@@ -405,7 +535,9 @@ export async function setupOpenAIAuth(
 
   const storeLogin = async (login: PoolLoginResult) => {
     await ensureMigrated(login)
-    const outcome = await writeLoginToPool(source.poolStore(), paths(), login)
+    const outcome = await writeLoginToPool(source.poolStore(), paths(), login, {
+      vault,
+    })
     if (!poolMigrated(paths().configPath)) await lifecycle?.requestAdoption()
     await source.load()
     log.info('ChatGPT login stored in the account pool', outcome)
@@ -416,6 +548,7 @@ export async function setupOpenAIAuth(
     methods: chatgptLoginMethods({
       beginLogin: options.beginLogin ?? beginAccountLogin,
       version,
+      vault,
     }),
     onLogin: (login) => storeLogin(login),
     label: 'ChatGPT (openai-auth account pool)',
@@ -439,6 +572,7 @@ export async function setupOpenAIAuth(
     }
   })()
 
+  setupComplete = true
   return async () => {
     abort.abort()
     lifecycle?.dispose()

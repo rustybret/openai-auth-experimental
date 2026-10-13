@@ -173,10 +173,9 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   const runtime = createPiOpenAIRuntime()
   webSocketObserver = (headers, data) =>
     runtime.observeWebSocketMessage(headers, data)
-  registerPiProvider(pi, runtime)
   let refresh: (() => unknown) | undefined
   let notify: ((message: string, level: 'error') => void) | undefined
-  const syncSlot = () =>
+  const syncSlot = (explicit = true) =>
     runtime.syncVaultSlot(
       refresh
         ? async () => {
@@ -184,9 +183,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
             await refresh?.()
           }
         : undefined,
+      explicit,
     )
   const syncInBackground = () => {
-    void syncSlot().catch(() => {
+    void syncSlot(false).catch(() => {
       notify?.(
         'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
         'error',
@@ -204,6 +204,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   // Startup can move the login before a session context is available. The
   // first session reloads Pi's auth snapshot before looking up any login.
   await syncSlot().catch(() => {})
+  registerPiProvider(pi, runtime)
   setInterval(syncInBackground, PROVIDER_SYNC_INTERVAL_MS).unref?.()
   if (typeof pi.on === 'function') {
     pi.on('session_start', async (_event, ctx) => {
@@ -221,9 +222,11 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
       }
       if (runtime.vaultMode()) return
       try {
-        runtime.main.observeToken(
-          await ctx.modelRegistry.getApiKeyForProvider('openai-codex'),
-        )
+        await runtime
+          .commandSupport()
+          .observeLogin(
+            await ctx.modelRegistry.getApiKeyForProvider('openai-codex'),
+          )
       } catch {
         // No login yet: the first request hands one over.
       }

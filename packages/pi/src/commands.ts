@@ -109,8 +109,10 @@ export function createPiMenu(
     changed: dependencies.afterApply,
     ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
   })
-  return createOpenAiMenu({
+  const menu = createOpenAiMenu({
     store: pool.store(),
+    // The shared menu reads the vault's own enrollment authority, so an
+    // unreadable or token-less enrollment still gets the vault-only view.
     vault: pool.vault,
     login: {
       begin: (options) => begin({ ...options, version }),
@@ -149,23 +151,63 @@ export function createPiMenu(
         ...vaultMenu,
         build: async (invocation) => {
           const view = await vaultMenu.build(invocation)
+          const disconnect = {
+            id: 'disconnect',
+            label: 'Disconnect',
+            confirm:
+              'Disconnect this Pi host from the vault and restore its original login?',
+            run: async () => {
+              let result:
+                | Awaited<
+                    ReturnType<NonNullable<PiPoolCommands['disconnectVault']>>
+                  >
+                | undefined
+              try {
+                result = await pool.disconnectVault?.()
+              } catch {
+                let reloadFailed = false
+                try {
+                  await dependencies.afterApply?.()
+                } catch {
+                  reloadFailed = true
+                }
+                const authority = await pool.readAuthority()
+                throw new CommandError(
+                  'vault-disconnect-failed',
+                  [
+                    authority === 'local'
+                      ? 'Disconnect did not finish cleanly; local accounts are active. Retry Disconnect if Pi login restoration did not complete.'
+                      : 'Disconnect failed; Pi is still enrolled or enrollment is unreadable. Local accounts remain disabled; retry Disconnect to restore the login.',
+                    ...(reloadFailed
+                      ? [
+                          'Pi could not reload its auth snapshot; reopen the session.',
+                        ]
+                      : []),
+                  ].join('\n'),
+                )
+              }
+              await dependencies.afterApply?.()
+              return [
+                `Disconnected: ${pool.vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${pool.vault.name}\` to revoke it in the vault too.`,
+                ...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : []),
+              ].join('\n')
+            },
+          }
+          const actions = view.actions ?? []
           return {
             ...view,
-            actions: view.actions?.map((action) =>
-              action.id === 'disconnect' && pool.disconnectVault
-                ? {
-                    ...action,
-                    run: async () => {
-                      const result = await pool.disconnectVault?.()
-                      await dependencies.afterApply?.()
-                      return [
-                        `Disconnected: ${pool.vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${pool.vault.name}\` to revoke it in the vault too.`,
-                        ...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : []),
-                      ].join('\n')
-                    },
-                  }
-                : action,
-            ),
+            actions: [
+              ...actions.map((action) =>
+                action.id === 'disconnect' && pool.disconnectVault
+                  ? { ...action, run: disconnect.run }
+                  : action,
+              ),
+              ...(pool.vaultMode() &&
+              pool.disconnectVault &&
+              !actions.some((action) => action.id === 'disconnect')
+                ? [disconnect]
+                : []),
+            ],
           }
         },
       },
@@ -175,6 +217,17 @@ export function createPiMenu(
       return pool.reload()
     },
   })
+  return {
+    command: menu.command,
+    open: async (invocation) => {
+      await pool.readAuthority()
+      return menu.open(invocation)
+    },
+    apply: async (request, invocation) => {
+      await pool.readAuthority()
+      return menu.apply(request, invocation)
+    },
+  }
 }
 
 async function runOpenAiCommand(
@@ -188,13 +241,13 @@ async function runOpenAiCommand(
   }
   dependencies.onContext?.(ctx)
   if (dependencies.afterApply) await dependencies.afterApply()
-  else await pool.syncVaultSlot?.(() => ctx.modelRegistry.refresh())
+  else await pool.syncVaultSlot?.(() => ctx.modelRegistry.refresh(), true)
   // Take the token Pi holds for its login now, as a request would, so the
   // menu knows which account Pi signs in with. Not in vault mode: asking Pi
   // for the key makes Pi refresh and store an expired login.
   if (!pool.vaultMode()) {
     try {
-      pool.observeLogin(
+      await pool.observeLogin(
         await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
       )
     } catch {

@@ -696,7 +696,7 @@ expect_message = "+   \"apikey:openai:platform\","
 id = "vault-mode-ignores-a-real-slot-login"
 guards = "in vault mode a real login in OpenCode's slot is not used: the request is served from the vault before the slot is read"
 file = "packages/opencode/src/index.ts"
-old = "            if (vault.enrolled()) {\n              init = await materializeRequestInit(requestInput, init)"
+old = "            if (authority !== 'local') {\n              init = await materializeRequestInit(requestInput, init)"
 new = "            if (false) { // NON-VACUITY BREAK: read the slot in vault mode.\n              init = await materializeRequestInit(requestInput, init)"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -1366,7 +1366,7 @@ expect_red = ['^vault\scommand\smenu\svault\sfloors\suse\sthe\srequest\sroute\sk
 id = "menu-no-vault-output"
 guards = "an unenrolled vault leaves rendered local-only output byte-identical apart from unlabelled row names"
 file = "packages/core/src/vault-account-menu.ts"
-old = "  return view.status.enrollment.state === 'approved'"
+old = "  return view.authority !== 'local'"
 new = "  return true // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1378,8 +1378,8 @@ expect_red = ['^vault\scommand\smenu\sdisconnected\soutput\sis\sbyte-identical\s
 id = "menu-pi-vault-slots"
 guards = "Pi supplies the vault to the shared replacement slots as well as the Vault extra"
 file = "packages/pi/src/commands.ts"
-old = "    store: pool.store(),\n    vault: pool.vault,"
-new = "    store: pool.store(),\n    vault: undefined, // NON-VACUITY BREAK"
+old = "    vault: pool.vault,\n    login: {"
+new = "    vault: undefined, // NON-VACUITY BREAK\n    login: {"
 test_file = "packages/pi/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault.test.ts", "-t", "{test}"]
@@ -1414,7 +1414,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the published common-auth release containing Pi-slot and replacement-slot menus"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.14.1"'
+old = '"@cortexkit/common-auth": "^0.14.2"'
 new = '"@cortexkit/common-auth": "^0.11.4"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1510,14 +1510,14 @@ expect_red = ['^drains\sa\sstarted\ssource\sread\sbefore\sthe\snext\swire,\snami
 id = "opencode2-placeholder-ownership-gate"
 guards = "a migrated pool leaves an API-key request untouched when the prepared bearer is not the pool placeholder"
 file = "packages/opencode/src/v2/setup.ts"
-old = """    gateOnPlaceholder: {
-      credential: (headers) => {
-        const authorization = headers.get('authorization')
-        return authorization?.startsWith('Bearer ')
-          ? authorization.slice('Bearer '.length)
-          : undefined
-      },
-    },"""
+old = """      gateOnPlaceholder: {
+        credential: (headers) => {
+          const authorization = headers.get('authorization')
+          return authorization?.startsWith('Bearer ')
+            ? authorization.slice('Bearer '.length)
+            : undefined
+        },
+      },"""
 new = "    // NON-VACUITY BREAK: remove the shared placeholder equality gate."
 test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
 runner = "command"
@@ -1529,10 +1529,10 @@ expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sleaves\\san\\sactive
 id = "opencode2-request-bound-credential"
 guards = "switching connections changes the next prepared request's ownership instead of reusing a placeholder decision"
 file = "packages/opencode/src/v2/setup.ts"
-old = """        const authorization = headers.get('authorization')
-        return authorization?.startsWith('Bearer ')
-          ? authorization.slice('Bearer '.length)
-          : undefined"""
+old = """          const authorization = headers.get('authorization')
+          return authorization?.startsWith('Bearer ')
+            ? authorization.slice('Bearer '.length)
+            : undefined"""
 new = """        // NON-VACUITY BREAK: treat every prepared credential as the pool placeholder.
         void headers
         return 'common-auth-placeholder.openai'"""
@@ -1633,13 +1633,13 @@ expect_red = ['^the\spool\ssource\sin\svault\smode\srefreshes,\spolls\sand\soffe
 id = "vault-mode-warms-no-local-target"
 guards = "in vault mode a keep-warm target captured on a local account before connecting is never warmed: no local token is read, refreshed or sent"
 file = "packages/opencode/src/core/cachekeep.ts"
-old = "      if (options.vault?.enrolled())\n        throw new Error("
-new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error("
-test_file = "packages/opencode/src/tests/vault.test.ts"
+old = "      if (options.vault && (await options.vault.authority()) !== 'local')\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
+new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
 runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^vault\\scachekeep\\sin\\svault\\smode\\sa\\slocal\\starget\\scaptured\\sbefore\\sconnecting\\sis\\snever\\swarmed:\\snothing\\sis\\ssent\\sor\\srefreshed$"]
+expect_red = ['^vault\senrollment\saudit\san\senrolled\swarm\srefuses\sbefore\sresolving\sany\slocal\stoken$']
 
 [[control]]
 id = "vault-mode-sidebar-lists-vault-accounts"
@@ -1652,6 +1652,18 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\smode\\sthe\\ssidebar\\sfile\\sin\\svault\\smode\\slists\\sthe\\svault\\saccounts\\sand\\sno\\slocal\\srow,\\swith\\sthe\\sserving\\sone\\sactive$"]
+
+[[control]]
+id = "vault-sidebar-write-clears-local-main-state"
+guards = "a vault-mode sidebar snapshot replaces stale local main quota and identity instead of applying local quota freshness merging"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "        const vaultMode = machineState.vaultAccounts !== undefined"
+new = "        const vaultMode = false // NON-VACUITY BREAK: merge persisted local account state into vault mode."
+test_file = "packages/opencode/src/tests/sidebar-state.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-state.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\smachine\\swrites\\sclear\\spersisted\\slocal\\smain\\sidentity\\sand\\squota$"]
 
 [[control]]
 id = "opencode2-vault-mode-routes-no-local-row"
@@ -1669,8 +1681,8 @@ expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\snever\\sroutes\\sa\\spool
 id = "pi-vault-slot-enter-before-reload"
 guards = "the expired Pi login is stashed and replaced before Pi can resolve or refresh it"
 file = "packages/pi/src/runtime.ts"
-old = "        if (mode) await this.vaultSlot().enterVault()"
-new = "        if (mode) await Promise.resolve() // NON-VACUITY BREAK: leave Pi's OAuth login in the slot."
+old = "    if (mode) await this.vaultSlot().enterVault()"
+new = "    if (mode) await Promise.resolve() // NON-VACUITY BREAK: leave Pi's OAuth login in the slot."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -1688,13 +1700,13 @@ test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^Pi\\sin\\svault\\smode\\sneither\\sPi's\\slogin\\snor\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold\\sis\\ssent\\swith,\\srefreshed\\sor\\spolled,\\sand\\sthe\\spool\\sfiles\\sstay\\sbyte-identical$"]
+expect_red = ['^Pi\sin\svault\smode\sthe\spool\ssource\ssets\slocal\swork\saside\sbefore\sinvoking\sits\sproviders$']
 
 [[control]]
 id = "vault-mode-pauses-the-pool-lifecycle"
 guards = "while paused (vault mode) the pool lifecycle runs no adoption: a slot login stays in the slot and the account files stay byte-identical"
 file = "packages/opencode/src/core/pool-lifecycle.ts"
-old = "    if (!deps.paused?.()) return false\n"
+old = "    if (!(await deps.paused?.())) return false\n"
 new = "    return false // NON-VACUITY BREAK: run while paused.\n"
 test_file = "packages/opencode/src/tests/pool-lifecycle.test.ts"
 runner = "command"
@@ -1706,7 +1718,7 @@ expect_red = ["^in\\svault\\smode\\sa\\sslot\\slogin\\slanding\\sin\\svault\\smo
 id = "opencode1-vault-mode-wires-the-lifecycle-pause"
 guards = "OpenCode 1 pauses its pool lifecycle in vault mode, so a never-migrated install is not migrated while the vault serves it"
 file = "packages/opencode/src/index.ts"
-old = "          paused: () => vault.enrolled(),"
+old = "          paused: async () => (await vault.authority()) !== 'local',"
 new = "          paused: () => false, // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
 runner = "command"
@@ -1718,19 +1730,19 @@ expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\
 id = "opencode1-vault-mode-loader-writes-nothing"
 guards = "OpenCode 1's loader seeds and updates no account file in vault mode"
 file = "packages/opencode/src/index.ts"
-old = "        const loaderVaultMode = vault.enrolled()"
+old = "        const loaderVaultMode = (await vault.authority()) !== 'local'"
 new = "        const loaderVaultMode = false // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle-plugin.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\\sinstall\\sis\\sserved\\sfrom\\sthe\\svault\\swithout\\smigrating,\\sand\\smigrates\\sonce\\sthe\\shost\\sdisconnects$"]
+expect_red = ['^the\spool\slifecycle\sin\svault\smode\san\senrolled\sfirst-run\sloader\sleaves\sabsent\saccount\sfiles\sabsent$']
 
 [[control]]
 id = "opencode2-vault-mode-wires-the-lifecycle-pause"
 guards = "OpenCode 2 pauses its pool lifecycle in vault mode, so a login in the slot is neither adopted nor the placeholder written"
 file = "packages/opencode/src/v2/setup.ts"
-old = "        paused: () => vault.enrolled(),"
+old = "        paused: async () => (await vault.authority()) !== 'local',"
 new = "        paused: () => false, // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
 runner = "command"
@@ -2079,8 +2091,8 @@ test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sterminal\sadd\sselected\sbefore\senrollment\srefuses\swithout\schanging\spool\sbytes$']
-expect_message = "Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts."
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sthe\sshared\sterminal\srefuses\sa\sstale\sadd\sbefore\sinvoking\sits\slogin\sprovider$']
+expect_message = "expect(logins).toBe(0)"
 
 [[control]]
 id = "menu-pi-vault-accounts-no-add"
@@ -2099,20 +2111,20 @@ expect_message = '"add"'
 id = "menu-vault-terminal-no-local-login-fallback"
 guards = "vault enrollment opens the terminal account menu without probing or signing into a local credential"
 file = "packages/opencode/src/auth/methods.ts"
-old = "  const hasCredential = async (): Promise<boolean> => {\n    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return true"
+old = "  const hasCredential = async (): Promise<boolean> => {\n    if (vault && (await vault.authority()) !== 'local') return true"
 new = "  const hasCredential = async (): Promise<boolean> => {\n    // NON-VACUITY BREAK: ignore vault enrollment."
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
-expect_message = "local login must not start"
+expect_message = "Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts."
 
 [[control]]
 id = "menu-vault-terminal-no-premigration-doctor"
 guards = "an enrolled host opens the vault menu rather than the local pre-migration doctor"
 file = "packages/opencode/src/auth/methods.ts"
-old = "    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)"
+old = "    if (vault && (await vault.authority()) !== 'local')\n      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)"
 new = "    // NON-VACUITY BREAK: fall through to the local migration menu."
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -2125,7 +2137,7 @@ expect_message = "Accounts are managed in the vault with ck. Disconnect to use l
 id = "menu-vault-terminal-no-local-status-read"
 guards = "the connected terminal status does not inspect legacy local accounts"
 file = "packages/opencode/src/auth/methods.ts"
-old = "      if (vault && enrollment?.enrollment.state === 'approved')"
+old = "      if (vault && (await vault.authority()) !== 'local' && enrollment)"
 new = "      if (false) // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -2165,8 +2177,8 @@ expect_message = "expect(finished).toBe(false)"
 id = "pi-vault-slot-restores-before-disconnect"
 guards = "disconnect restores the saved entry before enrollment is removed"
 file = "packages/pi/src/runtime.ts"
-old = "      const result = await this.vaultSlot().exitVault()"
-new = "      const result = 'nothing-to-do' as const // NON-VACUITY BREAK: delete enrollment before restoring Pi's login."
+old = "        const result = await this.vaultSlot().exitVault()"
+new = "        const result = 'nothing-to-do' as const // NON-VACUITY BREAK: delete enrollment before restoring Pi's login."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -2191,8 +2203,8 @@ expect_message = "expect(result.text).toContain(VAULT_SLOT_CONFLICT)"
 id = "pi-vault-slot-refuses-stale-resolved-credential"
 guards = "vault streams refuse a non-placeholder credential locally even when the vault could serve"
 file = "packages/pi/src/runtime.ts"
-old = "    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {"
-new = "    if (false) { // NON-VACUITY BREAK: accept Pi's stale local credential."
+old = "          (await this.readAuthority()) !== 'local' &&\n          options?.apiKey !== VAULT_PLACEHOLDER_KEY"
+new = "          false // NON-VACUITY BREAK: accept Pi's stale local credential."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -2253,3 +2265,760 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.tes
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
 expect_message = "expect(hostEntry.key).toBe(VAULT_PLACEHOLDER_KEY)"
+
+# Pi enrollment races: mode is re-read at local side-effect boundaries, and
+# slot moves are reconciled against the authority after competing operations.
+[[control]]
+id = "pi-approval-during-request-storage"
+guards = "approval during a request settings read prevents observing Pi's native token"
+file = "packages/pi/src/runtime.ts"
+old = "    const storage = await this.storage()\n    const vaultMode = (await this.readAuthority()) !== 'local'"
+new = "    const vaultMode = (await this.readAuthority()) !== 'local'\n    const storage = await this.storage() // NON-VACUITY BREAK: retain pre-read enrollment mode."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sapproval\sduring\srequest\sstorage\sread\snever\spolls\sthe\snative\slogin$']
+expect_message = "expect(runtime.main.currentToken()).toBeUndefined()"
+
+[[control]]
+id = "pi-approval-during-quota-storage"
+guards = "approval during quota settings read selects vault-only polling"
+file = "packages/pi/src/runtime.ts"
+old = "        // Vault mode polls the vault's accounts alone.\n        if ((await this.readAuthority()) !== 'local')"
+new = "        // NON-VACUITY BREAK: skip the post-storage authority branch.\n        if (false)"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sapproval\sduring\srefresh-all\sstorage\sread\snever\spolls\sthe\snative\slogin$']
+expect_message = "expect(results).toEqual([])"
+
+[[control]]
+id = "pi-native-quota-send-authority"
+guards = "a previously scheduled native quota poll checks enrollment immediately before sending"
+file = "packages/pi/src/runtime.ts"
+old = "        if ((await this.readAuthority()) !== 'local')\n          throw new Error('Pi login quota polling is disabled while enrolled')"
+new = "        // NON-VACUITY BREAK: send with the retained Pi token after approval."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sa\snative\squota\spoll\squeued\sbefore\sapproval\srefuses\sto\ssend\sin\svault\smode$']
+expect_message = "expect(result.ok).toBe(false)"
+
+[[control]]
+id = "pi-disconnect-failure-reconciles-slot"
+guards = "a failed enrollment removal moves the restored Pi login back aside"
+file = "packages/pi/src/runtime.ts"
+old = "      } finally {\n        await this.reconcileSlot()\n      }"
+new = "      } finally {\n        await this.readAuthority() // NON-VACUITY BREAK: leave the restored login active while enrolled.\n      }"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sdisconnect\sfailure\sbefore\senrollment\sremoval\sre-stashes\sthe\srestored\slogin$']
+expect_message = "toBe(VAULT_PLACEHOLDER_KEY)"
+
+[[control]]
+id = "pi-disconnect-failure-reloads-auth"
+guards = "a disconnect that removed enrollment but failed later still reloads restored Pi auth"
+file = "packages/pi/src/commands.ts"
+old = "                  await dependencies.afterApply?.()"
+new = "                  await Promise.resolve() // NON-VACUITY BREAK: keep Pi's placeholder snapshot after failed disconnect."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sdisconnect\sfailure\safter\senrollment\sremoval\skeeps\sthe\soriginal\slogin\sand\sreloads\sPi$']
+expect_message = "expect(reloads).toBe(2)"
+
+[[control]]
+id = "pi-competing-slot-move-authority"
+guards = "a second runtime that restores during approval re-enters custody and preserves the original login"
+file = "packages/pi/src/runtime.ts"
+old = "    if (currentMode !== mode) {"
+new = "    if (false) { // NON-VACUITY BREAK: ignore enrollment changed during the locked slot move."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\ssecond\sruntime\srestoring\sduring\sapproval\spreserves\sthe\soriginal\slogin\sexactly\sonce$']
+expect_message = "toBe(VAULT_PLACEHOLDER_KEY)"
+
+[[control]]
+id = "pi-steady-slot-sync-lock-free"
+guards = "steady local and vault background sync reads authority without acquiring Pi auth locks"
+file = "packages/pi/src/runtime.ts"
+old = "    if (mode === this.slotVaultMode && !explicit) return"
+new = "    // NON-VACUITY BREAK: lock auth.json on every background tick."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\ssteady\slocal\sand\svault\ssync\sticks\stake\sno\sPi\sauth\slocks$']
+expect_message = "expect(count()).toBe(0)"
+
+[[control]]
+id = "pi-explicit-slot-sync-bypasses-fast-path"
+guards = "explicit session and menu sync requests reconcile the Pi slot even when authority has not changed"
+file = "packages/pi/src/runtime.ts"
+old = "    if (mode === this.slotVaultMode && !explicit) return"
+new = "    if (mode === this.slotVaultMode) return // NON-VACUITY BREAK: ignore an explicit slot reconciliation."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sexplicit\sslot\ssync\sand\srecovery\safter\sfailure\stake\sPi\sauth\slocks$']
+expect_message = "expect(count()).toBeGreaterThan(0)"
+
+# Enrollment authority, send-time enrollment changes and recoverable vault menus.
+
+[[control]]
+id = "audit-enrolled-pool-login"
+guards = "ordinary OAuth authorization and completion cannot write a migrated local pool while enrolled"
+file = "packages/opencode/src/v2/login.ts"
+old = "  if ((await vault.authority()) !== 'local')"
+new = "  if (false) // NON-VACUITY BREAK: authorize and store local logins while enrolled."
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\slogins\sa\smigrated\spool\srefuses\san\sordinary\slogin\scompleted\safter\senrollment\swithout\schanging\spool\sbytes$']
+
+[[control]]
+id = "audit-unreadable-dialog-mode"
+guards = "unreadable enrollment never shows or applies local dialog account actions"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return view.authority !== 'local'"
+new = "  return view.status.enrollment.state === 'approved' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sunreadable\senrollment\shides\slocal\sdialog\sactions\sand\srefuses\sstale\swrites\sand\spolls$']
+
+[[control]]
+id = "audit-unreadable-auth-menu-mode"
+guards = "the terminal auth menu stays vault-only and offers Disconnect when enrollment state is unreadable"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return view.authority !== 'local'"
+new = "  return view.status.enrollment.state === 'approved' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sunreadable\senrollment\skeeps\sthe\sauth\smenu\svault-only\swith\sDisconnect\sand\sno\slocal\spolling$']
+
+[[control]]
+id = "audit-authority-cache"
+guards = "cached synchronous guards only allow locals after a fresh authoritative read of unchanged files"
+file = "packages/core/src/vault.ts"
+old = "    const mode = await enrollmentAuthority(this.paths, this.name)"
+new = "    const mode = 'local' as const // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sthe\ssynchronous\smode\sguard\sstays\sclosed\suntil\sauthority\sreads\sunchanged\senrollment\sfiles$']
+
+[[control]]
+id = "audit-warm-enrollment-race"
+guards = "a local bearer resolved after enrollment is never dispatched by keep-warm"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "      // Enrollment can finish during token resolution; do not dispatch the\n      // resolved local bearer after authority has switched away from local.\n      if (options.vault && (await options.vault.authority()) !== 'local')"
+new = "      if (false) // NON-VACUITY BREAK: send the local bearer after enrollment."
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\senrollment\sduring\sa\slocal\swarm\stoken\sawait\sprevents\sdispatch$']
+
+[[control]]
+id = "audit-vault-menu-hang"
+guards = "Disconnect remains reachable when account discovery never resolves"
+file = "packages/core/src/vault-account-menu.ts"
+old = "          VAULT_REQUEST_ROSTER_WAIT_MS,"
+new = "          VAULT_REQUEST_ROSTER_WAIT_MS * 10, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sa\shung\sroster\srefresh\sleaves\sDisconnect\sreachable\swithin\sthe\sroster\swait\sbudget$']
+
+[[control]]
+id = "audit-vault-menu-rejection"
+guards = "a rejected menu discovery renders its error instead of rejecting the dialog"
+file = "packages/core/src/vault-account-menu.ts"
+old = "            error instanceof Error ? error.message : String(error),"
+new = "            Promise.reject(error), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sa\srejected\sroster\srefresh\srenders\san\serror\sand\sleaves\sDisconnect\sreachable$']
+
+[[control]]
+id = "audit-vault-before-migration"
+guards = "local migration notices cannot hide the vault menu or Disconnect"
+file = "packages/core/src/commands.ts"
+old = "    async open(invocation): Promise<CommandDialogPayload> {\n      const context = own(invocation)\n      const state =\n        options.vault && (await options.vault.authority()) !== 'local'\n          ? undefined\n          : await options.migration?.()"
+new = "    async open(invocation): Promise<CommandDialogPayload> {\n      const context = own(invocation)\n      const state = await options.migration?.() // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\svault\sdialog\sbypasses\san\sunmigrated\slocal\sinstall$']
+
+[[control]]
+id = "audit-vault-admission-cause"
+guards = "a nonempty vault blocked by quota admission is not called empty"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "            ? ctx.vault.noRouteCause()\n            : undefined"
+new = "            ? ctx.vault.noRouteCause()\n            : 'vault-empty' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\srequest\spath\sin\svault\smode\svault\squota\sadmission\sis\snot\smisreported\sas\san\sempty\sroster$']
+
+[[control]]
+id = "audit-setup-vault-lease"
+guards = "setup failure after acquiring the shared vault does not retain a holder"
+file = "packages/opencode/src/v2/setup.ts"
+old = "      if (!setupComplete) vaultLease.release()"
+new = "      if (!setupComplete) void 0 // NON-VACUITY BREAK: leak the setup holder."
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\slogins\ssetup\sreleases\sits\svault\slease\swhen\sloading\sthe\ssource\sthrows$']
+
+[[control]]
+id = "audit-vault-menu-action-intent"
+guards = "a stale Connect choice never becomes Disconnect after enrollment completes"
+file = "packages/opencode/src/auth/methods.ts"
+old = "        if (mode !== 'local') {\n          context.print("
+new = "        if (mode !== 'local') {\n          await target.disconnect() // NON-VACUITY BREAK: reverse a stale Connect choice.\n          context.print("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sstale\sterminal\sConnect\schoice\snever\sdisconnects\sa\snewly\senrolled\shost$']
+
+# Windows browser opener: launched without waiting, so a slow cold PowerShell
+# start is never killed before the browser opens (verified on real Windows).
+[[control]]
+id = "opener-windows-does-not-wait"
+guards = "the Windows opener launches PowerShell unreferenced without a synchronous wait"
+file = "packages/core/src/util/open-url.ts"
+old = "      child.unref()"
+new = "      void child // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/browser-opener.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^browser\sopener\suses\sa\sshell-free\sPowerShell\scommand\sfor\sa\scomplete\sOAuth\sURL\son\sWindows$']
+
+# Prevent local sends/writes after vault enrollment and remove credentials from provider errors.
+
+[[control]]
+id = "opencode1-local-dispatch-authority"
+guards = "enrollment after the request body await prevents every physical local dispatch"
+file = "packages/opencode/src/index.ts"
+old = "if (!vaultReceipt && (await vault.authority()) !== 'local') {"
+new = "if (false && !vaultReceipt) { // NON-VACUITY BREAK: allow stale local custody at dispatch."
+test_file = "packages/opencode/src/tests/opencode1-authority.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode1-authority.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode1\senrollment\sduring\srequest\sbody\sawait\sprevents\sphysical\slocal\sdispatch$']
+
+[[control]]
+id = "opencode1-vault-unused-corrupt-store"
+guards = "vault-only loading and fixed refusal do not depend on the unused local store parsing"
+file = "packages/opencode/src/index.ts"
+old = """        const storage = await loadAccounts(
+          getAccountPaths(getConfigPath()),
+        ).catch(async (err) => {"""
+new = """        await loadAccounts(getAccountPaths(getConfigPath())) // NON-VACUITY BREAK: require unused local storage.
+        const storage = await loadAccounts(
+          getAccountPaths(getConfigPath()),
+        ).catch(async (err) => {"""
+test_file = "packages/opencode/src/tests/opencode1-authority.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode1-authority.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode1\svault\sloader\sdeclines\slocally\seven\swhen\sthe\sunused\slocal\saccount\sfile\sis\smalformed$']
+
+[[control]]
+id = "pi-quota-enrollment-commit"
+guards = "a deferred pool quota commit cannot change local files after enrollment, including after lock waits"
+file = "packages/pi/src/pool-source.ts"
+old = "          step.startsWith('before-') &&"
+new = "          false && // NON-VACUITY BREAK: permit a local quota commit after enrollment."
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sdeferred\srecordQuota\srefuses\spersistence\swhen\senrollment\slands\sat\scommit$']
+
+[[control]]
+id = "pi-transport-error-bearer-redaction"
+guards = "provider error events on transports without an HTTP response wrapper cannot expose an opaque attempt credential to Pi"
+file = "packages/pi/src/runtime.ts"
+old = """            event.error.errorMessage = redactCredentialText(
+              event.error.errorMessage ?? '',
+              token,
+            )"""
+new = """            void event.error.errorMessage // NON-VACUITY BREAK: forward the provider's echoed bearer."""
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\slate-event\serror\smasks\severy\soccurrence\sof\san\sopaque\sattempt\scredential$']
+
+[[control]]
+id = "codex-sse-delta-no-json-parse"
+guards = "ordinary and Unicode-escaped Codex delta frames do not pay for JSON parsing on the streaming request path"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    !frame.includes('error') &&"
+new = "    false && // NON-VACUITY BREAK: parse every ordinary Codex delta."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^ordinary\sdelta\sframes\sbypass\sJSON\sparsing\sentirely$', '^escaped\sUnicode\sdelta\sframes\sbypass\sJSON\sparsing\sand\sremain\sbyte-identical$']
+
+[[control]]
+id = "credential-non-ok-header-redaction"
+guards = "provider error headers cannot retain exact account credentials or JWT-shaped diagnostics"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        init.headers.set(name, redactCredentialText(value, credential))"
+new = "        init.headers.set(name, value) // NON-VACUITY BREAK: forward echoed header credentials."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^non-ok\sresponse\sheaders\sredact\sexact\scredentials\sand\sJWTs\swhile\spreserving\sretry\smetadata$']
+
+[[control]]
+id = "credential-sse-cancel-rejection-redaction"
+guards = "stream cancellation rejects with scrubbed diagnostics while forwarding the caller reason and releasing the reader"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "          throw redactCredentialError(error, credential)"
+new = "          throw error // NON-VACUITY BREAK: expose the cancellation rejection."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^SSE\scancellation\srejection\sredacts\scredentials\swithout\schanging\sthe\sreason\sand\sreleases\sthe\sreader$']
+
+[[control]]
+id = "credential-sse-escaped-error-redaction"
+guards = "legal JSON escaping of error keys and type values cannot bypass SSE credential scrubbing"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "      (!escapedErrorField.test(frame) && !escapedErrorType.test(frame)))"
+new = "      true) // NON-VACUITY BREAK: ignore escaped error envelopes."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^escaped\sJSON\serror\skeys\sredact\sexact\scredentials\sand\sJWTs\sthrough\sthe\sSSE\swrapper$']
+
+[[control]]
+id = "credential-decoded-json-value-redaction"
+guards = "Unicode-escaped credentials in HTTP and SSE error string values cannot reappear after JSON decoding"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "      if (hex) return String.fromCharCode(Number.parseInt(hex, 16))"
+new = "      if (hex) return sequence // NON-VACUITY BREAK: leave Unicode credentials encoded."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^failed\sHTTP\sJSON\sbodies\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$', '^SSE\serror\sframes\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$']
+
+# Streaming error redaction follows the caller's SSE contract, not provider headers.
+[[control]]
+id = "credential-sse-missing-content-type"
+guards = "a missing provider content-type cannot bypass caller-declared SSE error redaction"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (!bodyStream || mode === 'http') return response"
+new = "    if (!bodyStream || mode === 'http' || !headers.has('content-type')) return response // NON-VACUITY BREAK: trust missing provider metadata."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^explicit\sSSE\smode\sscrubs\scredentials\swith\smissing\scontent-type$']
+
+[[control]]
+id = "credential-sse-plain-content-type"
+guards = "a text/plain provider content-type cannot bypass caller-declared SSE error redaction"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (!bodyStream || mode === 'http') return response"
+new = "    if (!bodyStream || mode === 'http' || headers.get('content-type') === 'text/plain') return response // NON-VACUITY BREAK: trust mislabelled provider metadata."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^explicit\sSSE\smode\sscrubs\scredentials\swith\stext/plain\scontent-type$']
+
+[[control]]
+id = "opencode1-caller-sse-mode"
+guards = "OpenCode1 declares SSE mode for model sends even without provider content-type"
+file = "packages/opencode/src/index.ts"
+old = """              response,
+              accessToken,
+              'event-stream',"""
+new = """              response,
+              accessToken,
+              'http', // NON-VACUITY BREAK: omit the model stream contract."""
+test_file = "packages/opencode/src/tests/opencode1-authority.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode1-authority.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode1\sstreaming\ssends\sscrub\serrors\swith\smissing\scontent-type$']
+
+[[control]]
+id = "opencode2-caller-sse-mode"
+guards = "OpenCode2 declares SSE mode before the native driver parses model errors"
+file = "packages/opencode/src/v2/setup.ts"
+old = """          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'event-stream',"""
+new = """          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'http', // NON-VACUITY BREAK: omit the native model stream contract."""
+test_file = "packages/opencode/src/tests/opencode2-wire.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-wire.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^through\sthe\sOpenCode\s2\sentry\sscrubs\sstreaming\serrors\swith\smissing\scontent-type\sthrough\sthe\sresponse\shook$']
+
+[[control]]
+id = "pi-caller-sse-mode"
+guards = "Pi scrubs raw SSE errors before pi-ai copies echoed credentials into shared partial messages"
+file = "packages/pi/src/runtime.ts"
+old = """                await send(input, init),
+                token,
+                'event-stream',"""
+new = """                await send(input, init),
+                token,
+                'http', // NON-VACUITY BREAK: omit the Pi model stream contract."""
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sruntime\sparses\sand\sscrubs\sSSE\serrors\swith\smissing\scontent-type$']
+
+# Credential diagnostics: lexical scans, safe object projection, and unchanged stream bytes.
+[[control]]
+id = "credential-audit-duplicate-keys"
+guards = "discarded duplicate JSON strings cannot leak from SSE error frames"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    return redactCredentialJsonText(frame, credential)"
+new = "    return redactCredentialText(JSON.stringify(value), credential) === JSON.stringify(value) ? frame : redactCredentialJsonText(frame, credential) // NON-VACUITY BREAK: trust only surviving JSON values."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit duplicate keys cannot conceal credentials in HTTP or SSE errors$']
+
+[[control]]
+id = "credential-audit-escaped-text"
+guards = "raw diagnostics have an independent escape-decoded credential scan"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const decoded = decodeEscapes(raw)"
+new = "  const decoded = raw // NON-VACUITY BREAK: skip the decoded diagnostic scan."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit raw and escape-decoded diagnostics are scanned independently$']
+
+[[control]]
+id = "credential-audit-header-names"
+guards = "diagnostic header names cannot carry the attempt credential"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        if (redactCredentialText(name, credential?.toLowerCase()) !== name) {"
+new = "        if (false && redactCredentialText(name, credential?.toLowerCase()) !== name) { // NON-VACUITY BREAK: keep secret header names."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit non-ok header names cannot contain credentials$']
+
+[[control]]
+id = "credential-audit-proxy-projection"
+guards = "proxies in thrown prototype chains cannot run traps during projection"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (types.isProxy(prototype)) return false"
+new = "    if (false && types.isProxy(prototype)) return false // NON-VACUITY BREAK: inspect caller proxies."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit proxied Error prototype does not execute traps$']
+
+[[control]]
+id = "credential-audit-leading-bom"
+guards = "BOM bytes in successful streams remain identical"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        bom +\n        event"
+new = "        '' + // NON-VACUITY BREAK: omit the original leading BOM.\n        event"
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit BOM success bytes stay identical at start and inside stream under every header$']
+
+[[control]]
+id = "credential-audit-response-getters"
+guards = "Response subclass getters cannot execute at the credential boundary"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    const status = responseStatus.call(response) as number"
+new = "    const status = response.status // NON-VACUITY BREAK: execute subclass status accessors."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit Response subclasses and reused bodies do not run getters or leak$']
+
+[[control]]
+id = "credential-audit-http-read-rejection"
+guards = "a failed read of an eagerly consumed non-ok body cannot escape raw"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  } catch (error) {\n    throw redactCredentialError(error, credential)\n  }\n}"
+new = "  } catch (error) {\n    throw error // NON-VACUITY BREAK: expose the body-read rejection.\n  }\n}"
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit non-ok body read rejections are scrubbed$']
+
+[[control]]
+id = "credential-audit-pi-shared-partial"
+guards = "late provider errors cannot leak through earlier shared Pi partials"
+file = "packages/pi/src/runtime.ts"
+old = """          if (event.type === 'error') {
+            // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
+            event.error.errorMessage = redactCredentialText(
+              event.error.errorMessage ?? '',
+              token,
+            )
+          }
+          yield event"""
+new = "          yield event.type === 'error' ? { ...event, error: { ...event.error, errorMessage: redactCredentialText(event.error.errorMessage ?? '', token) } } : event // NON-VACUITY BREAK: leave the error text raw on earlier shared partials."
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi late transport errors scrub the shared partial retained by start events$']
+
+[[control]]
+id = "credential-audit-sdk-retry-brand"
+guards = "owned Errors preserve AI SDK recognition and retry classification without prototypes"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (ownData(error, key) === true)"
+new = "    if (false && ownData(error, key) === true) // NON-VACUITY BREAK: drop the SDK error brand."
+test_file = "packages/opencode/src/tests/credential-projection.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-projection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^owned projection preserves SDK retry brands, retry-after, and usage-limit classification$']
+
+[[control]]
+id = "credential-audit-projected-abort"
+guards = "an owned AbortError stops reactive fallback instead of returning the primary error response"
+file = "packages/opencode/src/index.ts"
+old = """              if (
+                (error instanceof Error || error instanceof DOMException) &&
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('reactive fallback candidate threw; stopping', {"""
+new = """              if (
+                (error instanceof DOMException) && // NON-VACUITY BREAK: ignore projected native aborts.
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('reactive fallback candidate threw; stopping', {"""
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^integration: active fallback routing propagates caller aborts from reactive fallback attempts$']
+
+[[control]]
+id = "credential-audit-inherited-accessor"
+guards = "inherited error messages and names are never evaluated during projection"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  let name = ownData(error, 'name')"
+new = "  let name = safeObject(error) ? (error as { name?: unknown }).name : undefined // NON-VACUITY BREAK: read inherited caller accessors."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit inherited Error accessors and Symbol-keyed messages are not retained or executed$']
+
+[[control]]
+id = "credential-audit-wrapped-known-token"
+guards = "whitespace wrapping cannot leave a known credential suffix after Bearer prefix masking"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const masked = maskKnownCredential(text, credential)"
+new = "  const masked = credential ? text.split(credential).join('[credential]') : text // NON-VACUITY BREAK: ignore wrapped known credentials."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^known credentials wrapped across whitespace are removed completely from error text$']
+
+[[control]]
+id = "credential-audit-numeric-lexemes"
+guards = "JSON numbers are never rounded or normalized when scrubbing an unrelated string"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "function redactCredentialJsonText(text: string, credential?: string): string {"
+new = "function redactCredentialJsonText(text: string, credential?: string): string {\n  text = JSON.stringify(JSON.parse(text)) // NON-VACUITY BREAK: normalize numeric source lexemes."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^JSON diagnostic rewrites preserve unrelated numeric literal spelling exactly$']
+
+[[control]]
+id = "credential-audit-numeric-secret"
+guards = "numeric-looking credentials cannot escape unquoted JSON diagnostic values"
+file = "packages/core/src/util/credential-redaction.ts"
+old = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/g,'''
+new = '''    /"(?:\\.|[^"\\])*"/g, // NON-VACUITY BREAK: skip numeric credential literals.'''
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^numeric-looking credentials become JSON strings without rounding other numbers$']
+
+[[control]]
+id = "credential-audit-request-id"
+guards = "the owned projection retains a scrubbed provider support request id"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (typeof requestId === 'string')"
+new = "  if (false && typeof requestId === 'string') // NON-VACUITY BREAK: discard the support request id."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^owned error projection preserves scrubbed provider request ids from headers and body$']
+
+[[control]]
+id = "credential-audit-host-body"
+guards = "the actual host parser still sees the provider's context overflow body"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (typeof body === 'string')"
+new = "  if (false && typeof body === 'string') // NON-VACUITY BREAK: drop the host classification body."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves context overflow code$']
+
+[[control]]
+id = "credential-audit-host-ms-header"
+guards = "the actual host delay retains retry-after-ms precedence over seconds"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    for (const key of ['retry-after-ms', 'retry-after']) {"
+new = "    for (const key of ['retry-after']) { // NON-VACUITY BREAK: drop the millisecond retry hint."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves 429 millisecond header precedence$']
+
+[[control]]
+id = "credential-audit-host-header-presence"
+guards = "the actual host backoff distinguishes empty headers from absent headers"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (headers && typeof headers === 'object') {"
+new = "  if (headers && typeof headers === 'object' && Object.keys(headers).length) { // NON-VACUITY BREAK: lose empty header presence."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves 429 empty headers uncapped$']
+
+[[control]]
+id = "credential-audit-host-late-retry"
+guards = "a body retry marker past the size cap survives in compact classification data"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const markers = retryBodyPatterns.flatMap(\n    (pattern) => pattern.exec(safe)?.[0] ?? [],\n  )"
+new = "  const markers: string[] = [] // NON-VACUITY BREAK: lose retry facts beyond the retained body cap."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves oversized late retry marker$']
+
+[[control]]
+id = "credential-audit-sse-scalars"
+guards = "rebuilt error frames cannot retain Boolean or null values equal to the known credential"
+file = "packages/core/src/util/credential-redaction.ts"
+old = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/g,'''
+new = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g, // NON-VACUITY BREAK: copy Boolean and null credential values.'''
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^rebuilt SSE errors never retain credential-equal scalar retry metadata$']
+
+[[control]]
+id = "credential-audit-warm-response"
+guards = "vault warm response diagnostics are scrubbed before the shared manager retains them"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "          return await redactCredentialResponse(\n            response,\n            accessToken,\n            'event-stream',\n          )"
+new = "          return response // NON-VACUITY BREAK: expose the warm error body to manager logging."
+test_file = "packages/opencode/src/tests/cachekeep-credential.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/cachekeep-credential.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^keep-warm vault http diagnostics scrub the exact warm credential before logging$']
+
+[[control]]
+id = "credential-audit-warm-throw"
+guards = "local warm transport errors are scrubbed with their resolved attempt token"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "          throw redactCredentialError(error, accessToken)"
+new = "          throw error // NON-VACUITY BREAK: expose warm fetch rejection diagnostics."
+test_file = "packages/opencode/src/tests/cachekeep-credential.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/cachekeep-credential.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^keep-warm local throw diagnostics scrub the exact warm credential before logging$']
+
+[[control]]
+id = "credential-audit-numeric-alias"
+guards = "exponent and decimal scalar aliases of a numeric credential are masked without rounding ids"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const numericCredential = credential ? canonicalNumber(credential) : undefined"
+new = "  const numericCredential = undefined // NON-VACUITY BREAK: ignore mathematically equal numeric spellings."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^numeric scalar aliases are scrubbed without rounding or masking unrelated numeric ids$']
+
+[[control]]
+id = "credential-audit-pi-fetch-owned"
+guards = "pi-ai never reads caller getters on an unprojected fetch rejection"
+file = "packages/pi/src/runtime.ts"
+old = "              throw redactCredentialError(error, token)"
+new = "              throw error // NON-VACUITY BREAK: allow pi-ai to inspect raw fetch exceptions."
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi fetch throws are owned before pi-ai reads diagnostic getters$']
