@@ -29,7 +29,7 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "0.11.0",
+      "version": "1.0.2",
       "dependencies": {
         "@opentui/core": ">=0.5.14",
         "@opentui/solid": ">=0.5.14",
@@ -54,7 +54,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "0.11.0",
+      "version": "1.0.2",
       "devDependencies": {
         "@cortexkit/claustrum-client": "^0.6.2",
         "@cortexkit/common-auth": "^0.14.2",
