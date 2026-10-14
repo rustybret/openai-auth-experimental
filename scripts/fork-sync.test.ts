@@ -18,7 +18,7 @@ const scriptCode = script
   .join('\n')
 
 describe('fork-sync exclusion manifest', () => {
-  it('parses to the three supported action verbs only', () => {
+  it('parses to the supported action verbs only', () => {
     const verbs = manifest
       .split('\n')
       .map((line) => line.replace(/#.*$/, '').trim())
@@ -27,7 +27,12 @@ describe('fork-sync exclusion manifest', () => {
 
     expect(verbs.length).toBeGreaterThan(0)
     for (const verb of verbs) {
-      expect(['keep-deleted', 'take-theirs', 'regenerate']).toContain(verb)
+      expect([
+        'keep-deleted',
+        'take-theirs',
+        'take-ours',
+        'regenerate',
+      ]).toContain(verb)
     }
   })
 
@@ -69,7 +74,12 @@ describe('fork-sync.sh', () => {
   })
 
   it('handles every verb the manifest is allowed to use', () => {
-    for (const verb of ['keep-deleted', 'take-theirs', 'regenerate']) {
+    for (const verb of [
+      'keep-deleted',
+      'take-theirs',
+      'take-ours',
+      'regenerate',
+    ]) {
       expect(script).toContain(`${verb}:*)`)
     }
   })
@@ -78,7 +88,12 @@ describe('fork-sync.sh', () => {
     // Regression guard: `${line#regenerate:}` leaves a leading space, which
     // turns the pathspec into " bun.lock" — a path that matches nothing, so
     // the regenerated lockfile silently never gets staged.
-    for (const verb of ['keep-deleted', 'take-theirs', 'regenerate']) {
+    for (const verb of [
+      'keep-deleted',
+      'take-theirs',
+      'take-ours',
+      'regenerate',
+    ]) {
       const pattern = new RegExp(
         `${verb}:\\*\\)\\s*\\w+\\+=\\("\\$\\(trim "\\$\\{line#${verb}:\\}"\\)"\\)`,
       )

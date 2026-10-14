@@ -3,6 +3,7 @@
 #
 # keep-deleted: files removed in this fork that upstream might re-introduce
 # take-theirs: pure checkout — upstream's version is always preferred as-is
+# take-ours:   pure checkout — this fork's differential version is preferred as-is
 # regenerate:  checkout upstream's version, run the rebuild command for THAT
 #              FILE'S ecosystem, then stage the result INTO the merge commit
 #              (never a follow-up commit)
@@ -22,6 +23,9 @@ keep-deleted: .github/dependabot.yml
 keep-deleted: scripts/release.sh
 keep-deleted: scripts/version-sync.mjs
 keep-deleted: scripts/wait-release.sh
+
+# Documentation: thin differential documentation maintained by this fork
+take-ours: README.md
 
 # Lockfile. `take-theirs` alone is wrong here: upstream's lockfile does not
 # describe this fork's devDependency set (@earendil-works/*, lefthook, our

@@ -37,6 +37,7 @@ fi
 # --- parse the exclusion manifest ---------------------------------------------
 KEEP_DELETED=()
 TAKE_THEIRS=()
+TAKE_OURS=()
 REGENERATE=()
 
 # trim <string> — strip surrounding whitespace. Manifest values are used both as
@@ -57,6 +58,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in
     keep-deleted:*) KEEP_DELETED+=("$(trim "${line#keep-deleted:}")") ;;
     take-theirs:*)  TAKE_THEIRS+=("$(trim "${line#take-theirs:}")") ;;
+    take-ours:*)    TAKE_OURS+=("$(trim "${line#take-ours:}")") ;;
     regenerate:*)   REGENERATE+=("$(trim "${line#regenerate:}")") ;;
     *) echo "warning: unrecognized manifest line: $line" >&2 ;;
   esac
@@ -204,6 +206,12 @@ else
 
     if matches_any "$conflict_file" ${TAKE_THEIRS[@]+"${TAKE_THEIRS[@]}"}; then
       git -C "$ROOT" checkout --theirs -- "$conflict_file"
+      git -C "$ROOT" add -- "$conflict_file"
+      continue
+    fi
+
+    if matches_any "$conflict_file" ${TAKE_OURS[@]+"${TAKE_OURS[@]}"}; then
+      git -C "$ROOT" checkout --ours -- "$conflict_file"
       git -C "$ROOT" add -- "$conflict_file"
       continue
     fi
