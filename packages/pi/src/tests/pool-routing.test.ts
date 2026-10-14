@@ -36,7 +36,7 @@ import {
   getPiStickyRouting,
   setPiStickyRouting,
 } from '../routing.ts'
-import { PiOpenAIRuntime } from '../runtime.ts'
+import { FIRST_READING_WAIT_MS, PiOpenAIRuntime } from '../runtime.ts'
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -166,7 +166,9 @@ async function setMode(mode: RoutingMode): Promise<void> {
   }, paths)
 }
 
-function makeRuntime(firstReadingWaitMs = 2_000): PiOpenAIRuntime {
+function makeRuntime(
+  firstReadingWaitMs = FIRST_READING_WAIT_MS,
+): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
     createStream: createAssistantMessageEventStream,
@@ -463,6 +465,35 @@ describe('Pi requests on the account pool', () => {
     const served = await send(runtime)
     expect(served[0]?.type).toBe('start')
     expect(codexTokens()).toEqual([MAIN_TOKEN])
+  })
+
+  test('the original request serves after a pending first reading without a second request', async () => {
+    const gate = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    whamHandler = async () => {
+      started.resolve()
+      await gate.promise
+      return whamOk()
+    }
+    const runtime = makeRuntime()
+    await setMode('main-first')
+    try {
+      let finished = false
+      const serving = send(runtime).then((events) => {
+        finished = true
+        return events
+      })
+      await started.promise
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(finished).toBe(false)
+      expect(codexTokens()).toEqual([])
+      gate.resolve()
+      const events = await serving
+      expect(events[0]?.type).toBe('start')
+      expect(codexTokens()).toEqual([MAIN_TOKEN])
+    } finally {
+      gate.resolve()
+    }
   })
 
   test('every account gets a quota check as soon as it is seen, before any request', async () => {

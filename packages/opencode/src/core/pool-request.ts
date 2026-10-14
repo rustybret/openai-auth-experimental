@@ -39,10 +39,8 @@ import {
   type AccountStorage,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
-  isKillswitchEnabled,
   isShieldedMainRow,
   isTombstoned,
-  killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
@@ -58,11 +56,13 @@ import {
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyAdmission,
   type StickyRouteOptions,
   selectStickyRow,
   stickyBreak,
+  waitForFirstQuotaReading,
 } from './pool-routing'
 
 /** One sticky pin decision handed to the caller's pin ledger. */
@@ -132,7 +132,7 @@ export interface PoolVaultRoutes {
     dispatch: (token: string, attempt: QuotaReceipt) => Promise<Response>,
   ): Promise<Response | undefined>
   /** Asks for a quota reading of a vault account admission refused for want of one. */
-  requestReading(id: string): void
+  requestReading: PoolRoutingInput['requestPull']
   /**
    * Vault account id to the time (ms) until which that account counts as
    * rate-limited, from rate-limit signals a WebSocket stream received
@@ -299,20 +299,7 @@ function routingInput(
   targets: readonly PoolTarget[],
 ): PoolRoutingInput {
   const now = ctx.now()
-  const killswitch = new Map<string, boolean>()
-  if (isKillswitchEnabled(ctx.storage)) {
-    for (const target of targets) {
-      killswitch.set(
-        target.id,
-        killswitchPassesPolicy(
-          windowsFromQuotaMap(target.quota),
-          ctx.storage,
-          target.id === FORMER_MAIN_ID ? undefined : target.id,
-          now,
-        ),
-      )
-    }
-  }
+  const killswitch = poolKillswitchVerdicts(targets, ctx.storage, now)
   const routingRows: RoutingRow[] = targets.map((target) => ({
     id: target.id,
     kind: target.kind,
@@ -387,7 +374,18 @@ export async function servePoolRequest(
     await ctx.source.current()
     await ctx.source.prepareTokens(ctx.source.peek().rows, ctx.storage)
   }
-  const rows = currentTargets(ctx)
+  let rows = currentTargets(ctx)
+  const firstReadingRows =
+    ctx.replayable === false && rows.some((row) => row.id === FORMER_MAIN_ID)
+      ? rows.filter((row) => row.id === FORMER_MAIN_ID)
+      : rows
+  const firstReading = waitForFirstQuotaReading(
+    routingInput(ctx, firstReadingRows),
+  )
+  if (firstReading) {
+    await firstReading
+    rows = currentTargets(ctx)
+  }
 
   if (
     ctx.mode === 'sticky-balanced' &&

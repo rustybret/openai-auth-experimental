@@ -53,9 +53,11 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import {
+  FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
   type PoolBlock,
+  type PoolRoutingInput,
 } from '@cortexkit/openai-auth-core/pool-routing'
 import type {
   Api,
@@ -83,12 +85,9 @@ import {
 } from './vault-slot.ts'
 
 /**
- * How long a request refused for want of a quota reading waits for the first
- * quota poll of Pi's login (row `main`), which is already under way, before
- * routing once more. The poll is one HTTP call (no store lock); without this
- * wait the first request of every Pi process could be refused.
+ * The shared admission budget for an account's missing first usage reading.
  */
-export const FIRST_READING_WAIT_MS = 5_000
+export const FIRST_READING_WAIT_MS = FIRST_QUOTA_READING_WAIT_MS
 
 /** Longest a request waits for a lock-free re-read of the account settings. */
 const STORAGE_READ_BUDGET_MS = 500
@@ -504,10 +503,10 @@ export class PiOpenAIRuntime {
     return this.pool.peek().rows.find((row) => row.id === id)
   }
 
-  private requestPull(id: string): void {
-    if (id === FORMER_MAIN_ID) this.main.requestReading()
-    else if (this.vault.owns(id)) this.vault.requestReading(id)
-    else this.pool.requestReading(id)
+  private requestPull(id: string): ReturnType<PoolRoutingInput['requestPull']> {
+    if (id === FORMER_MAIN_ID) return this.main.requestReading()
+    if (this.vault.owns(id)) return this.vault.requestReading(id)
+    return this.pool.requestReading(id)
   }
 
   private rememberVaultToken(
@@ -668,7 +667,7 @@ export class PiOpenAIRuntime {
       // used. Before the vault's first account list there is nothing to
       // route, so that is waited for, for a bounded time.
       await settleWithinBudget(
-        this.vault.firstRoster().then(() => true),
+        this.vault.awaitRequestRoster().then(() => true),
         VAULT_REQUEST_ROSTER_WAIT_MS,
         () => false,
       )
@@ -702,6 +701,8 @@ export class PiOpenAIRuntime {
               .filter((row): row is PoolRow => row !== undefined),
           ),
         requestPull: (id) => this.requestPull(id),
+        firstReadingWaitMs:
+          this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
         send: (account) =>
           account.vault
             ? this.vaultAttempt(model, context, options, account.id).then(
@@ -715,22 +716,7 @@ export class PiOpenAIRuntime {
               : Promise.resolve(undefined),
         placePin: placePiStickyPin,
       })
-    let result = await run()
-    if (
-      result.kind === 'blocked' &&
-      result.block.reason === 'quota-unknown' &&
-      !vaultMode
-    ) {
-      const pending = this.main.pending()
-      if (pending) {
-        await settleWithinBudget(
-          pending.then(() => true),
-          this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
-          () => false,
-        )
-        result = await run()
-      }
-    }
+    const result = await run()
     if (result.kind === 'blocked') {
       // Vault mode never falls back to a local account: a request no vault
       // account could take is refused with a fixed text naming the cause.

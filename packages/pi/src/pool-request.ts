@@ -30,11 +30,10 @@ import {
   type AccountStorage,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
-  isKillswitchEnabled,
   isTombstoned,
-  killswitchPassesPolicy,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  type StickyPinPlacement,
 } from '@cortexkit/openai-auth-core/internal'
 
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
@@ -45,13 +44,14 @@ import {
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyAdmission,
   type StickyRouteOptions,
   selectStickyRow,
   stickyBreak,
+  waitForFirstQuotaReading,
 } from '@cortexkit/openai-auth-core/pool-routing'
-import type { PiPinPlacement } from './routing.ts'
 
 /** One account a request may be sent with. */
 export interface RouteAccount {
@@ -91,14 +91,16 @@ export interface PiRouteContext<A extends RouteAttempt> {
   /** Account id to the time it may be tried again, for accounts that must sit out. */
   refreshBackoff: (accounts: readonly RouteAccount[]) => Map<string, number>
   /** Asks for a quota poll of an account admission refused for want of a reading. */
-  requestPull: (id: string) => void
+  requestPull: PoolRoutingInput['requestPull']
+  /** Optional override for tests or callers with their own first-reading wait budget. */
+  firstReadingWaitMs?: number
   /**
    * Sends the request with one account. Undefined when nothing was sent: the
    * vault refused to serve a vault account.
    */
   send(account: RouteAccount): Promise<A | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
-  placePin(input: PiPinPlacement): { accountId: string } | undefined
+  placePin(input: StickyPinPlacement): { accountId: string } | undefined
   log?: { debug(message: string, meta?: Record<string, unknown>): void }
 }
 
@@ -153,20 +155,7 @@ function routingInput<A extends RouteAttempt>(
   accounts: readonly RouteAccount[],
 ): PoolRoutingInput {
   const now = ctx.now()
-  const killswitch = new Map<string, boolean>()
-  if (isKillswitchEnabled(ctx.storage)) {
-    for (const account of accounts) {
-      killswitch.set(
-        account.id,
-        killswitchPassesPolicy(
-          windowsFromQuotaMap(account.quota),
-          ctx.storage,
-          account.id === FORMER_MAIN_ID ? undefined : account.id,
-          now,
-        ),
-      )
-    }
-  }
+  const killswitch = poolKillswitchVerdicts(accounts, ctx.storage, now)
   const rows: RoutingRow[] = accounts.map((account) => ({
     id: account.id,
     kind: account.kind ?? 'oauth',
@@ -186,7 +175,15 @@ function routingInput<A extends RouteAttempt>(
 export async function routePiRequest<A extends RouteAttempt>(
   ctx: PiRouteContext<A>,
 ): Promise<PiRouteResult<A>> {
-  const accounts = ctx.accounts()
+  let accounts = ctx.accounts()
+  const firstReading = waitForFirstQuotaReading(
+    routingInput(ctx, accounts),
+    ctx.firstReadingWaitMs,
+  )
+  if (firstReading) {
+    await firstReading
+    accounts = ctx.accounts()
+  }
   if (ctx.mode === 'sticky-balanced' && ctx.sessionId) {
     const sticky = await routeSticky(ctx, accounts, ctx.sessionId)
     if (sticky) return sticky

@@ -45,6 +45,12 @@ import {
   type StickyRoute,
   type StickySelection,
 } from '@cortexkit/common-auth/routing'
+import {
+  type AccountStorage,
+  isKillswitchEnabled,
+  killswitchPassesPolicy,
+} from './accounts'
+import { windowsFromQuotaMap } from './pool-quota'
 
 /**
  * The main account's row: on OpenCode the row the migration moved the main
@@ -54,11 +60,43 @@ import {
 export const FORMER_MAIN_ID = 'main'
 
 /**
+ * Per-account verdicts for the killswitch: the opt-in minimum share of quota
+ * that must remain before an account is used. OpenCode and Pi both route with it.
+ */
+export function poolKillswitchVerdicts(
+  accounts: readonly { id: string; quota?: unknown }[],
+  storage: AccountStorage | null,
+  now: number,
+): Map<string, boolean> {
+  const verdicts = new Map<string, boolean>()
+  if (isKillswitchEnabled(storage)) {
+    for (const account of accounts) {
+      verdicts.set(
+        account.id,
+        killswitchPassesPolicy(
+          windowsFromQuotaMap(account.quota),
+          storage,
+          account.id === FORMER_MAIN_ID ? undefined : account.id,
+          now,
+        ),
+      )
+    }
+  }
+  return verdicts
+}
+
+/**
  * Retry-After for a request refused because no account has a quota reading
  * yet. The refusal itself asked for the readings, and a poll takes about a
  * second, so the client is told to come back shortly.
  */
 export const POOL_QUOTA_UNKNOWN_RETRY_SECONDS = 5
+
+/**
+ * A first usage reading is one HTTP call and can take several seconds under
+ * load. A short wait beats refusing the user's first request.
+ */
+export const FIRST_QUOTA_READING_WAIT_MS = 5_000
 
 /**
  * Where an ordered routing mode puts the main row: `ordered` (the shared
@@ -73,6 +111,11 @@ export function orderedPlacement(
   return mode === 'fallback-first' ? 'fallback-first' : 'main-first'
 }
 
+/** Existing callbacks may return a promise for an in-progress quota poll. */
+export type QuotaReadingRequest =
+  | ((id: string) => void)
+  | ((id: string) => Promise<unknown> | undefined)
+
 export interface PoolRoutingInput {
   /** OAuth rows openai-auth can send with, in roster order. */
   rows: readonly RoutingRow[]
@@ -86,7 +129,56 @@ export interface PoolRoutingInput {
    */
   killswitch: ReadonlyMap<string, boolean>
   /** Asks for a quota poll of a row admission refused for want of a reading. */
-  requestPull: (id: string) => void
+  requestPull: QuotaReadingRequest
+}
+
+/**
+ * Gives an otherwise eligible account's first quota poll a bounded startup
+ * budget. Callers must reread their source after the wait: completing a poll
+ * is not proof that it produced usable quota.
+ * Present readings, including stale ones, stay on the normal admission path.
+ */
+export function waitForFirstQuotaReading(
+  input: PoolRoutingInput,
+  waitMs = FIRST_QUOTA_READING_WAIT_MS,
+): Promise<void> | undefined {
+  const rows = input.rows.filter(
+    (row) =>
+      row.kind === 'oauth' &&
+      input.killswitch.get(row.id) !== false &&
+      projectQuota(row.quota).limits.length === 0,
+  )
+  if (rows.length === 0) return undefined
+  const current = admit({
+    rows: input.rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: () => {},
+  })
+  if (current.admitted.some((row) => input.killswitch.get(row.id) !== false))
+    return undefined
+  const pulls: Promise<unknown>[] = []
+  admit({
+    rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: (id) => {
+      const pending = input.requestPull(id)
+      if (pending) pulls.push(pending.catch(() => {}))
+    },
+  })
+  if (pulls.length === 0) return undefined
+  let timer: ReturnType<typeof setTimeout>
+  return Promise.race([
+    Promise.all(pulls),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, waitMs)
+    }),
+  ])
+    .then(() => {})
+    .finally(() => clearTimeout(timer))
 }
 
 export type PoolBlockReason =

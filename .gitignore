@@ -52,3 +52,6 @@ temp/
 /.opencode/skills/
 ucs.json
 /.ucs
+
+# Local test stdout and diagnostic traces; never publish verification data.
+.evidence/

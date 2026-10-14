@@ -31,6 +31,7 @@ import {
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PoolAccountSource } from '../core/pool-account-source'
+import { acquireOpenCodeVault } from '../core/shared-vault'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
@@ -85,6 +86,8 @@ async function start(
     /** Runs on the seeded files before setup. */
     prepare?: (files: PoolFiles) => void
     fetch?: typeof fetch
+    /** Leave the first quota poll pending so the request path must await it. */
+    waitForQuota?: boolean
     /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
     poolMigration?: boolean
   } = {},
@@ -99,7 +102,7 @@ async function start(
   // An approved enrollment, as Connect leaves it.
   const stateDir = join(files.dir, 'vault')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  const { tokenPath, rosterPath } = vaultPaths(stateDir, 'opencode')
+  const { tokenPath } = vaultPaths(stateDir, 'opencode')
   writeFileSync(
     tokenPath,
     JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
@@ -130,21 +133,28 @@ async function start(
   const routable = Object.keys(credentials).filter(
     (id) => credentials[id]?.type !== 'api_key',
   )
-  await waitFor(() => {
-    try {
-      const roster = JSON.parse(readFileSync(rosterPath, 'utf8')) as {
-        rows: Array<{ credentialId: string; quota?: unknown }>
-      }
-      return routable.every((id) =>
-        roster.rows.some((row) => row.credentialId === id && row.quota),
-      )
-    } catch {
-      return false
-    }
-  }, 'the vault accounts and their quota')
-  // The vault writes the quota reading to the roster file, then loads the
-  // file back into memory; routing sees the reading once that load is done.
-  await Bun.sleep(100)
+  // OpenAiVault publishes quota to disk before reloading its live roster.
+  // Wait for that roster to contain the reading instead of sleeping a fixed time.
+  const observer = acquireOpenCodeVault(
+    {
+      host: 'opencode',
+      stateDir,
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    },
+    files.paths(),
+  )
+  try {
+    if (options.waitForQuota !== false)
+      await waitFor(() => {
+        const rows = observer.vault.snapshot()?.rows ?? []
+        return routable.every((id) =>
+          rows.some((row) => row.credentialId === id && row.quota),
+        )
+      }, 'the live vault accounts and their quota')
+  } finally {
+    observer.release()
+  }
   return { host, daemon, files, tokenPath }
 }
 
@@ -233,6 +243,55 @@ async function send(host: Host, status: number) {
 }
 
 describe('vault accounts on OpenCode 2', () => {
+  it('the original request joins a pending first vault quota poll and serves without a retry', async () => {
+    const started = Promise.withResolvers<void>()
+    const gate = Promise.withResolvers<void>()
+    let polls = 0
+    const { host } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 7,
+        }),
+      },
+      {
+        waitForQuota: false,
+        fetch: (async (...args: Parameters<typeof fetch>) => {
+          polls++
+          started.resolve()
+          await gate.promise
+          return usageOnly(...args)
+        }) as typeof fetch,
+      },
+    )
+    try {
+      await started.promise
+      let finished = false
+      const serving = send(host, 200).then(
+        (headers) => {
+          finished = true
+          return { headers }
+        },
+        (error: unknown) => {
+          finished = true
+          return { error }
+        },
+      )
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(finished).toBe(false)
+      gate.resolve()
+      const result = await serving
+      expect('headers' in result).toBe(true)
+      if ('headers' in result) {
+        expect(result.headers.get('chatgpt-account-id')).toBe('chatgpt-vault')
+      }
+      expect(polls).toBe(1)
+    } finally {
+      gate.resolve()
+    }
+  })
+
   it('sends with the token the vault serves, and reports a 401 against that send record version only', async () => {
     const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
       'oauth:openai:vault': vaultLogin('chatgpt-vault', {
