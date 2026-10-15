@@ -77,13 +77,21 @@ printf "  GitHub Repository: %s\n" "$GITHUB_REPO"
 printf "  Submit to Gateway: %s\n" "$([ "$SUBMIT" -eq 1 ] && echo "YES" || echo "NO (pass --submit to submit)")"
 printf "=====================================================================\n"
 
-# Locate release envelopes (supporting both direct release.json and releases/*.json)
-ENVELOPES=$(find "$DIST_DIR" -name "release.json" 2>/dev/null | sort -u)
-if [ -z "$ENVELOPES" ]; then
-  ENVELOPES=$(find "$DIST_DIR" -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
+# Locate release envelopes from pack staging (dist-arcus) or dist fallback
+STAGING_DIR="${REPO_ROOT}/dist-arcus"
+if [ -d "$STAGING_DIR" ]; then
+  ENVELOPES=$(find "$STAGING_DIR" -name "release.json" 2>/dev/null | sort -u)
+  if [ -z "$ENVELOPES" ]; then
+    ENVELOPES=$(find "$STAGING_DIR" -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
+  fi
+else
+  ENVELOPES=$(find "$DIST_DIR" -name "release.json" 2>/dev/null | sort -u)
+  if [ -z "$ENVELOPES" ]; then
+    ENVELOPES=$(find "$DIST_DIR" -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
+  fi
 fi
 if [ -z "$ENVELOPES" ]; then
-  printf "error: no release envelopes found under %s\n" "$DIST_DIR" >&2
+  printf "error: no release envelopes found under %s or %s\n" "$STAGING_DIR" "$DIST_DIR" >&2
   exit 1
 fi
 
@@ -120,14 +128,15 @@ for env_file in $ENVELOPES; do
     CONFIG_FILE="${REPO_ROOT}/packages/arcus/arcus.json"
   fi
 
+  BUNDLE_DIR="${DIST_DIR}/${pkg_seq}/${comp_name}/${pkg_ver}"
   PUBLISH_CMD="sh \"$PUBLISHER_SCRIPT\" \
     --v3 \"$env_file\" \
     --package-id \"$comp_name\" \
-    --version "$pkg_ver" \
-    --release-id "$pkg_rel_id" \
+    --version \"$pkg_ver\" \
+    --release-id \"$pkg_rel_id\" \
     --output \"$comp_dir\" \
     --dist-dir \"$DIST_DIR\" \
-    --bundle-dir \"$comp_dir\" \
+    --bundle-dir \"$BUNDLE_DIR\" \
     --github-repo \"$GITHUB_REPO\" \
     --tag \"$TAG\" \
     --config \"$CONFIG_FILE\" \

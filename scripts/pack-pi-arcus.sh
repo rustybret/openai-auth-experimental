@@ -41,7 +41,7 @@ if [ -z "$SEQUENCE" ]; then
   SEQUENCE=$(arcus manifest allocate-sequence --gateway https://arcus-auth.rustybret.com --package-id pi-openai-auth --json 2>/dev/null | jq -r '.sequence' 2>/dev/null || echo "1")
 fi
 
-OUTPUT_DIR="${REPO_ROOT}/dist/${SEQUENCE}/pi-openai-auth/${VERSION}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/dist-arcus/pi-openai-auth}"
 
 if [ "$NO_CLEAN" -eq 0 ] && [ -d "$OUTPUT_DIR" ]; then
   rm -rf "$OUTPUT_DIR"
