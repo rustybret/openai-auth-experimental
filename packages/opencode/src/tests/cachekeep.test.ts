@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import './setup-env.ts'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
 import { getConfigPath } from '../config'
 import {

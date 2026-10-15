@@ -56,7 +56,6 @@ import {
   resolveSessionSidebarRouting,
   setSidebarState,
 } from '../sidebar-state'
-import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import {
   HOUR,
   installWire,
@@ -70,12 +69,6 @@ import {
   type Wire,
   waitFor,
 } from './fixtures/pool-install'
-import { createRequestTestScope } from './request-test-scope.ts'
-import {
-  FLOOR_AUTH_FILE,
-  FLOOR_SIDEBAR_STATE_FILE,
-  FLOOR_STATE_FILE,
-} from './setup-env'
 
 /** The network, with the main row's quota polls reading it exhausted. */
 function wireWithExhaustedMain(): Wire {
@@ -86,6 +79,14 @@ function wireWithExhaustedMain(): Wire {
       }),
   })
 }
+
+import { createFailurePhaseClock } from './failure-phase-clock.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
+import {
+  FLOOR_AUTH_FILE,
+  FLOOR_SIDEBAR_STATE_FILE,
+  FLOOR_STATE_FILE,
+} from './setup-env'
 
 const ENROLLMENT_TOKEN = '01'.repeat(32)
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')

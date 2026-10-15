@@ -55,6 +55,8 @@ import {
   QuotaManager,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  redactCredentialError,
+  redactCredentialResponse,
   refreshAllQuota,
   refreshBackoffActive,
   resolveMidStreamRateLimitResetAt,
@@ -712,23 +714,31 @@ function cleanAbort(): never {
  * `holdsMainRefreshLock`: the caller already holds `main-refresh`, the lock a
  * settings write otherwise takes alongside the store's own.
  */
-async function writeLoaderSettings(
+async function writeLoaderSettingsLocally(
   edit: (current: AccountStorage) => void,
-  options: { holdsMainRefreshLock?: boolean } = {},
+  options: { holdsMainRefreshLock?: boolean; canWrite?: () => boolean } = {},
 ): Promise<void> {
   const paths = getAccountPaths(getConfigPath())
   if (poolMigrated(paths.configPath)) {
     await writeSettings(
       openAccountPool(paths),
       options.holdsMainRefreshLock ? undefined : poolSettingsLocks(paths),
-      (settings) => edit(settings as unknown as AccountStorage),
+      (settings) => {
+        if (options.canWrite && !options.canWrite())
+          throw new Error(LOCAL_CREDENTIAL_REFUSALS['vault-refused'])
+        edit(settings as unknown as AccountStorage)
+      },
     )
     return
   }
-  await mutateAccounts((current) => {
-    edit(current)
-    return current
-  }, paths)
+  await mutateAccounts(
+    (current) => {
+      edit(current)
+      return current
+    },
+    paths,
+    { canWrite: options.canWrite },
+  )
 }
 
 /** The `/openai` context the latest loader run built, for tests. */
@@ -1534,6 +1544,7 @@ export async function CodexAuthPlugin(
     getAccountPaths(getConfigPath()),
   )
   const vault = vaultLease.vault
+  await vault.authority()
   // Until the vault's first account list arrives, a local pool row signed in
   // as an account the vault holds looks like this host's own and could be
   // served or adopted twice. Login adoption and first-sight quota polls wait
@@ -1581,7 +1592,7 @@ export async function CodexAuthPlugin(
           // In vault mode neither the migration nor an adoption runs: a login
           // in the slot stays there, unused, and the local files stay as they
           // are until the host disconnects.
-          paused: () => vault.enrolled(),
+          paused: async () => (await vault.authority()) !== 'local',
           // After a migration or an adoption run the pool may hold a row this
           // process has never polled (or the install just turned migrated).
           // Re-reading it now starts those first quota polls at once, so an
@@ -1854,6 +1865,7 @@ export async function CodexAuthPlugin(
     auth: {
       provider: 'openai',
       async loader(getAuth) {
+        await vault.authority()
         loaderGetAuth = getAuth
         processHeartbeat ??= startProcessHeartbeat({
           version: PackageVersion,
@@ -1889,7 +1901,17 @@ export async function CodexAuthPlugin(
         // In vault mode (this host enrolled with the Claustrum vault) no local
         // account file is written, so the two loader-time writes below wait
         // until the host disconnects.
-        const loaderVaultMode = vault.enrolled()
+        async function writeLoaderSettings(
+          edit: (current: AccountStorage) => void,
+          options: { holdsMainRefreshLock?: boolean } = {},
+        ) {
+          if ((await vault.authority()) !== 'local') return
+          return writeLoaderSettingsLocally(edit, {
+            ...options,
+            canWrite: () => !vault.enrolled(),
+          })
+        }
+        const loaderVaultMode = (await vault.authority()) !== 'local'
 
         // Migration: seed the multi-account store from the existing token (idempotent)
         if (!slotTombstoned && !loaderVaultMode) {
@@ -1904,12 +1926,13 @@ export async function CodexAuthPlugin(
           )
         }
 
-        // Construct managers for push-only quota updates from response headers.
-        // Wrap the first boot-time read so a corrupt store surfaces a clear,
-        // actionable message instead of a raw JSON.parse SyntaxError.
+        // Use valid local settings for vault account selection and cache keep-warm.
+        // A broken local credential store must not prevent serving vault accounts
+        // or explaining how to recover an unavailable vault.
         const storage = await loadAccounts(
           getAccountPaths(getConfigPath()),
-        ).catch((err) => {
+        ).catch(async (err) => {
+          if ((await vault.authority()) !== 'local') return null
           const path = getConfigPath()
           throw new Error(
             `OpenAI auth store at ${path} is corrupt or unreadable: ${err instanceof Error ? err.message : String(err)}. Fix or remove it to continue.`,
@@ -1918,10 +1941,11 @@ export async function CodexAuthPlugin(
         })
 
         if (
-          await poolPlaceholderWithoutMain(
+          !loaderVaultMode &&
+          (await poolPlaceholderWithoutMain(
             getAccountPaths(getConfigPath()),
             auth,
-          )
+          ))
         ) {
           if (poolLifecycle) poolLifecycle.noticePlaceholderWithoutMain()
           else if (!missingPoolMainLogged) {
@@ -1950,8 +1974,8 @@ export async function CodexAuthPlugin(
         // one stat. A changed one is read without any lock (loadAccounts only
         // reads), waiting at most HOT_PATH_READ_BUDGET_MS before going ahead
         // with the last snapshot; the read then finishes in the background and
-        // serves the next request. A read that fails within the budget still
-        // fails the request, as an unreadable store always has.
+        // serves the next request. A read failure still fails local requests;
+        // vault requests can use the last settings snapshot without local files.
         async function loadRequestAccounts() {
           const path = getConfigPath()
           let stat: Stats | undefined
@@ -1969,18 +1993,24 @@ export async function CodexAuthPlugin(
             return requestStorageCache.storage
           }
           if (!stat) requestStorageCache = undefined
-          const read = loadAccounts(getAccountPaths(path)).then((next) => {
-            if (stat) {
-              requestStorageCache = {
-                path,
-                mtimeMs: stat.mtimeMs,
-                size: stat.size,
-                storage: next,
+          const read = loadAccounts(getAccountPaths(path))
+            .catch(async (error) => {
+              if ((await vault.authority()) !== 'local')
+                return lastRequestStorage
+              throw error
+            })
+            .then((next) => {
+              if (stat) {
+                requestStorageCache = {
+                  path,
+                  mtimeMs: stat.mtimeMs,
+                  size: stat.size,
+                  storage: next,
+                }
               }
-            }
-            lastRequestStorage = next
-            return next
-          })
+              lastRequestStorage = next
+              return next
+            })
           return settleWithinBudget(
             read,
             HOT_PATH_READ_BUDGET_MS,
@@ -2112,21 +2142,26 @@ export async function CodexAuthPlugin(
           vaultIdentities: () => vault.identities(),
           // In vault mode no pool row is refreshed, polled or sent with.
           vaultMode: () => vault.enrolled(),
+          vaultAuthority: () => vault.authority(),
           vaultFirstRoster,
           vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
         })
         poolAccountSource = poolSource
-        await poolSource.load()
+        if (!loaderVaultMode) await poolSource.load()
         const fallbackManager = new FallbackAccountManager({
           paths: getAccountPaths(getConfigPath()),
-          refreshFn: (opts) =>
-            codexRefreshFn({
+          refreshFn: async (opts) => {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(LOCAL_CREDENTIAL_REFUSALS['vault-refused'])
+            return codexRefreshFn({
               refreshToken: opts.refreshToken,
               fetchImpl: opts.fetchImpl,
               now: opts.now,
-            }),
+            })
+          },
           quotaManager,
+          canWrite: () => !vault.enrolled(),
           onFallbackStorageChanged: invalidateRequestStorageCache,
           // On a migrated install the roster rows are pool rows, which the
           // pool source refreshes; this background refresh must not. In vault
@@ -2235,6 +2270,8 @@ export async function CodexAuthPlugin(
         }) {
           let lastError: unknown
           for (let attempt = 1; attempt <= AUTH_SET_MAX_ATTEMPTS; attempt++) {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(LOCAL_CREDENTIAL_REFUSALS['vault-refused'])
             try {
               await input.client.auth.set({
                 path: { id: 'openai' },
@@ -2474,6 +2511,8 @@ export async function CodexAuthPlugin(
                   throw new Error('Codex OAuth refresh is already in progress')
                 }
 
+                if ((await vault.authority()) !== 'local')
+                  throw new Error(LOCAL_CREDENTIAL_REFUSALS['vault-refused'])
                 const tokens = await codexRefreshFn({
                   refreshToken: current.refresh,
                   fetchImpl: fetch,
@@ -2596,6 +2635,10 @@ export async function CodexAuthPlugin(
           fetchImpl: fetch,
           vault,
           getMainToken: async () => {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             // A migrated install's main account is the pool row `main`; the
             // slot is never read for it.
             if (await poolSource.active()) {
@@ -2604,6 +2647,10 @@ export async function CodexAuthPlugin(
               return access.token
             }
             const auth = await getAuth()
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             // Main lives in the pool row; the placeholder is never refreshed.
             if (isPoolMainPlaceholder(auth)) {
               return (await pooledMainTokens()).access
@@ -2621,6 +2668,10 @@ export async function CodexAuthPlugin(
             return auth.access
           },
           refreshFallback: async (accountId: string) => {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             if (await poolSource.active()) {
               // The warmed request recorded the pool row that served it.
               const access = await poolRowAccess(accountId)
@@ -2953,6 +3004,7 @@ export async function CodexAuthPlugin(
                 Date.now(),
               ),
               boundSidebarFile,
+              { canWrite: () => vault.enrolled() },
             )
             return
           }
@@ -2971,6 +3023,7 @@ export async function CodexAuthPlugin(
                     ?.resetCreditsAvailable,
               ),
               boundSidebarFile,
+              { canWrite: () => !vault.enrolled() },
             )
             return
           }
@@ -2983,6 +3036,7 @@ export async function CodexAuthPlugin(
               mainAccountIdentity,
             ),
             boundSidebarFile,
+            { canWrite: () => !vault.enrolled() },
           )
         }
 
@@ -3022,11 +3076,13 @@ export async function CodexAuthPlugin(
           route: RoutingMode,
           accounts: readonly { id: string; enabled?: boolean }[] | undefined,
           stickyState: SidebarState,
+          vaultRouting = false,
         ): void {
+          const hooks = { canWrite: () => vault.enrolled() === vaultRouting }
           const input = { activeId, route, updatedAt: Date.now() }
           if (!sessionId) {
             sidebarBookkeepingQueue.enqueue('routing:legacy', 'routing', () =>
-              setSidebarLegacyRouting(input, boundSidebarFile),
+              setSidebarLegacyRouting(input, boundSidebarFile, hooks),
             )
             return
           }
@@ -3038,6 +3094,7 @@ export async function CodexAuthPlugin(
                 { sessionId, ...input },
                 accounts,
                 boundSidebarFile,
+                hooks,
               ),
           )
           if (!parentSessionId || parentSessionId === sessionId) return
@@ -3067,6 +3124,7 @@ export async function CodexAuthPlugin(
                   },
                   accounts,
                   boundSidebarFile,
+                  hooks,
                 ),
             )
             return
@@ -3079,6 +3137,7 @@ export async function CodexAuthPlugin(
                 { sessionId: parentSessionId, ...input },
                 accounts,
                 boundSidebarFile,
+                hooks,
               ),
           )
         }
@@ -3190,6 +3249,7 @@ export async function CodexAuthPlugin(
           // account through the vault. In vault mode only the vault accounts
           // are polled.
           refreshAllQuota: async () => {
+            await vault.authority()
             if (vault.enrolled()) {
               const vaultResults = await vault.pollStale(0)
               await writeMachineSidebarState(quotaManager, lastRequestStorage)
@@ -3219,6 +3279,7 @@ export async function CodexAuthPlugin(
             return refreshAllQuota(buildRefreshAllQuotaDeps())
           },
           refreshResetTargetQuota: async (accountKey) => {
+            await vault.authority()
             if (vault.enrolled())
               return {
                 account: accountKey,
@@ -3312,6 +3373,17 @@ export async function CodexAuthPlugin(
             throw new Error(EMPTY_BEARER_MESSAGE)
           }
 
+          // Credential resolution can yield to enrollment in another process.
+          // A vault receipt identifies the credential served by the vault;
+          // without one, this bearer came from the host login or local pool.
+          if (!vaultReceipt && (await vault.authority()) !== 'local') {
+            return Response.json(
+              {
+                error: { message: LOCAL_CREDENTIAL_REFUSALS['vault-refused'] },
+              },
+              { status: 400 },
+            )
+          }
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
           headers.delete('api-key')
@@ -3404,7 +3476,17 @@ export async function CodexAuthPlugin(
                 },
               })
             }
-            if (!vaultReceipt) return websocketFetch(url, requestInit)
+            if (!vaultReceipt) {
+              try {
+                return await redactCredentialResponse(
+                  await websocketFetch(url, requestInit),
+                  accessToken,
+                  'event-stream',
+                )
+              } catch (error) {
+                throw redactCredentialError(error, accessToken)
+              }
+            }
             const key = `vault-stream:${randomUUID()}`
             vaultStreams.set(key, {
               id: keepwarmAccountKey,
@@ -3423,40 +3505,54 @@ export async function CodexAuthPlugin(
                 return response
               }
               const reader = response.body.getReader()
-              return new Response(
-                new ReadableStream<Uint8Array>({
-                  async pull(controller) {
-                    try {
-                      const chunk = await reader.read()
-                      if (chunk.done) {
+              return await redactCredentialResponse(
+                new Response(
+                  new ReadableStream<Uint8Array>({
+                    async pull(controller) {
+                      try {
+                        const chunk = await reader.read()
+                        if (chunk.done) {
+                          release()
+                          controller.close()
+                        } else controller.enqueue(chunk.value)
+                      } catch (error) {
                         release()
-                        controller.close()
-                      } else controller.enqueue(chunk.value)
-                    } catch (error) {
+                        controller.error(
+                          redactCredentialError(error, accessToken),
+                        )
+                      }
+                    },
+                    cancel(reason) {
                       release()
-                      controller.error(error)
-                    }
+                      return reader.cancel(reason)
+                    },
+                  }),
+                  {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
                   },
-                  cancel(reason) {
-                    release()
-                    return reader.cancel(reason)
-                  },
-                }),
-                {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                },
+                ),
+                accessToken,
+                'event-stream',
               )
             } catch (error) {
               release()
-              throw error
+              throw redactCredentialError(error, accessToken)
             }
           }
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
           if (typeof finalInit?.body !== 'string') {
-            return fetch(url, finalInit)
+            try {
+              return await redactCredentialResponse(
+                await fetch(url, finalInit),
+                accessToken,
+                'event-stream',
+              )
+            } catch (error) {
+              throw redactCredentialError(error, accessToken)
+            }
           }
 
           // Keepwarm capture: track every request body for idle
@@ -3493,7 +3589,11 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return response
+            return await redactCredentialResponse(
+              response,
+              accessToken,
+              'event-stream',
+            )
           } catch (error) {
             await dumpCodexRequest({
               sessionID,
@@ -3506,7 +3606,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               error: error instanceof Error ? error.message : String(error),
             })
-            throw error
+            throw redactCredentialError(error, accessToken)
           }
         }
 
@@ -4286,7 +4386,7 @@ export async function CodexAuthPlugin(
               // stop routing: the failed send may already have generated or
               // billed, so trying another account could duplicate the request.
               if (
-                error instanceof DOMException &&
+                (error instanceof Error || error instanceof DOMException) &&
                 error.name === 'AbortError'
               ) {
                 throw error
@@ -4361,7 +4461,7 @@ export async function CodexAuthPlugin(
               )
             } catch (error) {
               if (
-                error instanceof DOMException &&
+                (error instanceof Error || error instanceof DOMException) &&
                 error.name === 'AbortError'
               ) {
                 throw error
@@ -4450,6 +4550,7 @@ export async function CodexAuthPlugin(
 
         backgroundQuotaRefresh.start(
           async () => {
+            await vault.authority()
             // Vault mode polls no local account. The vault's own accounts are
             // polled by the shared vault consumer; the sidebar is rewritten
             // so it shows their latest quota.
@@ -4645,7 +4746,8 @@ export async function CodexAuthPlugin(
                   : quotaManager.peekFallbackForPolicy(id)?.quota,
               ),
             isAbort: (error) =>
-              (error instanceof DOMException && error.name === 'AbortError') ||
+              ((error instanceof Error || error instanceof DOMException) &&
+                error.name === 'AbortError') ||
               Boolean(
                 (init?.signal as AbortSignal | undefined | null)?.aborted,
               ),
@@ -4662,6 +4764,7 @@ export async function CodexAuthPlugin(
               ? vault.routes().map((route) => ({ id: route.id }))
               : reqStorage?.accounts,
             applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+            vaultMode,
           )
           return response
         }
@@ -4674,28 +4777,7 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            // Guard: only intercept requests destined for OpenAI or the
-            // configured Codex endpoint. Any other host (Google, Anthropic,
-            // OpenCode provider proxies, etc.) must pass through untouched so
-            // we don't strip their auth headers or inject a Codex token.
-            const reqUrl =
-              requestInput instanceof URL
-                ? requestInput
-                : new URL(
-                    typeof requestInput === 'string'
-                      ? requestInput
-                      : requestInput.url,
-                  )
-            const codexHost = new URL(codexApiEndpoint).hostname
-            const openaiHosts = new Set([
-              'api.openai.com',
-              'chatgpt.com',
-              codexHost,
-            ])
-            if (!openaiHosts.has(reqUrl.hostname)) {
-              return fetch(requestInput, init)
-            }
-
+            const authority = await vault.authority()
             const requestHeaders = effectiveRequestHeaders(requestInput, init)
             const sidebarSessionId = resolveSidebarSessionId(requestHeaders)
             const sidebarParentSessionId =
@@ -4709,7 +4791,7 @@ export async function CodexAuthPlugin(
             // and any legacy fallback are not read for routing, refreshed or
             // sent with, whether or not the install has migrated; a request
             // no vault account can serve is refused locally.
-            if (vault.enrolled()) {
+            if (authority !== 'local') {
               init = await materializeRequestInit(requestInput, init)
               return servePooled(
                 requestInput,
@@ -4728,6 +4810,17 @@ export async function CodexAuthPlugin(
               refresh?: string
               expires?: number
             } = await getAuth()
+            if ((await vault.authority()) !== 'local') {
+              init = await materializeRequestInit(requestInput, init)
+              return servePooled(
+                requestInput,
+                init,
+                reqStorage,
+                sidebarSessionId,
+                sidebarParentSessionId,
+                ++mainIdentityGeneration,
+              )
+            }
             const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') {
               requestHeaders.delete(OPENAI_AGENT_HEADER)

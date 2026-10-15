@@ -91,3 +91,9 @@ This repository follows UC Studio fleet fork discipline:
 - Downstream release builds on a shared version increment the monotonic Arcus `sequence`.
 - Upstream merges are executed via `bun run fork-sync` with exclusions maintained in `scripts/fork-sync-exclusions`.
 - Root `README.md` is governed by `take-ours` to preserve this differential specification across upstream merges.
+
+---
+
+## ⚠️ Migration & Downgrade Notice
+
+Downgrading after the account-pool migration is unsupported. The migration replaces OpenCode's login with an OAuth placeholder whose access token is empty; a pre-1.0 build that does not understand the placeholder would send an empty bearer instead of reading the account pool. Keep the pool-aware build, or sign in afresh in a separate store before using an older build.

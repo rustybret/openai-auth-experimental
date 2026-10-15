@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'bun:test'
-
 import {
   isCompleteQuotaHeaderFrame,
   normalizeQuotaHeaders,
@@ -89,6 +88,11 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary?.windowMinutes).toBe(10_080)
   })
 
+  // Regression: the real codex.rate_limits frame carries additional_rate_limits
+  // as an OBJECT keyed by model name (nested primary/secondary buckets), not the
+  // flat array the original code assumed. for..of over it threw "{} is not
+  // iterable" and tore down the WS frame loop. We ignore those per-model windows
+  // (nothing consumes them) and must never crash on the real shape.
   it('WS frame: real object-shaped additional_rate_limits does not crash and is ignored', () => {
     const s = normalizeWsFrame({
       type: 'codex.rate_limits',
@@ -126,6 +130,7 @@ describe('quota normalize → QuotaSnapshot', () => {
           },
         },
       },
+      // The empty-object form that actually triggered the crash in the field.
     } as unknown as Parameters<typeof normalizeWsFrame>[0])
     expect(s.primary?.usedPercent).toBe(17)
     expect(s.primary?.remainingPercent).toBe(83)

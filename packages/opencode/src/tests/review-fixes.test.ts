@@ -1400,6 +1400,9 @@ describe('#12 NaN used_percent → no quota window', () => {
       '@cortexkit/openai-auth-core/internal'
     )
 
+    // The real wire frame keys additional_rate_limits by model name with nested
+    // primary/secondary buckets — not a flat metered array. It is not consumed,
+    // and iterating it with for..of previously threw "{} is not iterable".
     const snap = normalizeWsFrame({
       type: 'codex.rate_limits',
       rate_limits: {
