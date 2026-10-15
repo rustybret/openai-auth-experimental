@@ -55,7 +55,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   bun run --cwd "${REPO_ROOT}/packages/opencode" build
 fi
 
-RELEASE_ID="opencode-openai-auth-${VERSION}-${SEQUENCE}"
+RELEASE_ID="opencode-openai-auth-${VERSION}"
 
 printf "pack-opencode-arcus: packing opencode-openai-auth %s (seq: %s) -> %s\n" "$VERSION" "$SEQUENCE" "$OUTPUT_DIR"
 

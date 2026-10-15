@@ -78,7 +78,10 @@ printf "  Submit to Gateway: %s\n" "$([ "$SUBMIT" -eq 1 ] && echo "YES" || echo 
 printf "=====================================================================\n"
 
 # Locate release envelopes (supporting both direct release.json and releases/*.json)
-ENVELOPES=$(find "$DIST_DIR" -name "release.json" -o -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
+ENVELOPES=$(find "$DIST_DIR" -name "release.json" 2>/dev/null | sort -u)
+if [ -z "$ENVELOPES" ]; then
+  ENVELOPES=$(find "$DIST_DIR" -path "*/releases/*.json" 2>/dev/null | grep -v ".index-policy.json" | sort -u)
+fi
 if [ -z "$ENVELOPES" ]; then
   printf "error: no release envelopes found under %s\n" "$DIST_DIR" >&2
   exit 1

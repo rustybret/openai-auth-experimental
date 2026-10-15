@@ -55,7 +55,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   bun run --cwd "${REPO_ROOT}/packages/pi" build
 fi
 
-RELEASE_ID="pi-openai-auth-${VERSION}-${SEQUENCE}"
+RELEASE_ID="pi-openai-auth-${VERSION}"
 
 printf "pack-pi-arcus: staging clean payload...\n"
 TMP_STAGING=$(mktemp -d "${TMPDIR:-/tmp}/pi-pack.XXXXXX")
@@ -75,7 +75,7 @@ printf "pack-pi-arcus: packing pi-openai-auth %s (seq: %s) -> %s\n" "$VERSION" "
 set -- \
   --config "${REPO_ROOT}/packages/arcus/pi-openai-auth.json" \
   --version "$VERSION" \
-  --release-id "pi-openai-auth-${VERSION}-${SEQUENCE}" \
+  --release-id "$RELEASE_ID" \
   --sequence "$SEQUENCE" \
   --output "$OUTPUT_DIR" \
   --offline
