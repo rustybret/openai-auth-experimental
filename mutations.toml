@@ -4666,3 +4666,321 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-r
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sreset\scredits\sin\svault\smode\sReset\scredits\sshows\sthe\svault\snote,\sand\severy\saction\sis\srefused\swithout\sreading\sa\scredential$']
+
+[[control]]
+id = "opencode2-frame-turn-tool-delta-keeps-turn"
+guards = "a chained WebSocket frame whose delta holds no user message (tool outputs) keeps the frame turn, so a tool loop keeps one turn id"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+      startsTurn = users.length > 0
+"""
+new = """
+      startsTurn = true // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\skeeps\sthe\sturn\sfor\sa\stool-output\sdelta,\scompleted\sor\snot$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-chained-user-starts-turn"
+guards = "a chained WebSocket frame whose delta holds a user message starts a new frame turn, even when the message repeats the previous one"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+      startsTurn = users.length > 0
+"""
+new = """
+      startsTurn = false // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\sstarts\sa\sturn\sfor\seach\sof\stwo\sconsecutive\sidentical\suser\smessages$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-resend-needs-uncompleted"
+guards = "a full WebSocket frame counts as a resend (same turn) only when the previous frame got no response.completed"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+        !prior.completed &&
+"""
+new = """
+        // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\sstarts\sa\sturn\sfor\sthe\ssame\sfull\sframe\sonce\sthe\sprevious\sone\scompleted$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-resend-needs-same-fingerprint"
+guards = "a full WebSocket frame counts as a resend only when its last user message has the recorded fingerprint"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+        prior.fingerprint === fingerprint &&
+"""
+new = """
+        // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\sstarts\sa\sturn\sfor\sa\sfull\sframe\swhose\slast\suser\smessage\sdiffers\safter\san\suncompleted\ssend$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-resend-needs-same-count"
+guards = "a full WebSocket frame counts as a resend only when its user-message count equals the recorded count, so a second identical user message starts a turn"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+        prior.userCount === userCount
+"""
+new = """
+        true // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\sstarts\sa\sturn\sfor\sa\sfull\sframe\safter\san\suncompleted\ssend\sthat\sadds\sa\ssecond\sidentical\suser\smessage$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-full-tool-output-keeps-turn"
+guards = "a full WebSocket frame (new socket) that ends on tool or model output keeps the frame turn"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+        lastUser >= 0 && lastUser > input.findLastIndex(isModelOrToolItem)
+"""
+new = """
+        lastUser >= 0 // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\skeeps\sthe\sturn\sfor\sa\sfull\sframe\son\sa\snew\ssocket\sthat\sends\son\stool\soutput$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-state-holds-no-text"
+guards = "the per-session frame turn state stays fixed-size and holds no message text, whatever the size of the last user message"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+  return createHash('sha256').update(JSON.stringify(item)).digest('hex')
+"""
+new = """
+  return JSON.stringify(item) // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\srule\skeeps\sa\sfixed-size\sstate\swith\sno\smessage\stext\sfor\sa\smulti-megabyte\suser\smessage$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-separate-from-http-turn"
+guards = "a WebSocket frame is shaped with the frame turn, never the HTTP turn that title and compaction requests move"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+    turnID: turn.turnID,
+"""
+new = """
+    turnID: session.turnID, // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\sand\sHTTP\sturn\sstate\sare\sseparate\san\sHTTP\stitle\sand\san\sHTTP\scompaction\sbetween\sframes\sleave\sthe\sframe\sturn\suntouched$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-shaping-never-writes-http-turn"
+guards = "shaping a WebSocket frame never writes the session's HTTP turn state (turnID, turnStartedAt, input, canonicalInput)"
+file = "packages/opencode/src/v2/frame-turn.ts"
+old = """
+  return {
+    threadID: session.threadID,
+    windowID: session.windowID,
+    turnID: turn.turnID,
+    turnStartedAt: turn.turnStartedAt,
+  }
+"""
+new = """
+  return Object.assign(session, { // NON-VACUITY BREAK
+    threadID: session.threadID,
+    windowID: session.windowID,
+    turnID: turn.turnID,
+    turnStartedAt: turn.turnStartedAt,
+  })
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\sand\sHTTP\sturn\sstate\sare\sseparate\san\sHTTP\stitle\sand\san\sHTTP\scompaction\sbetween\sframes\sleave\sthe\sframe\sturn\suntouched$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-completion-from-ws-receive"
+guards = "a response.completed received on an owned WebSocket marks the session's last frame completed, so resending that same full frame afterwards starts a new turn instead of counting as a resend"
+file = "packages/opencode/src/v2/setup.ts"
+old = """
+                codex.frameReceived(received.sessionID, received.frame)
+"""
+new = """
+                // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\stakes\sthe\scompletion\sof\sa\sframe\sfrom\sexperimental\.ws\.receive,\sso\sonly\san\suncompleted\sfull\sframe\sis\sresent\sin\sits\sturn$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-completion-needs-completed-type"
+guards = "only a received frame whose type is response.completed marks the session's last frame completed; other frames, even ones whose text names response.completed, leave it uncompleted"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+    if (parseObject(frame)?.type === 'response.completed')
+"""
+new = """
+    if (parseObject(frame)?.type !== undefined) // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\stakes\sthe\scompletion\sof\sa\sframe\sfrom\sexperimental\.ws\.receive,\sso\sonly\san\suncompleted\sfull\sframe\sis\sresent\sin\sits\sturn$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-rule-runs-on-sent-frames"
+guards = "every owned response.create frame the host sends runs the frame turn rule, so the session's frame turn follows its WebSocket turns"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+  effort.http.advanceFrame(scope.sessionID, body)
+"""
+new = """
+  // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\stakes\sthe\scompletion\sof\sa\sframe\sfrom\sexperimental\.ws\.receive,\sso\sonly\san\suncompleted\sfull\sframe\sis\sresent\sin\sits\sturn$', '^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\sadvances\sthe\sturn\sfor\seach\schained\suser\smessage,\sand\snever\sfor\sa\stool-output\sdelta\sor\sa\sfull\sframe\sending\son\stool\soutput$', '^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\skeeps\sthe\sturn\sfor\san\sunchanged\sfull-frame\sretry\safter\san\suncompleted\ssend\sand\sadvances\sit\sfor\sone\sadding\sa\ssecond\sidentical\suser\smessage$', '^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\skeeps\sthe\sturn\sacross\san\sHTTP\scompaction\srequest\sbetween\sa\sWebSocket\sturn\sand\sits\stool\sstep$', '^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\skeeps\sthe\sturn\sacross\san\sHTTP\sgenerate\srequest\sbetween\sa\sWebSocket\sturn\sand\sits\stool\sstep$', '^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\skeeps\sa\sfixed-size\sstate\swith\sno\smessage\stext\safter\sa\smulti-megabyte\suser\smessage,\sand\sits\sresend\srules\sstill\shold$', '''^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\sdrops\sthe\ssession's\sturn\sstate\swhen\sthe\shost\sdeletes\sthe\ssession\s\(session\sfile:\sfalse\)$''', '''^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\sdrops\sthe\ssession's\sturn\sstate\swhen\sthe\shost\sdeletes\sthe\ssession\s\(session\sfile:\strue\)$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-store-delete-drops-turn"
+guards = "a host session.deleted drops the session's frame turn state from the process-wide session store, so the next frame with that id starts a new turn"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = """
+    this.frameTurns.forget(sessionID)
+"""
+new = """
+    // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\sdrops\sthe\ssession's\sturn\sstate\swhen\sthe\shost\sdeletes\sthe\ssession\s\(session\sfile:\strue\)$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-turn-forget-drops-turn"
+guards = "a host session.deleted drops the session's frame turn state when the Codex state has no session store"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+      this.frameTurns.forget(sessionID)
+"""
+new = """
+      // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-turn.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sturn\sin\sthe\sOpenCode\s2\splugin\sdrops\sthe\ssession's\sturn\sstate\swhen\sthe\shost\sdeletes\sthe\ssession\s\(session\sfile:\sfalse\)$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+

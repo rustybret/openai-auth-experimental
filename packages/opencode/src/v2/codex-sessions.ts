@@ -27,6 +27,7 @@ import {
 } from '../codex-sessions'
 import { getConfigDir } from '../config'
 import { uuidV7 } from '../util/uuid-v7'
+import { FrameTurnState } from './frame-turn'
 
 /** OpenCode 2's file, next to OpenCode 1's `openai-auth-sessions.json`. */
 export const OPENCODE2_CODEX_SESSIONS_FILE =
@@ -54,6 +55,13 @@ export interface CodexSessionStoreOptions {
 
 export class CodexSessionStore {
   readonly sessions: Map<string, CodexSessionMetadata>
+  /**
+   * Each session's WebSocket frame turn, kept next to its Codex metadata.
+   * Every location in this process gets this same store, so they all share
+   * one frame turn per session. It lives in memory only and is never written
+   * to the session file at `path`.
+   */
+  readonly frameTurns = new FrameTurnState()
   /** Sessions this process created since its last successful save. */
   readonly #dirty = new Set<string>()
   /** Sessions this process deleted since its last successful save. */
@@ -88,6 +96,7 @@ export class CodexSessionStore {
   /** Forgets a deleted host session here and, on the next save, in the file. */
   delete(sessionID: string): void {
     this.sessions.delete(sessionID)
+    this.frameTurns.forget(sessionID)
     this.#dirty.delete(sessionID)
     this.#deleted.add(sessionID)
     void this.save()
