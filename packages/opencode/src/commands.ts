@@ -23,6 +23,7 @@ import {
   createOpenAiMenu,
   type MenuMigrationState,
   OPENAI_COMMAND_NAME,
+  type OpenAiMenuOptions,
   type OpenDialogPayload,
   type ResetTargetIdentity,
   resetCreditsSection,
@@ -53,12 +54,21 @@ const log = createLogger('commands')
 
 /** What the `/openai` menu reads and changes in this process. */
 export interface OpenCodeMenuContext {
+  readOnly?: boolean
+  allowAction?: OpenAiMenuOptions['allowAction']
+  unavailableSections?: OpenAiMenuOptions['unavailableSections']
   accountStoragePath: string
   /** Runtime-state file that goes with `accountStoragePath`. */
   accountStatePath: string
   /** Host package version, sent as the version half of the OAuth `User-Agent`. */
   packageVersion: string
-  quotaManager: QuotaManager
+  /**
+   * Each account's saved quota windows and applicable reset-credit count, and
+   * whether it is rate limited now: what the Reset credits section judges
+   * eligibility and reports a redemption with. OpenCode 2 backs it with its
+   * account pool instead of a `QuotaManager`.
+   */
+  quotaManager?: Pick<QuotaManager, 'isRateLimited' | 'getMain' | 'getFallback'>
   loadAccounts: typeof loadAccounts
   /** The pool store the accounts live in. */
   store: () => PoolStore
@@ -395,6 +405,7 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const paths = storePaths(ctx)
   const extraLocks = poolSettingsLocks(paths)
   const reset =
+    ctx.quotaManager &&
     ctx.resolveResetTarget &&
     ctx.refreshResetTargetQuota &&
     ctx.fetchImpl &&
@@ -417,6 +428,11 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const beginLogin = ctx.beginAccountLogin
   return createOpenAiMenu({
     store: ctx.store(),
+    ...(ctx.readOnly ? { readOnly: true } : {}),
+    ...(ctx.allowAction ? { allowAction: ctx.allowAction } : {}),
+    ...(ctx.unavailableSections
+      ? { unavailableSections: ctx.unavailableSections }
+      : {}),
     ...(ctx.vault ? { vault: ctx.vault } : {}),
     ...(ctx.now ? { now: ctx.now } : {}),
     extraLocks,

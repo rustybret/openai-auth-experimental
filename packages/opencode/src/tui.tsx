@@ -3,7 +3,12 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { formatQuota, quotaTextParts } from '@cortexkit/common-auth/quota'
+import {
+  formatQuota,
+  quotaTextParts,
+  quotaWindowParts,
+} from '@cortexkit/common-auth/quota'
+import type { Plugin } from '@opencode/plugin/tui'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -38,6 +43,7 @@ import {
   sidebarQuotaProjection,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
+import { setupTui, type TuiTransportOptions } from './tui/v2.js'
 import {
   type AppearancePrefs,
   computeEffectiveOrder,
@@ -95,7 +101,17 @@ const PLUGIN_VERSION: string = (() => {
 const SINGLE_BORDER = { type: 'single' } as any
 
 type Tone = 'ok' | 'warn' | 'err' | 'muted' | 'accent' | 'text'
-type ThemeCurrent = TuiPluginApi['theme']['current']
+type ThemeCurrent = Pick<
+  TuiPluginApi['theme']['current'],
+  | 'text'
+  | 'textMuted'
+  | 'accent'
+  | 'background'
+  | 'borderActive'
+  | 'success'
+  | 'warning'
+  | 'error'
+>
 type ThemeColor = ThemeCurrent['text']
 
 // Tone -> theme token. Theme tokens only — never hardcoded colors. Fallbacks
@@ -254,6 +270,7 @@ export interface QuotaDisplayRow {
   label: string
   labelWidth: number
   text: string
+  resetText?: string
   window: QuotaWindow
   pacing: QuotaPacing | null
 }
@@ -292,9 +309,7 @@ export function renderedQuotas(state: {
 }): ReadonlyArray<AccountQuota | null | undefined> {
   // In vault mode only the vault accounts are rendered.
   if (state.vaultAccounts !== undefined)
-    return state.vaultAccounts
-      .filter((account) => account.enabled)
-      .map((account) => account.quota)
+    return state.vaultAccounts.map((account) => account.quota)
   return [
     state.main?.quota ?? null,
     ...(state.fallbacks ?? [])
@@ -327,33 +342,50 @@ export function buildQuotaRowsForDisplay(
 ): QuotaDisplayRow[] {
   const projection = sidebarQuotaProjection(quota, now)
   const rows: Array<Omit<QuotaDisplayRow, 'labelWidth'>> =
-    getPresentQuotaWindows(quota).map((row) => ({
-      key: row.key,
-      label: row.label,
-      window: row.window,
-      text: formatQuota(
-        projection && {
-          ...projection,
-          budget: undefined,
-          limits: projection.limits.filter((limit) => limit.label === row.key),
-        },
-        { now, form: 'compact', staleAfterMs: Number.POSITIVE_INFINITY },
-      ),
-      pacing:
-        pacingEnabled && row.windowMs !== null
-          ? computeQuotaPacing(row.window, row.windowMs, now)
-          : null,
-    }))
+    getPresentQuotaWindows(quota).map((row) => {
+      const rowProjection = projection && {
+        ...projection,
+        budget: undefined,
+        limits: projection.limits.filter((limit) => limit.label === row.key),
+      }
+      const reset = quotaWindowParts(rowProjection, {
+        now,
+        staleAfterMs: Number.POSITIVE_INFINITY,
+      }).windows[0]
+      return {
+        key: row.key,
+        label: row.label,
+        window: row.window,
+        text: formatQuota(rowProjection, {
+          now,
+          form: 'compact',
+          staleAfterMs: Number.POSITIVE_INFINITY,
+        }),
+        resetText:
+          reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),
+        pacing:
+          pacingEnabled && row.windowMs !== null
+            ? computeQuotaPacing(row.window, row.windowMs, now)
+            : null,
+      }
+    })
   const spendControl = quota?.spendControl
   if (spendControl) {
+    const rowProjection = projection && { ...projection, limits: [] }
+    const reset = quotaWindowParts(rowProjection, {
+      now,
+      staleAfterMs: Number.POSITIVE_INFINITY,
+    }).windows[0]
     rows.push({
       key: 'spendControl',
       label: SPEND_CONTROL_LABEL,
-      text: formatQuota(projection && { ...projection, limits: [] }, {
+      text: formatQuota(rowProjection, {
         now,
         form: 'compact',
         staleAfterMs: Number.POSITIVE_INFINITY,
       }),
+      resetText:
+        reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),
       window: {
         usedPercent: spendControl.usedPercent,
         remainingPercent: spendControl.remainingPercent,
@@ -435,6 +467,7 @@ function QuotaRow(props: {
   label: string
   labelWidth: number
   text: string
+  resetText?: string
   window: { usedPercent: number; resetsAt?: string } | undefined
   pacing: QuotaPacing | null
 }) {
@@ -479,6 +512,9 @@ function QuotaRow(props: {
             {` ${props.text.slice(props.label.length + 1)}`}
           </text>
         </box>
+        <Show when={props.resetText}>
+          <text fg={props.theme.textMuted}>{props.resetText}</text>
+        </Show>
       </box>
       <Show when={paceLine()}>
         <box width='100%' flexDirection='row'>
@@ -506,6 +542,8 @@ function AccountBlock(props: {
   name: string
   quota: AccountQuota | null
   killed: boolean
+  vaultState?: string
+  hostDisabled?: boolean
   active: boolean
   pacingEnabled: boolean
   labelWidth: number
@@ -533,6 +571,12 @@ function AccountBlock(props: {
           <b>{statusWord()}</b>
         </text>
       </box>
+      <Show when={props.vaultState}>
+        <text fg={props.theme.warning}>{props.vaultState}</text>
+      </Show>
+      <Show when={props.hostDisabled}>
+        <text fg={props.theme.textMuted}>off in /openai</text>
+      </Show>
       <Show
         when={isQuotaLoaded(props.quota)}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
@@ -549,6 +593,7 @@ function AccountBlock(props: {
                 label={row.label}
                 labelWidth={row.labelWidth}
                 text={row.text}
+                resetText={row.resetText}
                 window={row.window}
                 pacing={row.pacing}
               />
@@ -629,6 +674,7 @@ interface SidebarController {
   prefs: () => OpenaiAuthTuiPrefs
   collapsed: () => boolean
   toggleCollapsed: () => void
+  dispose: () => void
 }
 
 // The TUI may unmount and remount sidebar_content when the user switches
@@ -651,14 +697,13 @@ function createSidebarController(
   let lastPersistedCollapsed: boolean | null = initialPrefs.collapsed
   let lastApplied = JSON.stringify(initialPrefs)
 
-  // The watcher lives for the plugin/process lifetime — it is intentionally
-  // never disposed. Collapse guard mirrors the race-fix in toggleCollapsed:
-  // lastPersistedCollapsed is advanced only once our own write lands, so
-  // watcher echoes of the previous persisted value are rejected by the
-  // `!==` check and cannot revert a user click.
-  watchTuiPreferences(() => {
+  let disposed = false
+  // Remember the last value written to disk, not an unpersisted click. A watcher
+  // echo of the previous disk value must not undo a click whose write is pending.
+  const unwatch = watchTuiPreferences(() => {
     void (async () => {
       const next = resolveOpenaiAuthPrefs(await readTuiPreferencesFile())
+      if (disposed) return
       const serialized = JSON.stringify(next)
       if (serialized === lastApplied) return
       lastApplied = serialized
@@ -686,11 +731,27 @@ function createSidebarController(
     }
   }
 
-  return { prefs, collapsed, toggleCollapsed }
+  return {
+    prefs,
+    collapsed,
+    toggleCollapsed,
+    dispose() {
+      disposed = true
+      unwatch()
+    },
+  }
 }
 
 function QuotaSidebar(props: {
-  api: TuiPluginApi
+  api: {
+    theme: { readonly current: ThemeCurrent }
+    event: {
+      on(
+        type: 'session.updated' | 'message.updated',
+        listener: () => void,
+      ): () => void
+    }
+  }
   controller: SidebarController
   sessionId: string
 }) {
@@ -699,10 +760,12 @@ function QuotaSidebar(props: {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
+  let disposed = false
 
   async function refresh() {
+    if (disposed) return
     const next = await readStateFromFile()
-    if (next.lastUpdated !== lastUpdated) {
+    if (!disposed && next.lastUpdated !== lastUpdated) {
       lastUpdated = next.lastUpdated
       setState(next)
     }
@@ -727,9 +790,11 @@ function QuotaSidebar(props: {
     props.api.event.on('session.updated', scheduleRefresh),
     props.api.event.on('message.updated', scheduleRefresh),
   ]
-  setTimeout(refresh, 300)
+  const initialRefresh = setTimeout(refresh, 300)
 
   onCleanup(() => {
+    disposed = true
+    clearTimeout(initialRefresh)
     if (debounce) clearTimeout(debounce)
     for (const u of unsubs) u()
   })
@@ -740,11 +805,10 @@ function QuotaSidebar(props: {
   // Vault mode: the host uses only the vault's accounts, which the file lists
   // in `vaultAccounts`; main and the local fallbacks are not shown.
   const vaultMode = () => state().vaultAccounts !== undefined
-  const enabledVaultAccounts = () =>
-    (state().vaultAccounts ?? []).filter((account) => account.enabled)
+  const vaultAccounts = () => state().vaultAccounts ?? []
   const hasData = () =>
     vaultMode()
-      ? enabledVaultAccounts().length > 0
+      ? vaultAccounts().length > 0
       : state().main?.quota != null || enabledFallbacks().length > 0
 
   const headerLabel = () => {
@@ -788,8 +852,8 @@ function QuotaSidebar(props: {
   }
   const killedNames = () =>
     [
-      state().main?.killed ? 'main' : '',
-      ...enabledFallbacks()
+      !vaultMode() && state().main?.killed ? 'main' : '',
+      ...(vaultMode() ? vaultAccounts() : enabledFallbacks())
         .filter((f) => f.killed)
         .map((f) => f.label ?? f.id),
     ].filter(Boolean)
@@ -887,7 +951,7 @@ function QuotaSidebar(props: {
             <Show
               when={!vaultMode()}
               fallback={
-                <For each={enabledVaultAccounts()}>
+                <For each={vaultAccounts()}>
                   {(account, index) => (
                     <AccountBlock
                       theme={theme()}
@@ -895,6 +959,8 @@ function QuotaSidebar(props: {
                       name={account.label ?? account.id}
                       quota={account.quota}
                       killed={account.killed}
+                      vaultState={account.vaultState}
+                      hostDisabled={!account.enabled}
                       active={sessionRouting().activeId === account.id}
                       pacingEnabled={prefs().sections.pacing}
                       labelWidth={quotaLabelWidth()}
@@ -1064,8 +1130,48 @@ const tui: TuiPlugin = async (api) => {
   }
 }
 
-const plugin: TuiPluginModule & { id: string } = {
+async function setup(
+  context: Plugin.Context,
+  options: TuiTransportOptions = {},
+) {
+  if (options.sidebarText !== undefined || options.sidebar)
+    return setupTui(context, options)
+  const root = await readTuiPreferencesFile()
+  const controller = createSidebarController(resolveOpenaiAuthPrefs(root))
+  const api = {
+    theme: {
+      get current() {
+        return context.theme
+      },
+    },
+    event: {
+      on: (type: 'session.updated' | 'message.updated', listener: () => void) =>
+        context.data.on(
+          type === 'session.updated'
+            ? 'session.metadata.updated'
+            : 'session.usage.updated',
+          listener,
+        ),
+    },
+  }
+  return setupTui(context, {
+    ...options,
+    sidebar: {
+      render: (input) => (
+        <QuotaSidebar
+          api={api}
+          controller={controller}
+          sessionId={input.sessionID}
+        />
+      ),
+      dispose: controller.dispose,
+    },
+  })
+}
+
+const plugin: TuiPluginModule & { id: string; setup: typeof setup } = {
   id: ID,
+  setup,
   tui,
 }
 

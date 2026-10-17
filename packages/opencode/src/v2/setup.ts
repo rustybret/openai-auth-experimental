@@ -37,7 +37,10 @@
 //    credential table only ever receives a placeholder.
 // 6. The model rules (`models.ts`).
 
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
+  type Attempt,
   installOpenCode2Auth,
   type OpenCode2AuthAdapter,
   OpenCode2AuthError,
@@ -58,7 +61,6 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   vaultStateDir,
-  whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
@@ -82,18 +84,20 @@ import {
   migrateToPool,
   poolPlaceholderWithoutMain,
 } from '../core/pool-migration'
-import { observationFromSnapshot } from '../core/pool-quota'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
-import { createLogger } from '../logger'
+import { createLogger, setLogLevel } from '../logger'
 import { PackageVersion } from '../version'
 import {
   createOpenAIAdapter,
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
+import { acquireCodexSessions } from './codex-sessions'
+import { CodexHttpState } from './codex-wire'
+import { type ControlPlaneMenu, installControlPlane } from './control-plane'
 import { opencode1HostSlot } from './host-slot'
 import {
   assertLocalPoolLogin,
@@ -104,8 +108,16 @@ import {
   vaultLoginMethod,
   writeLoginToPool,
 } from './login'
+import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
-import { SessionPins } from './pins'
+import { RequestDumps } from './request-dumps'
+import {
+  createPoolQuotaPull,
+  createPoolResetDeps,
+  ResetCreditCounts,
+} from './reset-credits'
+import { acquireSessionPins } from './shared-pins'
+import { acquireSidebarPublisher } from './sidebar-publisher'
 
 /**
  * The plugin id both hosts list this plugin under: the OpenCode 1 plugin's
@@ -118,6 +130,18 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
+  /** Overrides HTTP identity and clock sources for deterministic wire fixtures. */
+  codex?: import('./codex-wire').CodexHttpState
+  /** Binds this location's sidebar output; defaults to the shared sidebar state file. */
+  sidebarStateFile?: string
+  /**
+   * Test-only interval in milliseconds for checking settings/enrollment file
+   * metadata and cached vault rosters. Tests can shorten the 2,000 ms default
+   * to observe changes quickly.
+   */
+  sidebarObservationIntervalMs?: number
+  /** Overrides the production menu for transport fixtures. */
+  controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
   /** OpenCode 1's login slot the migration reads; its `auth.json` by default. */
@@ -126,6 +150,11 @@ export interface OpenAIAuthV2Options {
   version?: string
   /** Used for token refreshes and quota polls. */
   fetch?: typeof fetch
+  /**
+   * The clock for token refreshes, quota polls and the readings they record,
+   * rate-limit marks, and reset credits; `Date.now` by default.
+   */
+  now?: () => number
   /** Starts one ChatGPT login (`beginAccountLogin`). */
   beginLogin?: BeginLogin
   /** The migration's version fence; `migrationFenceOpen` for `version` by default. */
@@ -157,17 +186,24 @@ export interface OpenAIAuthV2Options {
 type SetupContext = Pick<
   Plugin.Context,
   'session' | 'event' | 'integration' | 'model'
->
+> &
+  Partial<Pick<Plugin.Context, 'command' | 'location'>>
 
 async function installPoolHooks<Q, A>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
+  codex = new CodexHttpState(),
 ) {
+  const dumps = new RequestDumps(log)
+  // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
+  // constructs the final Request. Async-local storage carries that handle to
+  // this hook's final snapshot without sharing a latest attempt across requests.
+  const observing = new AsyncLocalStorage<{ attempt?: Attempt<A> }>()
   // Receive/retry hooks have no request object to identify the send they answer.
   // They answer the last handshake or send for this session, so remember its
   // bearer. A send using another integration's login is not ours to rewrite.
-  const sockets = new Map<string, string>()
+  const sockets = new Map<string, { bearer: string; attempt: Attempt<A> }>()
   const latest = new Map<string, string>()
   const forget = (sessionID: string) => {
     latest.delete(sessionID)
@@ -196,12 +232,36 @@ async function installPoolHooks<Q, A>(
             const owned =
               prepared?.get('authorization') ===
               `Bearer ${placeholderSecret(adapter.providerID)}`
+            const observation: { attempt?: Attempt<A> } = {}
+            if (handshake)
+              sockets.delete(`${handshake.sessionID}:${handshake.kind}`)
             try {
-              await callback(draft)
+              await observing.run(observation, () => callback(draft))
             } catch (error) {
               if (owned && !(error instanceof OpenCode2AuthError))
                 throw redactCredentialError(error)
               throw error
+            }
+            if (request && owned && observation.attempt) {
+              // accountHeaders runs after the HTTP rewrite and restores the host
+              // session id. Keep the same Request object: installOpenCode2Auth
+              // uses its identity to attribute responses to the account attempt.
+              const threadID = request.request.headers.get('thread-id')
+              if (threadID) request.request.headers.set('session-id', threadID)
+            }
+            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)
+            if (handshake && owned && observation.attempt) {
+              // A stable thread id lets WebSocket and HTTP fallback share the
+              // same cache without changing the host's socket key between turns.
+              handshake.headers['session-id'] = codex.get(
+                handshake.sessionID,
+              ).threadID
+            }
+            if (name === 'experimental.ws.send') {
+              const sent = draft as SessionHooks['experimental.ws.send']
+              const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
+              if (socket) await dumps.frame(sent.frame, socket.attempt)
             }
             if (request || handshake) {
               const scope = request ?? handshake
@@ -219,7 +279,8 @@ async function installPoolHooks<Q, A>(
               else latest.delete(scope.sessionID)
               if (handshake) {
                 const key = `${handshake.sessionID}:${handshake.kind}`
-                if (owned && bearer) sockets.set(key, bearer)
+                if (owned && bearer && observation.attempt)
+                  sockets.set(key, { bearer, attempt: observation.attempt })
                 else sockets.delete(key)
               }
               if (latest.size > 512) {
@@ -232,11 +293,14 @@ async function installPoolHooks<Q, A>(
               }
             } else if (name === 'experimental.ws.receive') {
               const received = draft as SessionHooks['experimental.ws.receive']
-              const token = sockets.get(
+              const socket = sockets.get(
                 `${received.sessionID}:${received.kind}`,
               )
-              if (token)
-                received.frame = redactCredentialFrame(received.frame, token)
+              if (socket)
+                received.frame = redactCredentialFrame(
+                  received.frame,
+                  socket.bearer,
+                )
             } else if (name === 'retry') {
               const retry = draft as SessionHooks['retry']
               const token = latest.get(retry.sessionID)
@@ -263,7 +327,22 @@ async function installPoolHooks<Q, A>(
     context,
     {
       ...adapter,
+      rewriteRequest: async (input) => {
+        const observation = observing.getStore()
+        if (observation) observation.attempt = input.attempt
+        return adapter.rewriteRequest?.(input)
+      },
+      rewriteHandshakeURL: (input) => {
+        const observation = observing.getStore()
+        if (observation) observation.attempt = input.attempt
+        return adapter.rewriteHandshakeURL?.(input)
+      },
+      onAttemptEnd: async (attempt, outcome) => {
+        await dumps.end(attempt, outcome)
+        await adapter.onAttemptEnd?.(attempt, outcome)
+      },
       rewriteResponse: async (input) => {
+        await dumps.response(input.request, input.response.status)
         const response =
           (await adapter.rewriteResponse?.(input)) ?? input.response
         return redactCredentialResponse(
@@ -294,6 +373,8 @@ async function installPoolHooks<Q, A>(
       latest.clear()
       sockets.clear()
       await dispose()
+      await dumps.settle()
+      dumps.clear()
     },
   }
 }
@@ -314,7 +395,15 @@ export async function setupOpenAIAuth(
   const log = createLogger('opencode2')
   const logQ = createLogger('quota')
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
+  // The logger starts with the environment floor. A saved choice overrides it,
+  // just as it does on OpenCode 1, before setup writes any diagnostic lines.
+  const storage = await loadAccounts(paths())
+  const storedLevel = storage?.logging?.level
+  if (storedLevel && typeof storedLevel === 'string') {
+    setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
+  }
   const fetchImpl = options.fetch ?? fetch
+  const now = options.now ?? Date.now
   const version = options.version ?? PackageVersion
   const migrationEnabled = options.poolMigration ?? POOL_MIGRATION_ENABLED
 
@@ -392,13 +481,14 @@ export async function setupOpenAIAuth(
   await vault.authority()
   const vaultFirstRoster = vaultLease.firstRoster
 
+  const resetCounts = new ResetCreditCounts()
   const source = new PoolAccountSource({
     paths,
     refreshProvider: async (credential) => {
       const tokens = await codexRefreshFn({
         refreshToken: credential.refresh,
         fetchImpl,
-        now: Date.now,
+        now,
       })
       const identity = extractAccountId({
         id_token: '',
@@ -407,20 +497,17 @@ export async function setupOpenAIAuth(
       })
       return { ...tokens, ...(identity ? { identity } : {}) }
     },
-    pullQuota: async (request) => {
-      const credential = request.credential
-      if (credential.type !== 'oauth' || !credential.access)
-        throw new Error('the row holds no access token to poll with')
-      const snapshot = await whamUsageFn({
-        accessToken: credential.access,
-        fetchImpl,
-        now: Date.now,
-        ...(request.identity ? { accountId: request.identity } : {}),
-        accountKey: request.id,
-        logger: logQ,
-      })
-      return observationFromSnapshot(snapshot, Date.now(), true)
-    },
+    // Each usage poll's windows and available reset-credit count go into
+    // the row's quota map (what routing reads). The poll's applicable count,
+    // which the reset result reports and the map has no field for, goes
+    // into `resetCounts`.
+    pullQuota: createPoolQuotaPull({
+      fetchImpl,
+      now,
+      counts: resetCounts,
+      logger: logQ,
+    }),
+    now,
     // One ChatGPT account has one owner. A local pool row signing in as an
     // account the vault holds for this host belongs to the vault, so this
     // source neither refreshes that row's token nor polls quota with it
@@ -496,8 +583,27 @@ export async function setupOpenAIAuth(
 
   vaultLease.start()
 
-  const pins = new SessionPins()
+  const pins = acquireSessionPins(paths())
+  const sidebar = acquireSidebarPublisher(
+    { paths: paths(), source, pins, vault },
+    options.sidebarStateFile,
+    options.sidebarObservationIntervalMs,
+  )
+  using _sidebarRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) void sidebar.release()
+    },
+  }
+  // Disk publication must not hold up the host's location-ready lifecycle.
+  void sidebar.publish()
+  // Thread ids are saved per host session so the prompt cache key survives a
+  // server restart; every location in this process shares the one map.
+  const codex =
+    options.codex ??
+    new CodexHttpState(undefined, undefined, acquireCodexSessions())
   const openai = createOpenAIAdapter({
+    codex,
+    onRoute: sidebar.route,
     source,
     slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
@@ -511,9 +617,10 @@ export async function setupOpenAIAuth(
     },
     responsesLite: () => getSettings().responsesLite,
     codexEndpoint: () => getSettings().codexApiEndpoint,
+    now,
     log,
   })
-  const installation = await installPoolHooks(ctx, openai.adapter, log)
+  const installation = await installPoolHooks(ctx, openai.adapter, log, codex)
   openai.attach(installation)
 
   /** Waits for a migration run when the install has not migrated yet. */
@@ -561,6 +668,62 @@ export async function setupOpenAIAuth(
     vault: vaultLoginMethod(vault),
   })
   const models = await registerCodexModelRules(ctx)
+  if (options.controlPlane && (!ctx.command || !ctx.location))
+    throw new Error(
+      'OpenCode 2 control plane requires command and location APIs',
+    )
+  const controlPlane =
+    ctx.command && ctx.location
+      ? await installControlPlane(
+          {
+            session: ctx.session,
+            command: ctx.command,
+            location: ctx.location,
+          },
+          options.controlPlane ??
+            createControlPlaneMenu({
+              // Reset credits over the pool: a missing row is refused, and
+              // no host login is read in its place.
+              ...createPoolResetDeps({
+                source,
+                storage: () => loadAccounts(paths()),
+                counts: resetCounts,
+                now,
+                authority: () => vault.authority(),
+              }),
+              fetchImpl,
+              now,
+              randomUUID,
+              accountStoragePath: paths().configPath,
+              accountStatePath: paths().statePath,
+              packageVersion: version,
+              loadAccounts,
+              store: () => source.poolStore(),
+              migration: async () => {
+                if (poolMigrated(paths().configPath)) return { migrated: true }
+                const state = await fence()
+                return {
+                  migrated: false,
+                  blockers: state.open ? [] : state.blockers,
+                }
+              },
+              beginAccountLogin: options.beginLogin ?? beginAccountLogin,
+              refreshAllQuota: async () =>
+                (await source.pollRows(await loadAccounts(paths()))).map(
+                  (row) => ({ ...row, account: row.id }),
+                ),
+              getStickyRouting: async (sessionId) => pins.get(sessionId),
+              afterWrite: () => source.load(),
+              refreshSidebar: () => sidebar.publish(),
+              clearStickyRouting: async (sessionId) => {
+                const existed = pins.get(sessionId) !== undefined
+                pins.forget(sessionId)
+                return existed
+              },
+              vault,
+            }),
+        )
+      : undefined
 
   // A deleted session's pin and remembered account go with it.
   const abort = new AbortController()
@@ -582,20 +745,28 @@ export async function setupOpenAIAuth(
   return async () => {
     closing = true
     abort.abort()
+    await controlPlane?.()
     lifecycle?.dispose()
     source.dispose()
+    await sidebar.release()
     await Promise.allSettled([
       installation.dispose(),
       methods.dispose(),
       models.dispose(),
     ])
     // Join account-pool transfers and reads after stopping new slot adoptions.
-    // Their reloads must finish before releasing this host's state. Preserve
-    // the five-second shutdown limit for an unresponsive provider or login slot.
+    // Their reloads must finish before releasing this host's state. Also finish
+    // saving the sessions this location created or deleted, so a restart right
+    // after still finds their thread ids. Preserve the five-second shutdown
+    // limit for an unresponsive provider, login slot or session-file lock.
     let settleTimer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        Promise.all([lifecycle?.idle(), source.settled()]),
+        Promise.all([
+          lifecycle?.idle(),
+          source.settled(),
+          codex.store?.settled(),
+        ]),
         new Promise<void>((resolve) => {
           settleTimer = setTimeout(resolve, SETTLE_ON_DISPOSE_MS)
           settleTimer.unref?.()

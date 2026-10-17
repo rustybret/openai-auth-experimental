@@ -41,19 +41,30 @@ import {
   hostEnrollmentPaths,
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
+  readVaultRoster,
   type VaultRosterFile,
   type VaultRosterRow,
 } from '@cortexkit/common-auth/claustrum'
 import { CommandError } from '@cortexkit/common-auth/commands'
 import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
+import { normalizeInsulaCodexQuota } from './insula-quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
 import { observationFromSnapshot } from './pool-quota'
 import type { QuotaReadingRequest } from './pool-routing'
 import { whamUsageFn } from './provider'
 import { errorMessage } from './util/error'
+import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
 
 const log = createLogger('vault')
+
+type VaultQuotaSource = 'insula' | 'fallback'
+type VaultQuotaSourceReason =
+  | 'account-changed'
+  | 'insula-not-configured'
+  | 'insula-unusable'
+  | 'no-insula-reading'
+  | null
 
 /** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
 export const VAULT_PLUGIN_NAME = 'openai-auth'
@@ -157,6 +168,8 @@ export function vaultIdentityOf(accessToken: string): string | undefined {
 /** One vault account as routing sees it. */
 export interface VaultRoute {
   id: string
+  /** The vault credential name, distinct from its stable routing id. */
+  credentialId?: string
   kind: 'oauth' | 'api-key'
   /** The ChatGPT account it signs in as, when the vault knows it. */
   identity?: string
@@ -207,12 +220,16 @@ export class OpenAiVault {
   readonly name: string
   readonly paths: VaultPaths
   readonly #options: OpenAiVaultOptions
-  readonly #consumer: ClaustrumConsumer
+  readonly #consumer: ClaustrumConsumer<
+    NonNullable<ReturnType<typeof normalizeInsulaCodexQuota>>
+  >
   readonly #pulls = new Map<string, Promise<unknown>>()
   readonly #quotaPolls = new Map<
     string,
     Promise<{ ok: boolean; error?: string }>
   >()
+  readonly #lastQuotaSource = new Map<string, VaultQuotaSource>()
+  #consumerHasInsula: boolean | undefined
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
   /** The roster discovery this instance has in flight, if any. */
@@ -241,6 +258,7 @@ export class OpenAiVault {
         ? { reservedRouteIds: options.reservedRouteIds }
         : {}),
       parseIdentity: vaultIdentityOf,
+      insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
       ...(options.now ? { now: options.now } : {}),
       onRoster: () => {
         this.#lastError = undefined
@@ -270,7 +288,24 @@ export class OpenAiVault {
     return (
       this.#options.connectScoped?.() ??
       connectClaustrumScopedClient(this.#clientOptions())
-    )
+    ).then((client) => {
+      this.#consumerHasInsula = client.insula !== undefined
+      return client
+    })
+  }
+
+  #logQuotaSource(
+    routeId: string,
+    source: VaultQuotaSource,
+    reason: VaultQuotaSourceReason,
+  ): void {
+    if (this.#lastQuotaSource.get(routeId) === source) return
+    this.#lastQuotaSource.set(routeId, source)
+    log.info('vault background quota source changed', {
+      routeId,
+      source,
+      reason,
+    })
   }
 
   #connectEnrollment(): Promise<ClaustrumEnrollmentConnection> {
@@ -339,6 +374,7 @@ export class OpenAiVault {
       try {
         await this.authority()
         await this.#discover()
+        await this.#consumer.refreshInsulaQuota()
       } catch (error) {
         if (!this.#closed) this.#fail('vault roster refresh failed', error)
       }
@@ -451,6 +487,7 @@ export class OpenAiVault {
       const identity = rows.get(routing.id)?.accountIdentity
       return {
         id: routing.id,
+        credentialId: rows.get(routing.id)?.credentialId,
         kind: routing.kind === 'api-key' ? 'api-key' : 'oauth',
         ...(identity !== undefined ? { identity } : {}),
         ...(routing.quota !== undefined ? { quota: routing.quota } : {}),
@@ -568,24 +605,80 @@ export class OpenAiVault {
     )
   }
 
-  /** Joins an existing quota poll, or starts one through the usage endpoint. */
-  pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+  /** Joins a quota poll; current insula quota for the same account replaces a background ChatGPT wham/usage request. */
+  pollQuota(
+    routeId: string,
+    background = true,
+  ): Promise<{ ok: boolean; error?: string }> {
     const pending = this.#quotaPolls.get(routeId)
     if (pending) return pending
-    const pull = this.#pollQuota(routeId).finally(() => {
+    const pull = this.#pollQuota(routeId, background).finally(() => {
       this.#quotaPolls.delete(routeId)
     })
     this.#quotaPolls.set(routeId, pull)
     return pull
   }
 
-  async #pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+  async #pollQuota(
+    routeId: string,
+    background: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (background) {
+      await this.authority()
+      await this.#consumer.refreshInsulaQuota()
+      const row = (await readVaultRoster(this.paths.rosterPath))?.rows.find(
+        (row) => row.routeId === routeId,
+      )
+      const cached = await this.#consumer.cachedInsulaQuotaForRoute(routeId)
+      if (cached !== undefined && row?.accountIdentity) {
+        const observation = observationFromSnapshot(
+          cached,
+          cached.primary.checkedAt,
+          true,
+        )
+        if (!observation) {
+          this.#logQuotaSource(routeId, 'fallback', 'insula-unusable')
+          return { ok: false, error: 'unusable insula reading' }
+        }
+        const kept = await this.#consumer.recordAccountQuota(
+          routeId,
+          row.accountIdentity,
+          observation,
+        )
+        if (kept) {
+          this.#logQuotaSource(routeId, 'insula', null)
+          return { ok: true }
+        }
+        this.#logQuotaSource(routeId, 'fallback', 'account-changed')
+        return { ok: false, error: 'vault account changed' }
+      }
+      this.#logQuotaSource(
+        routeId,
+        'fallback',
+        this.#consumerHasInsula === false
+          ? 'insula-not-configured'
+          : 'no-insula-reading',
+      )
+    }
     let failure: string | undefined
     const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch
     const response = await this.send(
       routeId,
       async (token, attempt) => {
         try {
+          const cached = background
+            ? undefined
+            : await this.#consumer.cachedInsulaQuota(attempt)
+          if (cached !== undefined) {
+            const observation = observationFromSnapshot(
+              cached,
+              cached.primary.checkedAt,
+              true,
+            )
+            if (!observation) throw new Error('unusable insula reading')
+            await this.#consumer.recordQuota(routeId, observation, attempt)
+            return new Response(null, { status: 200 })
+          }
           const snapshot = await whamUsageFn({
             accessToken: token,
             fetchImpl,
@@ -628,7 +721,7 @@ export class OpenAiVault {
   requestReading(routeId: string): ReturnType<QuotaReadingRequest> {
     const pending = this.#pulls.get(routeId)
     if (pending) return pending
-    const pull = this.pollQuota(routeId)
+    const pull = this.pollQuota(routeId, false)
       .catch((error: unknown) => {
         log.warn('vault quota poll failed', {
           routeId,
@@ -854,7 +947,7 @@ export function vaultConnectOutcome(
       const accounts = vault.snapshot()?.rows.length ?? 0
       return {
         ok: true,
-        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? ' (grant it the openai-native category with `ck auth grant` to add some)' : ''}.`,
+        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${VAULT_EMPTY_ACCESS_HINT}` : '.'}`,
       }
     }
     case 'denied':

@@ -2,23 +2,21 @@
 
 ## Pattern Overview
 
-**Overall:** Multi-account OAuth plugin with Codex request rewriting, reactive account fallback, credit-budget-aware sticky routing, OpenAI accounts served from the Claustrum vault, push-based quota tracking with background idle polling, prompt-cache stabilization, idle cache keep-warm, and a separate TUI sidebar communicating over a loopback RPC.
+**Overall:** Multi-account OAuth plugin with Codex request rewriting, reactive account fallback, sticky routing that keeps sessions on an account until its quota or credit budget is exhausted, OpenAI accounts served from the Claustrum vault, push-based quota tracking with background idle polling, idle cache keep-warm, and a separate TUI sidebar communicating over a loopback RPC.
 
 **Key Characteristics:**
-
 - Registers as the built-in `openai` provider; OpenCode loads external server plugins after its internal ones, so this package transparently supersedes OpenCode's internal OpenAI auth hook.
 - Rewrites OpenAI Responses requests into Codex's wire shape (headers, body, tools, turn metadata) so the Codex backend treats traffic as if it came from the official Codex CLI.
 - Reactive account fallback for ordered modes, plus sticky-balanced cold-session placement. Sticky pins migrate only on confirmed exhaustion — an exhausted rate-limit window or a reached credit budget — or permanent auth failure; there is no mid-session rebalance or Retry-After hold. Enforce the killswitch as a hard circuit-breaker directly on the request path to block requests or filter candidates before spending when cached quota falls below configured thresholds.
 - Push-based quota tracking with background idle polling: quota comes in-band from `x-codex-*` HTTP response headers or `codex.rate_limits` WS frames, while an unref'd jittered background timer refreshes idle accounts across processes under a shared lease lock to keep sidebar and routing quota fresh without extra polling on active traffic. Wham/usage also carries a spend-control credit budget and reset-credit counts, normalized alongside the rate-limit windows.
 - Optional Claustrum vault accounts, through the shared consumer in `@cortexkit/common-auth/claustrum`: once a host is enrolled (approved by the operator with `ck`), it is in vault mode: the OpenAI credentials the vault grants it are its only routing rows, and no local account (pool row, OpenCode's slot, Pi's own login) is used, refreshed, polled or warmed until it disconnects. A vault row holds no token: each send asks the vault for one.
-- Three transport modes share the cache-stabilizer behavior: HTTP/SSE, native WebSocket, and a hand-rolled RFC 6455 WebSocket (Bun.connect or node:net/node:tls).
+- Three transport modes carry Codex requests: HTTP/SSE, native WebSocket, and a hand-rolled RFC 6455 WebSocket (Bun.connect or node:net/node:tls). Requests do not inject a cache-stabilizer tool to pad the prompt or automatically add a provider-hosted web-search tool.
 - TUI sidebar reads a serialized, machine-global `sidebar-state.json` snapshot pushed by the auth loader; it owns SHA-256-keyed sticky assignments with a seven-day TTL. The loader and TUI exchange dialogs/notifications over a loopback HTTP RPC bound to a per-process token.
 - Plugin is split into a shared, provider-agnostic core package (`packages/core/src/`, imported as `@cortexkit/openai-auth-core`) and Codex-specific seams (`provider.ts`, `oauth.ts`) so the same shape could host another OAuth provider. Host-only behavior — cache keep-warm, sticky routing, background quota polling, and account-path resolution — stays in `packages/opencode/src/core/`.
 
 ## Layers
 
 **Provider injection seam:**
-
 - Purpose: Generic types (`ProviderRefreshFn`, `ProviderQuotaFn`, `ProviderHttpError`) plus the two Codex-specific fns (`codexRefreshFn`, `whamUsageFn`).
 - Location: `packages/core/src/provider.ts`
 - Contains: Token-refresh function type, quota-fetch function type, error shape carrying `status` + `retryAfter`, Codex OAuth constants, Codex HTTP refresh impl (with 15s timeout), Codex `wham/usage` quota fetch impl (with 15s timeout and logger warning).
@@ -26,7 +24,6 @@
 - Used by: `FallbackAccountManager` and `QuotaManager` constructors; `index.ts` plugin loader.
 
 **Accounts and fallback storage:**
-
 - Purpose: Atomic, multi-account JSON store with file locks, retry/backoff state, killswitch config, routing mode, persisted quota, log level, and dump/cachekeep toggles.
 - Location: `packages/core/src/accounts.ts`, `@cortexkit/common-auth/fs` (atomic writes and refresh locks), `packages/core/src/paths.ts` (shared file names + `deriveStatePath`), plus the host path resolver `packages/opencode/src/core/account-paths.ts`
 - Contains: `deriveStatePath` in `account-paths.ts` (derives `${configPath}.state.json` when custom config paths are used, preventing distinct account files from sharing one state document, with `accountPathsCollide` detecting aliases), `loadAccounts`/`migrateIfNeeded` (serialized under the shared save lock to coordinate concurrent migrations and mutations), `mutateAccounts` (authoritative read-modify-write for structural mutations and scalar writes, preserving load-dropped raw entries on disk with an `allowDrop` option for intentional caller removals, preventing concurrent union-merge resurrection of deleted accounts/secrets), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster to prevent resurrection of deleted account secrets), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, fire-and-forget `markUsed` telemetry; a row holding a tombstone from the removed handle-mode custody is never refreshed or selected), every config writer dropping the removed custody's `claustrum` settings, `OAuthAccount`/`CorruptOAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock with separated acquire window, lock TTL, and generation-fenced renewal and release (distinguishes holder contention from event-loop starvation in timeout errors, verifies owner and marker identity to avoid deleting or extending a successor's lock, and recreates missing parent directories automatically on `ENOENT`), atomic JSON write (temp + rename, mode `0o600`).
@@ -40,7 +37,6 @@
 - Account add/enable/disable/remove/reorder and terminal rendering belong to `@cortexkit/common-auth/auth-menu` and the pool store. OpenCode's `core/pool-accounts.ts` retains only store access, migration detection, removal protection and legacy settings-lock hooks. OpenCode's `auth/doctor.ts` still detects account/login faults and supplies repair actions to the shared menu, but no longer formats a second terminal report. The vault menu does not mix a local-account listing into a connected vault view.
 
 **Quota cache and policy:**
-
 - Purpose: In-memory cache of main + per-fallback quota snapshots, dedup of inflight fetches, refresh-after math, backoff gating, and mid-stream rate-limit marks.
 - Location: `packages/core/src/quota-manager.ts`, `packages/core/src/refresh-all-quota.ts`, plus `packages/opencode/src/core/background-quota-refresh.ts` and `packages/opencode/src/core/sticky-routing.ts`
 - Contains: `QuotaManager` class with `getMain`/`setMain`/`getFallback`/`setFallback`/`seedFallbacksFromAccounts`/`isBackedOff`/`isFallbackBackedOff`, rate limit marking (`markRateLimited`, `isRateLimited`, `rateLimitedUntil`), stable-identity policy peeks (`peekMainForPolicy`, `peekFallbackForPolicy`) to prevent token refreshes from invalidating cached quota, token-fingerprint helpers, `refreshAllQuota` orchestration (treats quota endpoint 401s as token refresh triggers, skips poll attempts for accounts with armed non-transient refresh backoff by marking them permanent failures, never polls with a tombstone, and displays quota readings with their own age when older than 15 minutes), `BackgroundQuotaRefresh` (unref'd 5-minute jittered poll with 4-minute freshness gating and auto-renewed `bg-quota-refresh` file lease lock), and `sticky-routing.ts` candidate selection and break classification (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`). The credit budget is a third pressure axis on its own monthly reset clock: `spendControlExhaustedResetAt` in `sidebar-state.ts` is the single shared exhaustion signal that admission, cold placement, and warm-pin migration all read, judged by the provider's authoritative `reached` boolean and failing open on a stale or missing reset. `getPresentQuotaWindows`/`exhaustedQuotaResetAt`/`isQuotaExhausted` in `sidebar-state.ts` back the killswitch and admission checks. Mid-stream rate-limit reset resolution (`resolveMidStreamRateLimitResetAt`) prefers explicit provider resets (e.g. from admission-time errors or HTTP/WS 429 upgrade frames) over cached named-window resets or bounded defaults. Policies drop cached window snapshots when their reset timestamps are in the past.
@@ -48,7 +44,6 @@
 - Used by: Plugin loader (push updates and background poller), `refresh-all-quota.ts` (active polling for `/openai-quota`).
 
 **Backoff and retry policy:**
-
 - Purpose: Classify refresh and quota errors as transient vs non-transient, build retry records, expose `*BackoffActive` checks.
 - Location: `packages/core/src/backoff.ts`
 - Contains: `isTransientRefreshError`, `isTransientQuotaError`, `buildRefreshOperationError`, `buildQuotaOperationError`, `hashRefreshToken`, `refreshBackoffActive`, `quotaBackoffActive`, `parseRetryAfter`.
@@ -56,7 +51,6 @@
 - Used by: `accounts.ts`, `quota-manager.ts`, the shared pool-source state primitives, plugin loader (`refreshMainWithLease`).
 
 **OAuth flow:**
-
 - Purpose: PKCE generation, OAuth authorize-URL building, local callback HTTP server, device-code flow, JWT/account-id extraction, fallback-account onboarding.
 - Location: `packages/core/src/oauth.ts`
 - Contains: `CLIENT_ID`, `ISSUER`, `OAUTH_PORT`, PKCE helpers, `startOAuthServer`, `waitForOAuthCallback`, `beginDeviceAuth`, `completeDeviceAuth`, `buildAuthorizeUrl`, `flowCleanup`, `parseJwtClaims`, `extractAccountIdFromClaims`, `beginAccountLogin`, `upsertAccount`.
@@ -76,7 +70,6 @@
 - Behaviour: a tombstoned row never routes, is never refreshed (`codexRefreshFn` refuses one before any network call) and never polled; a tombstone in OpenCode's slot is taken like the pool placeholder (main lives in the pool row `main`, or nowhere on an install that never migrated) and never sent; `claustrum.mode` is ignored and every config writer drops it. The doctor lists each of them with the remedy: connect the vault, or sign in to the account again.
 
 **Cache keep-warm:**
-
 - Purpose: Track idle main-agent (and optionally subagent) sessions and replay the last real request as a `store:false` shadow request just before Codex evicts the prompt cache. Employs model-aware TTL (raising GPT-5.6 TTL to 30 min from the 5-min default), gpt-5.6 subagent 2-warm caps, a process clock-bound window (outside of which warming and capture are skipped), and extended subagent idle bounds (75 min for GPT-5.6 subagents). `sustain` defaults off and bypasses only main idle pruning; it leaves the clock window, subagent limits, target-count, byte, and LRU caps intact.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Contains: `CacheKeepManager` class (target map, timer, idle caps, backoff), `buildKeepwarmCapture`, `buildKeepwarmBody`, model-aware TTL matcher (`isGpt56Model`, `ttlForModel`), clock window checker (`isWithinCacheKeepWindow`), SSE/JSON usage extraction.
@@ -84,43 +77,38 @@
 - Used by: Plugin loader (per-instance wiring); `/openai-cachekeep` command.
 
 **Request transformation:**
-
-- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for the models the backend catalog marks `use_responses_lite` (`gpt-5.6-sol`/`-terra`/`-luna` and every `gpt-6` variant). Responses Lite trades capabilities for compact requests by disabling parallel tool calls, moving system instructions and tools into developer messages prefixing the input sequence, excluding hosted tools, and stripping details from images. Preserves OpenCode's native `max` reasoning variant on the wire, sets the Codex client version to `0.155.0` (required for `gpt-6-sol` and `gpt-6-luna`; `gpt-6-astra` needs `0.153.0`, and one version serves the whole range), caps `gpt-5.6` variants, `gpt-6-sol`, and `gpt-6-luna` context and input (244k input, 372k context) to stay within OpenAI's cheap pricing tier below the 272k 2x-pricing threshold, while `gpt-6-astra` alone receives its full reported window (744k input, 872k context) exempt from the Codex long-context surcharge at the default endpoint. Preserves byte-identical prefix caches for `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` by pinning request-level reasoning effort to session-opening values and carrying mid-conversation effort changes as `configuration_update` input items immediately preceding the new user turn (models outside `MID_CONVERSATION_EFFORT_MODELS`, such as `gpt-5.6-sol`, retain standard request-level effort updates), and filters legacy experimental `-pro` model entries and bare disallowed IDs (`gpt-5.6`, `gpt-6`) while accepting major/minor versions `> 5.4` (such as `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`). Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
-- Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `maybeInjectCacheStabilizerTool`, `applyMidConversationEffort`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`, `ALLOWED_MODELS`/`DISALLOWED_MODELS`/`RESPONSES_LITE_MODELS`/`MID_CONVERSATION_EFFORT_MODELS`/`CODEX_VERSION`), `packages/opencode/src/codex-http.ts` (`sanitizeHttpFallbackInit`, `sanitizeHttpFallbackBody`, `hasWebSocketResponsesLiteMetadata`), `packages/opencode/src/hosted-web-search.ts` (provider-hosted web-search tool + replay rewrite + SSE translation), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
+- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for the models the backend catalog marks `use_responses_lite` (`gpt-5.6-sol`/`-terra`/`-luna` and every `gpt-6` variant). Responses Lite trades capabilities for compact requests by disabling parallel tool calls, moving system instructions and tools into developer messages prefixing the input sequence, excluding hosted tools, and stripping details from images. Preserves OpenCode's native `max` reasoning variant on the wire, sets the Codex client version to `0.155.0` (required for `gpt-6-sol` and `gpt-6-luna`; `gpt-6-astra` needs `0.153.0`, and one version serves the whole range), caps `gpt-5.6` variants, `gpt-6-sol`, and `gpt-6-luna` context and input (244k input, 372k context) to stay within OpenAI's cheap pricing tier below the 272k 2x-pricing threshold, while `gpt-6-astra` alone receives its full reported window (744k input, 872k context) exempt from the Codex long-context surcharge at the default endpoint. Preserves byte-identical prefix caches for `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` by pinning request-level reasoning effort to session-opening values and carrying mid-conversation effort changes as `configuration_update` input items immediately preceding the new user turn (models outside `MID_CONVERSATION_EFFORT_MODELS`, such as `gpt-5.6-sol`, retain standard request-level effort updates), and filters legacy experimental `-pro` model entries and bare disallowed IDs (`gpt-5.6`, `gpt-6`) while accepting major/minor versions `> 5.4` (such as `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`). Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
+- Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `applyMidConversationEffort`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`, `ALLOWED_MODELS`/`DISALLOWED_MODELS`/`RESPONSES_LITE_MODELS`/`MID_CONVERSATION_EFFORT_MODELS`/`CODEX_VERSION`), `packages/opencode/src/codex-http.ts` (`sanitizeHttpFallbackInit`, `sanitizeHttpFallbackBody`, `hasWebSocketResponsesLiteMetadata`), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
 - Depends on: `util/uuid-v7.ts`, `util/stable-json.ts`, `packages/core/src/util/record.ts` (`isRecord`), `config.ts`.
 - Used by: Plugin loader `sendWithAccessToken`, `fetch` override.
 
 **Transports:**
-
 - Purpose: Run Codex requests over HTTP or WebSocket, with a session-keyed pool for the WebSocket path and Codex-style incremental streaming when the hand-rolled client is enabled. WebSocket connection starts with a prompt-prewarming phase (sending a `generate: false` body to populate the session's prompt cache and establish continuation state) before sending the main turn. Intercepts rate-limit notifications on prewarm and main connections (including admission-time `usage_limit_reached` frames and 429 handshake upgrade rejections parsed via `raw-ws-upgrade.ts`) via the `onRateLimitReached` callback to mark the account rate-limited with explicit provider resets. Applies a no-replay gate (forces a retryable `ResponseStreamError` only if no generated output item — including tool/function calls — was yet emitted (`emittedOutput`), enabling a same-turn fallback reroute on the stock `@ai-sdk/openai` runtime, else closes the stream to prevent duplication, double-billing, or re-running side-effecting tools; note that same-turn rerouting is bypassed under the experimental native runtime `OPENCODE_EXPERIMENTAL_NATIVE_LLM=1` where the errored body rejects with a non-retryable error, though the mark still steers the next turn off that account). Handles oversized WebSocket request frames (close code 1009) by marking them non-retryable on WebSocket; `relayWithOversizedFallback` in `ws-pool.ts` intercepts oversized frame failures on the returned response body and, provided no output bytes were yet delivered to the consumer, transparently issues the request over HTTP and streams the fallback response to finish the turn without spending futile retries. When a socket closes or continuation fails before output, the socket is destroyed and continuation state is cleared so retried turns resend full input rather than chaining to a refused response. In hand-rolled WebSocket clients (`raw-ws-bun.ts`, `raw-ws-node.ts`), parsed peer close frames take precedence over synthetic 1006 TCP close events. Transport lifecycle logging records `response.created` (with response ID and continuation tracking) and stream death diagnostics (frames produced, elapsed time, and continuation context) ungated by request-dump settings.
 - Location: `packages/opencode/src/ws.ts` (WS connect/stream, header ordering, idle timeout, retryable terminal hook, mid-stream event parser), `packages/opencode/src/ws-pool.ts` (account pool keyed by ChatGPT account ID or token hash fallback to prevent token refreshes from busting continuation chains, turn rotation via shared `advanceTurn`, prewarm connection limit failover, `OpenAIWebSocketPool`), `packages/opencode/src/raw-ws.ts` (runtime selection), `packages/opencode/src/raw-ws-bun.ts` (`Bun.connect`), `packages/opencode/src/raw-ws-node.ts` (`node:net`/`node:tls`), `packages/opencode/src/raw-ws-upgrade.ts` (handshake upgrade 4xx/5xx status & header parser), `packages/opencode/src/util/proxy-env.ts`.
-- Depends on: `dump.ts`, `hosted-web-search.ts`, `packages/core/src/quota-normalize.ts`, `response-stream-error.ts`, `packages/core/src/util/error.ts` (`errorMessage`), `packages/core/src/util/record.ts` (`isRecord`).
+- Depends on: `dump.ts`, `packages/core/src/quota-normalize.ts`, `response-stream-error.ts`, `packages/core/src/util/error.ts` (`errorMessage`), `packages/core/src/util/record.ts` (`isRecord`).
 - Used by: Plugin loader `sendWithAccessToken`.
 
 **RPC (loader ↔ TUI):**
-
 - Purpose: Loopback HTTP server so the TUI can drain queued notifications and dispatch `apply` calls back to the auth loader (which already holds QuotaManager / FallbackAccountManager / storage).
 - Location: `packages/opencode/src/rpc/rpc-server.ts`, `packages/opencode/src/rpc/port-file.ts`, `packages/opencode/src/rpc/rpc-client.ts`, `packages/opencode/src/rpc/rpc-dir.ts`, `packages/opencode/src/rpc/protocol.ts` (re-export of the wire types in `packages/core/src/protocol.ts`), `packages/opencode/src/rpc/notifications.ts`.
 - Contains: 32-byte hex token, 1 MiB body cap, timed-out HTTP requests (2s), per-process port files (`port-<pid>.json`, mode `0o600`), pid-based discovery (drops dead pids), SHA-256(project-dir) `XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<hash>/` (mode `0o700`) with startup sweeps for dead port files and empty project directories, queue with monotonic IDs and per-session TUI-connected tracking.
 - Depends on: `node:crypto`, `node:http`, `node:fs/promises`.
 - Used by: Plugin loader (server + notifications push), `tui.tsx` (RPC client polling + dialog delivery).
+- OpenCode 2: `v2/control-plane.ts` exposes one process-wide command definition through each location's public command transform and dispatches by session directory. `v2/menu.ts` opens the same `createOpenCodeMenu` seam with core read-only and unavailable-section options; apply refuses before any action runs, explaining an unfinished migration or a local-only action attempted while enrolled in the vault. `tui/v2.tsx` drains only the displayed session and `tui/v2-dialog.ts` renders native host dialogs. This path does not register the OpenCode 1 sidebar; the OpenCode 2 quota sidebar is still deferred.
 
 **TUI sidebar:**
-
 - Purpose: Render an OpenCode sidebar slot showing main/fallback quota bars, routing/killswitch/health state, and the command dialog surfaces. The TUI does not own any auth state — it reads `sidebar-state.json`, resolves the session-safe active account via `resolveSessionSidebarRouting`, and pushes commands via RPC.
 - Location: `packages/opencode/src/tui.tsx`, `packages/opencode/src/tui/entry.mjs`, generated `packages/opencode/src/tui-compiled/`, `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/sidebar-state.ts`, `packages/opencode/src/tui-preferences.ts`.
 - Depends on: `@opentui/core`, `@opentui/solid`, `solid-js`, `jsonc-parser`.
 - Used by: OpenCode's TUI plugin loader (`./tui` export).
 
 **Quota normalization:**
-
 - Purpose: One place to coerce three quota shapes (HTTP `x-codex-*` headers, WS `codex.rate_limits` frame, wham/usage JSON) into the shared `OAuthQuotaSnapshot`, including reset-timestamp coercion (epoch seconds/ms/ISO).
 - Location: `packages/core/src/quota-normalize.ts`
 - Contains: `normalizeQuotaHeaders`, `normalizeWsFrame`, `normalizeWham`, `toResetIso`.
 - Used by: Plugin loader (push), `refresh-all-quota.ts`, `cachekeep.ts`, `provider.ts` (dynamic import to avoid a cycle).
 
 **Model cost restoration:**
-
 - Purpose: Restore real model costs from a local cache or a remote catalog (`models.dev`) when cost zeroing is disabled.
 - Location: `packages/opencode/src/model-costs.ts`
 - Contains: `loadModelsDevCosts`, `resetModelCostsForTest`, `toSdkCost` with strict price validation, `modelsCachePath` checking `OPENCODE_OPENAI_AUTH_MODELS_CACHE`/`OPENCODE_MODELS_PATH` env vars and falling back to XDG cache, and catalog caching with a timeout-backed fetch.
@@ -128,7 +116,6 @@
 - Used by: `packages/opencode/src/index.ts` models provider hook.
 
 **Settings and logging:**
-
 - Purpose: Resolve plugin settings from env + config file, and provide a leveled, secret-redacting, size-rotating logger.
 - Location: `packages/opencode/src/config.ts`, `packages/core/src/logger.ts` (redaction + rotation engine) with the host destination shim `packages/opencode/src/logger.ts`, `packages/opencode/src/dump.ts`.
 - Contains: `getSettings`, `refreshSettings` (invalidates the process-memoized settings cache so commands that modify configuration on disk take effect without a restart), `getConfigDir`, `getConfigPath`, `DEFAULT_CODEX_API_ENDPOINT`; leveled logger with key/value redaction (`redact`) and credential string scrubbing (`redactStrings`) for Bearer/sk-/JWT tokens, secret/api-key/password/token-like keys; 5 MiB log rotation keeping 3 generations; request-dump writer with redaction for `authorization`/`chatgpt-account-id`/`cookie`/`set-cookie`, embedding `process.pid` in filenames to avoid collisions across processes and restarts, recovering diff baselines from existing disk dumps across restarts, diffing on redacted body text so offsets match `.body.json`, and preserving tool schema properties via `redactStrings` so definitions remain valid and captures remain replayable.
@@ -136,17 +123,15 @@
 - Used by: Plugin loader, command implementations, every logger channel (`transport`, `quota`, `refresh`, `accounts`, `cachekeep`, `rpc`, `dump`, `sidebar`, `commands`, `rpc-tui`).
 
 **Utilities:**
-
 - Purpose: Small, dependency-free helpers shared by every layer.
 - Location: `packages/opencode/src/util/` (`proxy-env.ts`, `stable-json.ts`, `uuid-v7.ts`) plus `packages/core/src/util/` (`error.ts`, `record.ts`, `open-url.ts`) for the helpers both hosts share.
 - Contains: `errorMessage`, `ProxyEnv.getProxyForUrl` (Bun honors `HTTPS_PROXY`/`HTTP_PROXY`), `isRecord`, `stableStringify`, `uuidV7` (UUIDv7 with ms timestamp prefix), cross-platform `openUrl`.
 - Used by: Everywhere.
 
 **Commands (dialogs):**
-
-- Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback. Projects identity fields and scrubs credentials from knob payloads before sending over RPC. The shared bodies (quota, account, routing, reset, plus the dispatch and scrubbing) live in `packages/core/src/commands.ts` with module-private `execute*` bodies; the four host-owned bodies (killswitch, dump, logging, cachekeep) live in `packages/opencode/src/commands.ts` as `hostCommandBodies` and run through the core's `buildDialogPayload`/`applyCommand` so scrubbing applies uniformly.
-- Location: `packages/core/src/commands.ts` (shared bodies + seam), `packages/opencode/src/commands.ts` (host bodies + re-exported seam)
-- Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
+ - Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback. Projects identity fields and scrubs credentials from knob payloads before sending over RPC. The shared bodies (quota, account, routing, reset, plus the dispatch and scrubbing) live in `packages/core/src/commands.ts` with module-private `execute*` bodies; the four host-owned bodies (killswitch, dump, logging, cachekeep) live in `packages/opencode/src/commands.ts` as `hostCommandBodies` and run through the core's `buildDialogPayload`/`applyCommand` so scrubbing applies uniformly.
+ - Location: `packages/core/src/commands.ts` (shared bodies + seam), `packages/opencode/src/commands.ts` (host bodies + re-exported seam)
+ - Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
 - Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
 - Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
 
@@ -235,14 +220,13 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 ## Key Abstractions
 
 **`CodexAuthPlugin` (the plugin itself):**
-
 - Purpose: Entry point for OpenCode's plugin system. Returns `Hooks` (auth, provider, tool, event, dispose).
 - Location: `packages/opencode/src/index.ts`
 - Pattern: Factory; accepts `PluginInput` + `CodexAuthPluginOptions`; wires the auth loader, the WebSocket pool, the RPC server, the host's `OpenAiVault`, and the per-loader `CacheKeepManager` set.
 
 **`FallbackAccountManager`:**
-- Purpose: Owns the pre-pool fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware; tombstoned rows are skipped). Still used when the pool source is inactive; its background refresh is paused once the pool or vault serves.
-- Location: `packages/core/src/accounts.ts`
+  - Purpose: Owns the pre-pool fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware; tombstoned rows are skipped). Still used when the pool source is inactive; its background refresh is paused once the pool or vault serves.
+ - Location: `packages/core/src/accounts.ts`
 - Pattern: Constructor-injected `refreshFn` (`codexRefreshFn`) and `quotaManager`; background timer with on-demand `markUsed` to refresh before the next request.
 
 **`OpenAiVault`:**
@@ -251,49 +235,41 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Pattern: Wraps the shared `ClaustrumConsumer` (no credential cache by design: every send is authorized by the vault) and runs `ClaustrumEnrollmentManager` for Connect; connections, the state directory and the clock are injected so tests drive it against a mock daemon.
 
 **`QuotaManager`:**
-
-- Purpose: Single source of truth for in-memory main + per-fallback quota. Inflight dedup per fingerprint so concurrent calls with different tokens never cross-pollute.
-- Location: `packages/core/src/quota-manager.ts`
+ - Purpose: Single source of truth for in-memory main + per-fallback quota. Inflight dedup per fingerprint so concurrent calls with different tokens never cross-pollute.
+ - Location: `packages/core/src/quota-manager.ts`
 - Pattern: Push-only (no `fetchQuotaFn` injected — quota comes via `setMain`/`setFallback`); active refresh is orchestrated by `refreshAllQuota`.
 
 **`BackgroundQuotaRefresh`:**
-
 - Purpose: Periodic background quota polling for idle accounts across processes with an auto-renewing cross-process lease lock (`bg-quota-refresh`), per-window freshness gating, and timestamp-based snapshot merging.
 - Location: `packages/opencode/src/core/background-quota-refresh.ts`
 - Pattern: Unref'd interval timer with jitter; non-blocking cancellation (`isStopped()` check before writing sidebar state); serialized cross-process execution via `acquireBackgroundRefreshLock`.
 
 **Sticky candidate selection:**
-
 - Purpose: Cold-session candidate selection, sustainable spend-rate weighting, and sticky-break classification.
 - Location: `packages/opencode/src/core/sticky-routing.ts`
 - Pattern: Pure functions (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`) calculating quota pressure divided by sustainable spendable rate, where the credit budget participates as its own axis on its own reset; excludes stale or killswitch-failing accounts; falls open to configured order. Reads the shared `spendControlExhaustedResetAt` signal so cold placement, admission, and warm-pin migration agree on what "spent" means.
 
 **`CacheKeepManager`:**
-
 - Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm. Main-only `sustain` bypasses idle pruning without affecting the other bounds.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Pattern: Target map keyed by session id; interval timer; bounded (`maxTargets`, `maxBytes`) so a long-lived process cannot leak; model-aware TTL adjustment (30-min TTL for GPT-5.6 models) and gpt-5.6 subagent 2-warm limits.
 
 **Reset credit redemption coordinator:**
-
 - Purpose: Preview reset-credit eligibility and redeem exactly one explicit credit for an exhausted account after identity-bound confirmation.
-- Location: `packages/core/src/reset-credits.ts`; command orchestration in `packages/core/src/commands.ts` (`executeResetCommand` shared body).
+ - Location: `packages/core/src/reset-credits.ts`; command orchestration in `packages/core/src/commands.ts` (`executeResetCommand` shared body).
 - Pattern: Persisted `(creditId, redeemRequestId)` claim before the consume POST; confirm-time identity and new-attempt precondition checks; terminal-only finalization with bounded, identifier-stable retry for ambiguous outcomes.
 
 **`OpenAIWebSocketPool` / `createWebSocketFetch`:**
-
 - Purpose: Session-keyed WebSocket pool with continuation chaining (`previous_response_id`), refusal cleanup (clearing continuation state and destroying the socket so retries re-send full input), oversized frame (1009) HTTP relay fallback (`relayWithOversizedFallback`), per-account discriminator so a switch forces a fresh socket, and stream-failure retries.
 - Location: `packages/opencode/src/ws-pool.ts`
 - Pattern: `Map<accountDiscriminator, PoolEntry>`; lazy WS upgrades; pool entry owns its `turnID`/`turnStartedAt` so a single user turn keeps one Codex turn id across the whole tool loop; owns the response body so pre-output oversized frame rejections seamlessly complete over HTTP.
 
 **Loopback RPC server:**
-
 - Purpose: Notification queue + apply dispatch between loader and TUI.
 - Location: `packages/opencode/src/rpc/`
 - Pattern: HTTP server on `127.0.0.1:<ephemeral>` with a 32-byte bearer token written to `port-<pid>.json`; client discovers via pid-liveness scan of the dir.
 
 **Sidebar snapshot:**
-
 - Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema; also owns machine-global sticky assignments.
 - Location: `packages/opencode/src/sidebar-state.ts`
 - Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState`, short-lived session display records via `upsertSidebarActiveRouting`, and SHA-256-keyed sticky assignments via `resolveSidebarStickyAssignment`; file locking and a promise serialization chain preserve concurrent placement and pending-byte accounting. Pins expire after seven days.
@@ -301,19 +277,16 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 ## Entry Points
 
 **Plugin entry:**
-
 - Location: `packages/opencode/src/index.ts` (`CodexAuthPlugin`)
 - Triggers: OpenCode loads `@cortexkit/opencode-openai-auth` per `~/.config/opencode/opencode.json` `plugin` field.
-- Responsibilities: Returns `Hooks`; `provider.models` filters the OpenAI model list (allow-list + GPT >5.4 fallback, disallowing bare `gpt-5.6`/`gpt-6`) and zeroes OAuth costs; `auth.loader` does the heavy lifting on first OAuth request and starts the vault's background roster poll; `auth.fetch` is the per-request wrapper; `command.execute.before` returns `cleanAbort` for `/openai-*`; `tool.web_search` registers `HostedWebSearchTool`; `event` cleans session state on `session.deleted`; `dispose` closes WS, stops cachekeep, stops background refresh, stops background quota polling, and closes the vault connection.
+- Responsibilities: Returns `Hooks`; `provider.models` filters the OpenAI model list (allow-list + GPT >5.4 fallback, disallowing bare `gpt-5.6`/`gpt-6`) and zeroes OAuth costs; `auth.loader` does the heavy lifting on first OAuth request and starts the vault's background roster poll; `auth.fetch` is the per-request wrapper; `command.execute.before` returns `cleanAbort` for `/openai-*`; `event` cleans session state on `session.deleted`; `dispose` closes WS, stops cachekeep, stops background refresh, stops background quota polling, and closes the vault connection.
 
 **TUI entry:**
-
 - Location: `packages/opencode/src/tui/entry.mjs` (exported as `./tui`; dispatches to the precompiled or raw TUI)
 - Triggers: OpenCode TUI loads the plugin per its `oc-plugin: ["server", "tui"]` field.
 - Responsibilities: Renders the sidebar (quota, fallback accounts, routing, health, pacing); polls the loader RPC for dialogs; dispatches Apply; reads/writes `tui-preferences.jsonc`.
 
 **Pi extension entry:**
-
 - Location: `packages/pi/src/index.ts` (`cortexKitPiOpenAIAuth`)
 - Triggers: Pi loads the extension per its `pi.extensions` field.
 - Responsibilities: Registers the `openai-codex` provider with model list, OAuth login/refresh, custom streaming wrapper that swaps `globalThis.WebSocket` for the hand-rolled client, and the `/openai` command (its Vault section enrolls Pi as `openai-auth-pi`).
@@ -351,7 +324,6 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 **Logging:** Leveled logger engine in `packages/core/src/logger.ts`, initialized per host by `packages/opencode/src/logger.ts` (log file + env level). Channels: `transport`, `quota`, `refresh`, `accounts`, `cachekeep`, `vault`, `claustrum`, `models`, `rpc`, `rpc-tui`, `dump`, `sidebar`, `commands`. Redacts Bearer/sk-/JWT tokens, secret/api-key/password/token-like headers, ChatGPT stable ID (`chatgpt-account-id`/`chatgptAccountId`), and any value matching the secret-key patterns, while keeping the internal account ID visible. Vault tokens and served credentials never reach the `vault` or `claustrum` channels. Transport lifecycle and stream failures log to `transport` independent of dump settings so errors leave records at normal log levels. Log files, request dumps, and the default dump directory are restricted to private permissions (`0o600` for files, `0o700` for directories). Credentials and tokens are redacted from request dump bodies as well as log files, while `redactStrings` preserves tool schemas in dumps so definitions remain parseable and replayable. File rotates at 5 MiB keeping 3 generations; default file `tmpdir/opencode-openai-auth.log` (override `OPENCODE_OPENAI_AUTH_LOG_FILE`). Log level is settable at runtime via `/openai-logging` (persisted) or env `OPENCODE_OPENAI_AUTH_LOG_LEVEL`.
 
 **Caching:** Two layers.
-
 - **In-memory quota cache:** `QuotaManager` (per-account fingerprint; 5-min refresh-after default; `respectBackoff` gates active polling).
 - **Prompt cache keep-warm:** `CacheKeepManager` tracks per-session last request and replays as `store:false` before the Codex ~5-min eviction window.
 
@@ -361,6 +333,6 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 
 **Configuration resolution (`config.ts`):** Env wins over config file wins over default. The `webSearch` cache fix is default-on and gated by a NEGATIVE env (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`). Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. Settings are memoized per process; commands that write configuration on disk (such as `/openai-dump`) invoke `refreshSettings()` to invalidate the memoized settings and pick up changes immediately. Tests call `resetSettingsForTest`.
 
-**Versioning & build:** `packages/opencode/src/version.ts` exposes `PackageVersion` (currently `0.9.0`); the TUI plugin header reads `package.json` at runtime via `import.meta.url` so the version badge tracks the package version without baking it into the dist. Use `packages/opencode/scripts/build-tui.ts` during the build to precompile TUI Solid JSX source files into `packages/opencode/src/tui-compiled/` using the `@opentui/solid` compiler transform, binding Solid/OpenTUI imports to the host's virtual runtime registry (`opentui:runtime-module:<specifier>`) so the TUI shares the host's single Solid/OpenTUI runtime. The root `build` script runs `scripts/check-installed-ranges.mjs` first, refusing the build when an installed dependency's version (resolved from the nearest `node_modules` walking up from each workspace) falls outside the range its manifest declares — `bun install --frozen-lockfile` never checks the installed tree against the manifests, and because the build inlines dependencies, whatever version is installed at build time is what every user runs. The release pipeline is tag-driven (`.github/workflows` + `scripts/release.sh`); see `README.md` for the exact command surface.
+**Versioning & build:** `packages/opencode/src/version.ts` exposes `PackageVersion` (currently `0.9.0`); the TUI plugin header reads `package.json` at runtime via `import.meta.url` so the version badge tracks the package version without baking it into the dist. Use `packages/opencode/scripts/build-tui.ts` during the build to precompile TUI Solid JSX source files into `packages/opencode/src/tui-compiled/` using the `@opentui/solid` compiler transform, binding Solid/OpenTUI imports to the host's virtual runtime registry (`opentui:runtime-module:<specifier>`) so the TUI shares the host's single Solid/OpenTUI runtime. The root `build` script runs `scripts/check-installed-ranges.mjs` first, refusing the build when an installed dependency's version (resolved from the nearest `node_modules` walking up from each workspace) falls outside the range its manifest declares — `bun install --frozen-lockfile` never checks the installed tree against the manifests, and because the build inlines dependencies, whatever version is installed at build time is what every user runs. The release pipeline is tag-driven (`.github/workflows` + `scripts/release.sh`); see `docs/release.md` for the exact command surface.
 
 **Formatting/linting:** Biome 2.5.15 (single quotes, no semicolons, trailing commas, 2-space indent). Lefthook runs `biome check` on staged files. Tests run via `bun test src/tests`; typecheck via `tsc`.

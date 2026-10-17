@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
-import type { CommandInvocation } from '@cortexkit/common-auth/commands'
+import type {
+  CommandApplyRequest,
+  CommandInvocation,
+} from '@cortexkit/common-auth/commands'
 import {
   formatQuota,
   projectQuota,
@@ -154,6 +157,92 @@ async function sections(connected = true) {
 }
 
 describe('vault command menu', () => {
+  test('Routing shows the default vault account placement without renaming any route', async () => {
+    roster[1]!.credentialId = 'chatgpt:openai'
+    const menu = createOpenCodeMenu(context())
+    for (const mode of ['main-first', 'fallback-first', 'ordered'] as const) {
+      expect(
+        (
+          await menu.apply(
+            {
+              command: 'openai',
+              sectionId: 'routing',
+              actionId: 'mode',
+              values: { mode },
+            },
+            invocation,
+          )
+        ).ok,
+      ).toBe(true)
+      const routing = (await menu.open(invocation)).menu.sections.find(
+        (section) => section.id === 'routing',
+      )!
+      expect(routing.lines).toContain(
+        'Roster order: vault:chatgpt-main, vault:chatgpt-ufuk, vault:chatgpt-live',
+      )
+      if (mode !== 'ordered')
+        expect(routing.lines).toContain(
+          mode === 'main-first'
+            ? 'Tried in order: vault:chatgpt-ufuk, vault:chatgpt-main, vault:chatgpt-live'
+            : 'Tried in order: vault:chatgpt-main, vault:chatgpt-live, vault:chatgpt-ufuk',
+        )
+      expect(routing.lines).not.toContain(
+        'No default vault account, so this mode orders like Ordered',
+      )
+      const v2 = await createOpenCodeMenu({
+        ...context(),
+        readOnly: true,
+      }).open(invocation)
+      expect(
+        v2.menu.sections.find((section) => section.id === 'routing')!.lines,
+      ).toEqual(routing.lines)
+    }
+  })
+
+  test('Routing explains alias-only placement modes but not Ordered or sticky-balanced', async () => {
+    const menu = createOpenCodeMenu(context())
+    for (const mode of [
+      'main-first',
+      'fallback-first',
+      'ordered',
+      'sticky-balanced',
+    ] as const) {
+      await menu.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'mode',
+          values: { mode },
+        },
+        invocation,
+      )
+      const routing = (await menu.open(invocation)).menu.sections.find(
+        (section) => section.id === 'routing',
+      )!
+      expect(
+        routing.lines.includes(
+          'No default vault account, so this mode orders like Ordered',
+        ),
+      ).toBe(mode === 'main-first' || mode === 'fallback-first')
+      expect(
+        routing.lines.some((line) => line.startsWith('Tried in order:')),
+      ).toBe(false)
+      const v2 = await createOpenCodeMenu({
+        ...context(),
+        readOnly: true,
+      }).open(invocation)
+      expect(
+        v2.menu.sections.find((section) => section.id === 'routing')!.lines,
+      ).toEqual(routing.lines)
+    }
+    expect(
+      (await sections(false)).find((section) => section.id === 'routing')!
+        .lines,
+    ).not.toContain(
+      'No default vault account, so this mode orders like Ordered',
+    )
+  })
+
   test('dialog quota text matches the shared formatter and each row checks only its account', async () => {
     roster[0]!.email = 'known@example.com'
     const quota = (await sections()).find((section) => section.id === 'quota')!
@@ -205,10 +294,12 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.15.0')
-      expect(manifest.devDependencies['@cortexkit/claustrum-client']).toBe(
-        '^0.9.0',
-      )
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.18.0')
+      expect(
+        (manifest.dependencies ?? manifest.devDependencies)[
+          '@cortexkit/claustrum-client'
+        ],
+      ).toBe('^0.9.0')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the
@@ -266,7 +357,7 @@ describe('vault command menu', () => {
     }
   })
   test('cold and declined vault accounts are listed but not counted as routable', async () => {
-    roster[0]!.state = 'needs_login'
+    roster[0]!.state = 'needs_reauth'
     roster[1]!.enabled = false
     const accounts = (await sections()).find(
       (section) => section.id === 'accounts',
@@ -282,7 +373,7 @@ describe('vault command menu', () => {
     const quota = (await sections()).find((section) => section.id === 'quota')!
     expect(quota.items.map((item) => item.id)).toEqual([roster[2]!.routeId])
     expect(quota.lines).toEqual([
-      `${roster[0]!.label} (needs_login): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
+      `${roster[0]!.label} (needs_reauth): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
       `${roster[1]!.label} (disabled): ${formatQuota(projectQuota(roster[1]!.quota), { now, form: 'compact' })}`,
     ])
   })
@@ -575,4 +666,70 @@ Open the OpenCode TUI to change these settings.`)
       older.items.find((item) => item.id === roster[0]!.routeId)?.detail,
     ).toContain('checked 15m ago')
   })
+})
+
+test('OpenCode 2 vault read-only projection preserves wave-one data and reset precedence without polling', async () => {
+  const ctx = context(true)
+  const before = [
+    readFileSync(files.configFile, 'utf8'),
+    readFileSync(files.stateFile, 'utf8'),
+  ]
+  const expected = await createOpenCodeMenu(ctx).open({
+    ...invocation,
+    sessionId: 'session-a',
+  })
+  let refreshes = 0
+  ctx.vault!.refresh = async () => {
+    refreshes++
+  }
+  const menu = createOpenCodeMenu({
+    ...ctx,
+    readOnly: true,
+    unavailableSections: ['cache', 'diagnostics', 'reset'],
+  })
+  const actual = await menu.open({ ...invocation, sessionId: 'session-a' })
+  expect(actual.menu.sections.map((s) => s.id)).toEqual(
+    expected.menu.sections.map((s) => s.id),
+  )
+  for (const section of expected.menu.sections) {
+    const got = actual.menu.sections.find((s) => s.id === section.id)!
+    if (section.id === 'reset') expect(got).toEqual(section)
+    else if (['cache', 'diagnostics'].includes(section.id))
+      expect(got).toEqual({
+        ...section,
+        lines: ['Not available on OpenCode 2 yet.'],
+        items: [],
+        actions: [],
+      })
+    else expect(got).toEqual(section)
+    const requests = [
+      { sectionId: section.id },
+      ...section.actions.map((action) => ({
+        sectionId: section.id,
+        actionId: action.id,
+      })),
+      ...section.items.flatMap((item) =>
+        item.actions.map((action) => ({
+          sectionId: section.id,
+          itemId: item.id,
+          actionId: action.id,
+        })),
+      ),
+    ]
+    for (const request of requests)
+      expect(
+        (
+          await menu.apply(
+            { command: 'openai', ...request } as CommandApplyRequest,
+            invocation,
+          )
+        ).ok,
+      ).toBe(false)
+  }
+  expect(refreshes).toBe(0)
+  expect(polls).toEqual([])
+  expect([
+    readFileSync(files.configFile, 'utf8'),
+    readFileSync(files.stateFile, 'utf8'),
+  ]).toEqual(before)
 })

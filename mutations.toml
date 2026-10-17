@@ -10,7 +10,262 @@
 # a silent, costly failure: a credential lost or leaked, a reset credit spent
 # twice, output replayed, a crash that loses an account, a wire contract.
 
+[[control]]
+id = "pi-test-native-auth-isolation"
+guards = "Pi tests resolve native auth only inside a temporary agent directory, never the developer login"
+file = "packages/pi/src/tests/test-isolation.ts"
+old = "    process.env.PI_CODING_AGENT_DIR = dir"
+new = "    delete process.env.PI_CODING_AGENT_DIR // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/test-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/test-isolation.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/test-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^native Pi auth resolves inside the current test temp directory, never the real home$']
+
+# On every host, Main first tries the vault's chatgpt:openai credential first
+# and Fallback first tries it last. Local rows cannot fill that role in vault mode.
+
+[[control]]
+id = "sidebar-vault-host-toggle"
+guards = "vault availability does not overwrite the user's host toggle"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "enabled: row.enabled,"
+new = "enabled: routable.has(row.routeId), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\sretain\sunavailable\svault\saccounts\sseparately\sfrom\sthe\shost\stoggle$']
+
+[[control]]
+id = "sidebar-vault-all-visible"
+guards = "every vault account contributes to the rendered quota list even when turned off"
+file = "packages/opencode/src/tui.tsx"
+old = "return state.vaultAccounts.map((account) => account.quota)"
+new = "return state.vaultAccounts.filter((account) => account.enabled).map((account) => account.quota) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\sretain\sunavailable\svault\saccounts\sseparately\sfrom\sthe\shost\stoggle$']
+
+[[control]]
+id = "sidebar-pool-main-killswitch"
+guards = "the local main sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(POOL_MAIN_ROW_ID) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-pool-fallback-killswitch"
+guards = "the local fallback sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(row.id) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-vault-killswitch"
+guards = "the vault sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(row.routeId) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-legacy-killswitch"
+guards = "the pre-migration main sidebar uses the routing killswitch policy"
+file = "packages/opencode/src/index.ts"
+old = "killed: !killswitchPassesPolicy(mainQuota, store, undefined, now),"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\slegacy\skilled\sflags\suse\sthe\srouting\spolicy$']
+
+[[control]]
+id = "sidebar-vault-prunes-local-records"
+guards = "every locked vault write removes old local session records without dropping vault pins"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "if (next.vaultAccounts !== undefined) {"
+new = "if (false) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\svault\swrites\sprune\slocal\srecords\sand\spreserve\sunavailable\svault\spins$']
+
+[[control]]
+id = "vault-default-main-mapping"
+guards = "only the exact default OpenAI vault credential plays main without changing its route id"
+file = "packages/core/src/pool-routing.ts"
+old = "route.credentialId === 'chatgpt:openai',"
+new = "route.credentialId === 'chatgpt:openai:missing', // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/pool-routing-placement.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^ordered routing placement vault main mapping uses only the exact default credential and preserves its route id$']
+
+[[control]]
+id = "vault-main-never-maps-local-row"
+guards = "a local row never becomes main in vault mode even if it is named like the default credential"
+file = "packages/core/src/pool-routing.ts"
+old = "route.id.startsWith('vault:') &&"
+new = "true && // NON-VACUITY BREAK: allow a local row to play vault main."
+test_file = "packages/core/src/tests/pool-routing-placement.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^ordered routing placement vault main mapping never assigns a local row the main role$']
+
+[[control]]
+id = "opencode1-vault-default-main-wiring"
+guards = "OpenCode 1 applies the default vault main mapping on its ordered request path"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "vaultMainRouteId(ctx.vault.routes())"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the request path in vault mode main-first places the default vault account first and fallback-first places it last$']
+
+[[control]]
+id = "opencode2-vault-default-main-wiring"
+guards = "OpenCode 2 applies the default vault main mapping before authorizing an ordered attempt"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "vaultMainRouteId(vault?.routes() ?? [])"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault accounts on OpenCode 2 main-first places the default vault account first and fallback-first places it last$']
+
+[[control]]
+id = "pi-vault-default-main-wiring"
+guards = "Pi applies the default vault main mapping instead of using its own login as main"
+file = "packages/pi/src/runtime.ts"
+old = "vaultMainRouteId(this.vault.routes())"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi in vault mode main-first places the default vault account as main$']
+
+# OpenCode 2 locations share pending placement bytes only within one account store.
+
+[[control]]
+id = "opencode2-shared-session-pins"
+guards = "cold sessions in different locations see the same pending-byte ledger"
+file = "packages/opencode/src/v2/setup.ts"
+old = "  const pins = acquireSessionPins(paths())"
+new = "  const pins = new (await import('./pins')).SessionPins() // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sshared\ssession\spins\stwo\slocations\sspread\scold\ssessions\sacross\sequal\srows$']
+
+[[control]]
+id = "opencode2-session-pins-store-isolation"
+guards = "different account stores never share session pins or pending placement bytes"
+file = "packages/opencode/src/v2/shared-pins.ts"
+old = """  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])"""
+new = "  const key = 'all-stores' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sshared\ssession\spins\sgives\seach\saccount\sstore\sits\sown\sledger\sand\sone\sledger\sper\sstore$']
+
 # Send-time eligibility and vault admission on the migrated request paths.
+
+[[control]]
+id = "setup-opencode2-defers-local-login"
+guards = "OpenCode 2 setup leaves OAuth and the active pool login to OpenCode 2 instead of writing OpenCode 1's auth slot"
+file = "packages/opencode/src/setup.ts"
+old = "      if (context.opencodeGeneration === '2') return"
+new = "      // NON-VACUITY BREAK: let OpenCode 2 setup write the OpenCode 1 slot."
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sOpenCode\s2\ssetup\suses\sopencode2\swithout\slocal\sOAuth\sor\sslot\swrites$']
+
+[[control]]
+id = "setup-vault-mode-guard"
+guards = "vault setup leaves local credentials untouched and local setup refuses an enrolled host"
+file = "packages/opencode/src/setup.ts"
+old = "      await assertLocal(host)\n    },"
+new = "      // NON-VACUITY BREAK: permit local registration of an enrolled host.\n    },"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\svault\smode\spreserves\severy\slocal\scredential\sbyte\sand\srefuses\slocal\ssign-in$']
+
+[[control]]
+id = "setup-opencode-enrollment-path"
+guards = "setup enrolls OpenCode beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sopencode\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
+
+[[control]]
+id = "setup-pi-enrollment-path"
+guards = "setup enrolls Pi beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getPiAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getPiAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\spi\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
 
 [[control]]
 id = "cachekeep-vault-send-wiring"
@@ -68,7 +323,7 @@ expect_red = ['^vault\scachekeep\sa\slocal\spool\swarm\skeeps\sits\sbearer\sand\
 id = "vault-request-reading-contains-poll-rejection"
 guards = "a rejected background quota poll is warned about without an unhandled rejection and releases its in-flight dedupe"
 file = "packages/core/src/vault.ts"
-old = """    const pull = this.pollQuota(routeId)
+old = """    const pull = this.pollQuota(routeId, false)
       .catch((error: unknown) => {
         log.warn('vault quota poll failed', {
           routeId,
@@ -76,13 +331,26 @@ old = """    const pull = this.pollQuota(routeId)
         })
       })
       .finally(() => {"""
-new = """    const pull = this.pollQuota(routeId).finally(() => {"""
+new = """    const pull = this.pollQuota(routeId, false).finally(() => {"""
 test_file = "packages/core/src/tests/vault-request-reading.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-request-reading.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-request-reading.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\srequestReading\\sreports\\srejected\\squota\\spolls\\swithout\\san\\sunhandled\\srejection\\sand\\sreleases\\sdeduplication$"]
+
+[[control]]
+id = "vault-quota-source-logs-only-transitions"
+guards = "a route with an unchanged background quota source is not logged again"
+file = "packages/core/src/vault.ts"
+old = "    if (this.#lastQuotaSource.get(routeId) === source) return"
+new = "    if (false) return // NON-VACUITY BREAK: log unchanged quota polls."
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\sinsula\\squota\\sbackground\\squota\\ssource\\slogs\\sonly\\schanges\\sand\\snever\\sexposes\\saccount\\sidentity$"]
 
 [[control]]
 id = "pool-send-rechecks-current-eligibility"
@@ -972,6 +1240,36 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^request\\spath\\snever\\swaits\\son\\sbookkeeping\\sa\\ssticky-balanced\\srequest\\sreaches\\sthe\\swire\\swhen\\sthe\\ssidebar\\swrite\\sfails,\\sand\\sits\\spin\\slands\\sonce\\swrites\\swork\\sagain$"]
 expect_message = "EEXIST: file already exists"
 
+[[control]]
+id = "opencode1-sidebar-writer-uses-current-config"
+guards = "an idle OpenCode 1 loader writes the routing mode changed on disk with its quota reading"
+file = "packages/opencode/src/index.ts"
+old = """          const currentStorage = loadCurrentStorageForDisplay()
+          const store =
+            currentStorage instanceof Promise
+              ? await currentStorage.catch(() => lastRequestStorage)
+              : currentStorage"""
+new = "          const store = lastRequestStorage // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/shared-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^one host vault per process an idle OpenCode 1 loader publishes the current route with a quota reading$"]
+
+[[control]]
+id = "opencode1-stale-account-read-cannot-replace-newer"
+guards = "a storage read that began before a config change cannot publish after its newer read"
+file = "packages/opencode/src/core/current-storage.ts"
+old = "          if (generation > publishedGeneration) {"
+new = "          if (true) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/current-storage.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^an older config-and-state read that finishes last cannot replace the newer snapshot$"]
+
 # Build gates that scan for a violation must be seen to fail on a planted one.
 
 [[control]]
@@ -1341,7 +1639,7 @@ expect_message = "vault-owns-accounts"
 [[control]]
 id = "pool-downgrade-warning-names-empty-bearer"
 guards = "the migration docs warn that a pre-1.0 build sends the placeholder's empty bearer"
-file = "README.md"
+file = "docs/accounts-and-routing.md"
 old = "Downgrading after the account-pool migration is unsupported."
 new = "NON-VACUITY BREAK: downgrade warning removed."
 test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
@@ -1531,9 +1829,9 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 
 [[control]]
 id = "menu-common-auth-release"
-guards = "all packages require the Windows private-file common-auth release, which also retains Pi-slot and replacement-slot menus"
+guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.15.0"'
+old = '"@cortexkit/common-auth": "^0.18.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1910,7 +2208,7 @@ expect_message = "expect(received).toEqual(expected)"
 
 [[control]]
 id = "dialog-group-category"
-guards = "group headers and section summaries are categories, not options"
+guards = "group headers are categories, not options"
 file = "packages/opencode/src/tui/command-dialogs.tsx"
 old = "...(item.group ? { category: item.group } : {}),"
 new = "// NON-VACUITY BREAK: omit item group headers."
@@ -1921,6 +2219,47 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^the\s/openai\sdrawer\sgroup\sheaders\smap\sto\scategory\sabove\sactionable\srows$']
 expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-multiline-section-header"
+guards = "multiline section context cannot hide Diagnostics actions or Back below the host's list height"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "  return options\n}"
+new = """
+  // NON-VACUITY BREAK: restore the joined multiline category header.
+  const first = options[0]
+  if (first) {
+    const category = first.category
+    const text = [sectionTitle(section).split('\\n').slice(1).join('\\n'), category].filter(Boolean).join('\\n')
+    for (const option of options) {
+      if (option.category !== category) break
+      option.category = text
+    }
+  }
+  return options
+}
+"""
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\srenders\severy\sDiagnostics\saction\sand\sBack\sbelow\smultiline\ssection\scontext$']
+expect_message = "Diagnostics hides Set the log level"
+
+[[control]]
+id = "dialog-v2-multiline-description"
+guards = "OpenCode 2's section descriptions cannot consume the rows reserved for later options"
+file = "packages/opencode/src/tui/v2-dialog.ts"
+old = "description: inlineDescription(...section.lines),"
+new = "description: section.lines.join('\\n'), // NON-VACUITY BREAK: add uncounted description rows."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\srenders\sOpenCode\s2\ssections\sand\sactions\swithout\smultiline\sdescription\sclipping$']
+expect_message = "OpenCode 2 menu hides Reset credits"
 
 [[control]]
 id = "dialog-status-footer"
@@ -1963,6 +2302,20 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
 expect_message = "expect(received).toBe(expected)"
+
+[[control]]
+id = "sidebar-reset-column"
+guards = "sidebar quota rows retain shared future reset timing for local and vault readings"
+file = "packages/opencode/src/tui.tsx"
+old = "        resetText:\n          reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),\n        pacing:"
+new = "        resetText: undefined, // NON-VACUITY BREAK: drop reset timing from sidebar rows.\n        pacing:"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\srows\sshow\sthe\sshared\sreset\stiming\sfor\slocal\sand\svault\saccounts$']
+expect_message = "expect(received).toEqual(expected)"
 
 [[control]]
 id = "pi-per-account-quota"
@@ -3316,8 +3669,8 @@ expect_red = ['^shared\spool\ssource\sstate\sdoes\snot\sreplay\sa\sreading\sonto
 id = "opencode2-disposal-joins-adoption"
 guards = "a running adoption and its pool reload cannot outlive host cleanup"
 file = "packages/opencode/src/v2/setup.ts"
-old = "        Promise.all([lifecycle?.idle(), source.settled()]),"
-new = "        Promise.all([Promise.resolve(), source.settled()]), // NON-VACUITY BREAK: abandon adoption."
+old = "          lifecycle?.idle(),"
+new = "          Promise.resolve(), // NON-VACUITY BREAK: abandon adoption."
 test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
@@ -3404,3 +3757,912 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vaul
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^one\shost\svault\sper\sprocess\sreadiness\swaits\sfor\squota\sin\sthe\slive\sconsumer\ssnapshot$']
+
+[[control]]
+id = "insula-codex-raw-used-percent"
+guards = "saved reset relaxation cannot make an exhausted Codex account appear unused"
+file = "packages/core/src/insula-quota.ts"
+old = "  const usedPercent = window.rawUsedPercent ?? window.usedPercent"
+new = "  const usedPercent = window.usedPercent // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^insula\scodex\snormalization\sraw\susage\sbeats\sthe\ssaved-reset\spublished\szero$']
+
+[[control]]
+id = "insula-vault-skip-wham-on-hit"
+guards = "a current matched insula entry suppresses that account's background wham request"
+file = "packages/core/src/vault.ts"
+old = "      if (cached !== undefined && row?.accountIdentity) {"
+new = "      if (false && cached !== undefined && row?.accountIdentity) { // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\scurrent\shit\sskips\swham\sonly\sfor\sits\smatched\saccount$']
+
+[[control]]
+id = "insula-vault-miss-falls-back"
+guards = "a missing insula entry leaves the existing wham poll in charge"
+file = "packages/core/src/vault.ts"
+old = "    let failure: string | undefined\n    const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch"
+new = "    if (background) return { ok: true } // NON-VACUITY BREAK\n    let failure: string | undefined\n    const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\smissing\ssource\sfalls\sback\sto\swham$']
+
+[[control]]
+id = "insula-vault-hit-no-discovery"
+guards = "three current insula matches reload the persisted roster without per-account vault discovery"
+file = "packages/core/src/vault.ts"
+old = "        const kept = await this.#consumer.recordAccountQuota("
+new = "        await this.refresh() // NON-VACUITY BREAK\n        const kept = await this.#consumer.recordAccountQuota("
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\sthree\smatched\saccounts\sadd\sno\sdiscovery\sto\sa\sbackground\stick$']
+
+[[control]]
+id = "subc-single-copy-installed-tree"
+guards = "a second physical subc-client instance cannot pass the installed-tree check"
+file = "scripts/check-private-files-tree.mjs"
+old = "  requireSubc &&"
+new = "  false && // NON-VACUITY BREAK\n  requireSubc &&"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\srejects\sa\ssecond\ssubc-client\scopy\sat\sthe\ssame\sversion$']
+
+[[control]]
+id = "opencode-subc-client-external"
+guards = "the OpenCode bundle imports its single installed subc-client instead of embedding another client implementation"
+file = "packages/opencode/package.json"
+old = "--external @cortexkit/subc-client --minify && bun run build:types"
+new = "--minify && : 'NON-VACUITY BREAK' && bun run build:types"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/opencode build && bun test --cwd packages/opencode ./src/tests/vault-client-packaging.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\sopencode\simports\svault\sclients\sfrom\sruntime\sdependencies$']
+
+[[control]]
+id = "pi-subc-client-external"
+guards = "the Pi bundle imports its single installed subc-client instead of embedding another client implementation"
+file = "packages/pi/package.json"
+old = "--external @cortexkit/subc-client --minify && bun run build:types"
+new = "--minify && : 'NON-VACUITY BREAK' && bun run build:types"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/pi build && bun test --cwd packages/opencode ./src/tests/vault-client-packaging.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\spi\simports\svault\sclients\sfrom\sruntime\sdependencies$']
+
+[[control]]
+id = "installed-tree-follows-store-links"
+guards = "a second copy reached through a link into Bun's store still counts, so ignoring unlinked store entries cannot hide a real duplicate"
+file = "scripts/check-private-files-tree.mjs"
+old = "  if (!isDirectory(real) || visitedPackages.has(real)) return"
+new = "  if (!isDirectory(real) || visitedPackages.has(real) || real !== resolve(path)) return // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\scounts\sa\ssecond\scopy\sreached\sthrough\sthe\sBun\sstore$']
+
+[[control]]
+id = "gpt-6-1-sol-gets-codex-500k-context"
+guards = "gpt-6.1-sol keeps Codex's 500k default context instead of the 272k surcharge cap its subscription use does not pay"
+file = "packages/opencode/src/index.ts"
+old = "    return { context: 500_000, input: 372_000, output: 128_000 }"
+new = "    return { context: 372_000, input: 244_000, output: 128_000 } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/model-filter.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/model-filter.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/model-filter.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['500k\scontext\sCodex\suses\sby\sdefault$']
+
+[[control]]
+id = "vault-reset-credits-carry"
+guards = "wham reset credits survive conversion and persist in the shared vault roster"
+file = "packages/core/src/pool-quota.ts"
+old = "    typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0"
+new = "    false && typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0 // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sreset\scredits\swham\sreading\sreaches\sboth\sprocesses\ssidebar\sfiles$']
+
+[[control]]
+id = "quota-reset-credits-valid-count"
+guards = "an invalid reset count cannot invalidate otherwise usable quota windows"
+file = "packages/core/src/pool-quota.ts"
+old = "    typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0"
+new = "    typeof credits === 'number' && Number.isFinite(credits) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/pool-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^pool\squota\sconversion\skeeps\swindow\sreadings\swhen\sthe\sreset\scount\sis\snot\sa\snon-negative\ssafe\sinteger$']
+
+[[control]]
+id = "vault-reset-credits-newest-wins"
+guards = "a cached insula count uses its producer time rather than overwriting a newer count at receipt time"
+file = "packages/core/src/pool-quota.ts"
+old = "      ? { resetCredits: { value: credits, checkedAt } }"
+new = "      ? { resetCredits: { value: credits, checkedAt: Date.now() /* NON-VACUITY BREAK */ } }"
+test_file = "packages/opencode/src/tests/vault-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sreset\scredits\snewer\sreset\scount\sbeats\san\solder\sinsula\sreading$']
+
+[[control]]
+id = "vault-reset-credits-sidebar"
+guards = "the vault sidebar reads the persisted reset counter without a process-local quota side channel"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "      const credits = row.quota?.counters?.resetCredits?.value"
+new = "      const credits = undefined // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sreset\scredits\swham\sreading\sreaches\sboth\sprocesses\ssidebar\sfiles$']
+
+[[control]]
+id = "opencode2-tui-poll-cleanup"
+guards = "a replaced OpenCode 2 TUI mount stops its poll timer while the new mount keeps polling"
+file = "packages/opencode/src/tui/v2.tsx"
+old = "      clearInterval(timer)"
+new = "      // NON-VACUITY BREAK: leave the old mount's interval running."
+test_file = "packages/opencode/src/tests/opencode2-e2e.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/opencode build && OPENAI_AUTH_OPENCODE2_E2E=1 bun test --cwd packages/opencode ./src/tests/opencode2-e2e.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-e2e.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^openai-auth\son\sOpenCode\s2\s\(real\shost\)\sP0:\spacked\scommand,\sdialog\sand\ssidebar\smount\son\sthe\slocked\shost$']
+
+[[control]]
+id = "opencode2-tui-default-invisible"
+guards = "the OpenCode 2 transport contributes no sidebar UI unless a sidebar owner opts in"
+file = "packages/opencode/src/tui/v2.tsx"
+old = "    options.sidebarText === undefined"
+new = "    false /* NON-VACUITY BREAK: mount without a sidebar owner. */"
+test_file = "packages/opencode/src/tests/opencode2-tui-transport.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-tui-transport.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-tui-transport.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\stransport\sstays\sinvisible\swithout\sa\smenu\sor\ssidebar\sowner$']
+
+[[control]]
+id = "opencode2-later-wave-section-refusal"
+guards = "unsupported sections refuse even a section-only RPC apply before the engine can report success"
+file = "packages/core/src/commands.ts"
+old = "  const unavailable = new Set(options.unavailableSections)"
+new = "  const unavailable = new Set<string>() // NON-VACUITY BREAK: expose later-wave actions."
+test_file = "packages/opencode/src/tests/opencode2-menu.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/core build && bun test --cwd packages/opencode ./src/tests/opencode2-menu.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sunavailable\ssections\srefuse\ssection-only\sapplies\seven\swithout\sthe\sread-only\sgate$']
+
+[[control]]
+id = "opencode2-no-tui-no-write"
+guards = "a headless command never starts a model turn, writes conversation messages or spends"
+file = "packages/opencode/src/v2/control-plane.ts"
+old = "      if (!owner || !isTuiConnected(input.sessionID)) return"
+new = "      if (!owner) return\n      await api.prompt({ sessionID: input.sessionID, text: 'NON-VACUITY BREAK' })"
+test_file = "packages/opencode/src/tests/opencode2-command.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sno-TUI\sexecution\smakes\sno\swrites\sor\smodel\sturns\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-knob-credential-scrubbing"
+guards = "nested RPC knob data never carries credential-shaped fields"
+file = "packages/core/src/commands.ts"
+old = "    if (isCredentialKey(key)) {"
+new = "    if (false && isCredentialKey(key)) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-menu.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/core build && bun test --cwd packages/opencode ./src/tests/opencode2-menu.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sknob\sscrubbing\sremoves\scredential-shaped\sfields\srecursively$']
+
+[[control]]
+id = "opencode2-main-removal-refusal"
+guards = "the menu cannot remove the host main login"
+file = "packages/opencode/src/core/pool-accounts.ts"
+old = "  if (id === POOL_MAIN_ROW_ID) return POOL_MAIN_REMOVAL_REFUSED"
+new = "  if (false && id === POOL_MAIN_ROW_ID) return POOL_MAIN_REMOVAL_REFUSED // NON-VACUITY BREAK: allow main removal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 removal refuses main$']
+
+[[control]]
+id = "opencode2-pending-transfer-removal-refusal"
+guards = "the menu cannot remove a row receiving the host login transfer"
+file = "packages/opencode/src/core/pool-accounts.ts"
+old = "  if (pending?.rowId === id) return poolTransferRemovalRefused(id)"
+new = "  if (false && pending?.rowId === id) return poolTransferRemovalRefused(id) // NON-VACUITY BREAK: allow transfer-row removal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 removal refuses pending$']
+
+[[control]]
+id = "opencode2-captured-vault-local-action-refusal"
+guards = "a locally rendered action reports vault authority after enrollment"
+file = "packages/core/src/vault-command-menu.ts"
+old = "        (request.sectionId === 'accounts' ||"
+new = "        (false || // NON-VACUITY BREAK: lose the captured local-account refusal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 stale authority refuses captured local action and resumes after unenroll$']
+
+[[control]]
+id = "opencode2-delayed-vault-local-action-refusal"
+guards = "a locally begun login cannot insert after enrollment and notifies its initiating session"
+file = "packages/core/src/commands.ts"
+old = "        if (vault && (await vault.authority()) !== 'local')"
+new = "        if (false && vault && (await vault.authority()) !== 'local') // NON-VACUITY BREAK: insert after vault enrollment."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 menu login completion enroll$']
+
+[[control]]
+id = "opencode2-vault-controls-capability-fence"
+guards = "vault enrollment actions remain unavailable even though the engine exposes them"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    allowAction: allowed,"
+new = "    allowAction: () => true, // NON-VACUITY BREAK: permit vault enrollment."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
+
+[[control]]
+id = "opencode2-sidebar-merge-owner"
+guards = "v2 publication retains other writers' routing and freshest quota windows"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        await setSidebarMachineState(machine, this.file, { canWrite })"
+new = "        await import('../sidebar-state').then(({ setSidebarState }) => setSidebarState({ ...machine, activeId: undefined }, this.file)) // NON-VACUITY BREAK: overwrite other producers."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: OpenCode 1 and two locations retain independent quota windows and routes$']
+
+[[control]]
+id = "opencode2-sidebar-single-publisher"
+guards = "two locations on one file share one passive publication observer"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "  let publisher = publishers.get(key)"
+new = "  let publisher = undefined as SidebarPublisher | undefined // NON-VACUITY BREAK: allocate per location."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: one observer per file survives a location disposal$']
+
+[[control]]
+id = "opencode2-sidebar-vault-authority"
+guards = "enrollment publishes exclusive vault state without polling local accounts"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        const vaultMode = authority !== 'local'"
+new = "        const vaultMode = false // NON-VACUITY BREAK: ignore enrollment when projecting state."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: real enrollment and disconnect publish exclusive vault state without local polling$']
+
+[[control]]
+id = "opencode2-sidebar-forget-session"
+guards = "clearing a pin removes only that session's projected route and assignment"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        const accounts = machine.vaultAccounts ?? machine.fallbacks"
+new = "        const accounts = machine.vaultAccounts ?? machine.fallbacks\n        if (routing.accountId === undefined) return // NON-VACUITY BREAK: leave cleared pins visible."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: pin clear preserves two other sessions and subagent routing$']
+
+[[control]]
+id = "opencode2-sidebar-idle-observation-interval"
+guards = "passive sidebar observation defaults to two seconds instead of four idle scans per second"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "  observationIntervalMs = 2_000,"
+new = "  observationIntervalMs = 250, // NON-VACUITY BREAK: restore frequent idle file scans."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: production observer defaults to two seconds$']
+
+[[control]]
+id = "opencode2-sidebar-reload-replaces-mount"
+guards = "TUI reload leaves exactly one sidebar claim instead of retaining the previous mount"
+file = "packages/opencode/src/tui/v2.tsx"
+old = "  state.mount?.dispose()"
+new = "  // NON-VACUITY BREAK: leave the previous TUI mount registered."
+test_file = "packages/opencode/src/tests/opencode2-sidebar.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 production entry mounts one sidebar at the P0 anchor across reloads$']
+
+[[control]]
+id = "opencode-sidebar-disposes-state-poller"
+guards = "unmounting the shared sidebar stops its old state-file polling interval"
+file = "packages/opencode/src/tui.tsx"
+old = "    onCleanup(() => clearInterval(timer))"
+new = "    onCleanup(() => { void timer }) // NON-VACUITY BREAK: retain the old state poller."
+test_file = "packages/opencode/src/tests/opencode2-sidebar.test.ts"
+runner = "command"
+command = ["sh", "-c", "bun run --cwd packages/opencode build:tui && bun test --cwd packages/opencode src/tests/opencode2-sidebar.test.ts -t \"$1\"", "sidebar-mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 compiled sidebar renders local parity, live preferences and cleanup$']
+
+# Authority/menu fixtures avoid durable stash/restore writes; Pi vault slot
+# lifecycle tests verify those writes against the real auth and stash files.
+[[control]]
+id = "pi-authority-menu-volatile-slot"
+guards = "malformed enrollment authority/menu tests do not acquire a real Pi auth lock or durably rewrite a login"
+file = "packages/pi/src/tests/vault-mode.test.ts"
+old = "      const runtime = runtimeWith(target, volatileSlot())"
+new = "      const runtime = runtimeWith(target) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sunreadable\senrollment\sdisables\slocal\swork\sand\sretains\smenu\sDisconnect$']
+
+[[control]]
+id = "pi-slot-compromise-propagates"
+guards = "an overdue slot lease is rejected to the sync caller without publishing the stash or silently succeeding"
+file = "packages/pi/src/runtime.ts"
+old = "      await this.reconcileSlot(explicit)"
+new = "      await this.reconcileSlot(explicit).catch(() => {}) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\spaused\sstash\spublication\sexpires\sthe\slease\sand\sthe\sawaited\ssync\sowns\slock-compromised$']
+
+[[control]]
+id = "pi-background-slot-rejection-owned"
+guards = "a background slot rejection is caught and reported through a stable credential-free warning"
+file = "packages/pi/src/index.ts"
+old = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+    })"""
+new = "    void syncSlot(false) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat\sstartup,\ssession\sstart\sand\sa\sbackground\stick$']
+
+[[control]]
+id = "pi-background-slot-report-does-not-reject"
+guards = "the detached background rejection handler does not itself create an unhandled rejection after reporting"
+file = "packages/pi/src/index.ts"
+old = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+    })"""
+new = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+      throw new Error('NON-VACUITY BREAK')
+    })"""
+test_file = "packages/pi/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat\sstartup,\ssession\sstart\sand\sa\sbackground\stick$']
+
+
+[[control]]
+id = "opencode2-diagnostics-logging-capability"
+guards = "Diagnostics can set the log level through the server capability fence"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return !item && request.actionId === 'dump' // NON-VACUITY BREAK: refuse supported log level changes."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 controls matrix local logging$']
+
+[[control]]
+id = "opencode2-diagnostics-no-item-actions"
+guards = "Diagnostics refuses logging with any item id, including an empty one"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return ['logging', 'dump'].includes(request.actionId) // NON-VACUITY BREAK: accept item actions."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
+
+
+[[control]]
+id = "opencode2-other-menu-requests-still-refuse"
+guards = "the new Diagnostics capability does not admit cache, reset, vault enrollment or unknown requests"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    default:\n      return false"
+new = "    default:\n      return true // NON-VACUITY BREAK: admit unlisted requests."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
+
+[[control]]
+id = "opencode2-diagnostics-visible"
+guards = "Diagnostics exposes the shared section once log level changes are available"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    unavailableSections: ['cache'],"
+new = "    unavailableSections: ['cache', 'diagnostics'], // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 diagnostics exposes the shared log controls in local mode$']
+
+[[control]]
+id = "opencode2-persisted-log-level-precedence"
+guards = "a stored log level overrides the environment floor after server startup"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])"
+new = "    void storedLevel // NON-VACUITY BREAK: keep the environment floor instead of the saved choice."
+test_file = "packages/opencode/src/tests/opencode2-logging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-logging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-logging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 log precedence matches OpenCode 1: stored over conflicting env$']
+
+[[control]]
+id = "opencode2-diagnostics-dump-capability"
+guards = "Diagnostics admits the request dump toggle without an item id"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return !item && request.actionId === 'logging' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dump toggle persists and displays its warning in local and vault menus$']
+
+[[control]]
+id = "opencode2-dump-non-owned-http"
+guards = "non-owned HTTP requests must not emit diagnostic records"
+file = "packages/opencode/src/v2/setup.ts"
+old = """            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)"""
+new = """            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)
+            if (request && !owned) { // NON-VACUITY BREAK: dump an unowned send.
+              const attempt = { ...request, accountId: 'unowned', attemptId: 'unowned', transport: 'http' as const, data: undefined }
+              await dumps.captureHttp(request.request, attempt)
+              await dumps.response(request.request, 200)
+            }"""
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 non-owned HTTP requests write no dump and stay unchanged$']
+
+[[control]]
+id = "opencode2-dump-no-inbound-websocket"
+guards = "only outbound WebSocket frames are observed, never inbound frames"
+file = "packages/opencode/src/v2/setup.ts"
+old = "            if (name === 'experimental.ws.send') {"
+new = "            if (name === 'experimental.ws.receive') { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 observes only owned outbound WebSocket frames after rewriting$']
+
+[[control]]
+id = "opencode2-dump-one-per-attempt"
+guards = "a response closes the request snapshot before later attempt-end errors"
+file = "packages/opencode/src/v2/request-dumps.ts"
+old = "    const input = this.take(request)"
+new = "    const input = this.pending.get(request)?.input // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dumps final merged HTTP request once at status 200$']
+
+[[control]]
+id = "opencode2-dump-private-failure-contained"
+guards = "security write failures warn once and do not change the response"
+file = "packages/opencode/src/v2/request-dumps.ts"
+old = "      this.log.warn('request dump failed')"
+new = "      throw new Error('NON-VACUITY BREAK')"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 private dump write failure warns once without changing response$']
+
+[[control]]
+id = "opencode2-dump-bearer-redaction"
+guards = "dump redaction is not bypassed by using a raw bearer as the account label"
+file = "packages/opencode/src/dump.ts"
+old = "    accountId: input.accountId,"
+new = "    accountId: new Headers(input.headers).get('authorization')?.replace(/^Bearer /, '') ?? input.accountId, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dumps final merged HTTP request once at status 200$']
+
+[[control]]
+id = "opencode2-dump-ordinary-failure-warning"
+guards = "ordinary write failures emit exactly one dumper warning without changing the response"
+file = "packages/opencode/src/dump.ts"
+old = "    logger: log,"
+new = "    logger: { ...log, warn: () => {} }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 ordinary dump write failure warns once without changing response$']
+
+[[control]]
+id = "opencode2-http-always-shapes-owned"
+guards = "owned HTTP requests get Codex metadata and body defaults even when effort, Lite and output caps change nothing"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  const headers = new Headers(request.headers)\n"
+new = "  if (!lite && body && !('reasoning' in body) && !('max_output_tokens' in body)) return undefined // NON-VACUITY BREAK\n  const headers = new Headers(request.headers)\n"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\salways\\sshapes\\san\\sowned\\srequest\\swithout\\seffort,\\sLite\\sor\\soutput-cap\\schanges$"]
+expect_message = "Received value must be a string: null"
+
+[[control]]
+id = "opencode2-handshake-keeps-host-session"
+guards = "WebSocket handshakes share the HTTP thread cache identity while keeping headers stable across turns"
+file = "packages/opencode/src/v2/setup.ts"
+old = "            if (name === 'experimental.ws.send') {"
+new = "            if (handshake) handshake.headers = { ...handshake.headers, 'session-id': 'wrong-thread-id' } // NON-VACUITY BREAK\n            if (name === 'experimental.ws.send') {"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
+expect_message = "wrong-thread-id"
+
+[[control]]
+id = "opencode2-websocket-shares-http-cache-key"
+guards = "owned response.create frames use the HTTP thread cache key, never the host session id, so fallback keeps the cached prefix"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  body.prompt_cache_key = threadID"
+new = "  body.prompt_cache_key = scope.sessionID // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
+expect_message = "ses_1"
+
+# OpenCode 1 runs every request kind of a session through one Codex turn state,
+# so a title or compaction request changes what the next agent-loop request is
+# compared with. Keeping them out of that state is the change this row makes.
+# The older byte comparison in the same file ("S6 oracle matches final
+# OpenCode 1 bytes") stays green under it: its sequence sends generate after
+# title and compaction, and generate overwrites what they left before any
+# agent-loop request reads it.
+[[control]]
+id = "opencode2-http-helper-kinds-share-turn-state"
+guards = "title and compaction requests update the session's HTTP turn state exactly as OpenCode 1 does, so later agent-loop turn ids and turn metadata keep OpenCode 1's bytes"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    metadata: state.get(scope.sessionID),\n"
+new = "    metadata: scope.kind === 'title' || scope.kind === 'compaction' ? { ...state.get(scope.sessionID) } : state.get(scope.sessionID), // NON-VACUITY BREAK\n"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^agent-loop\\sturn\\sstate\\safter\\stitle,\\scompaction\\sand\\sgenerate\\smatches\\sOpenCode\\s1\\s\\(Lite=false,\\scap=false\\)$"]
+expect_message = "\"turn_started_at_unix_ms\":1900000002000"
+
+[[control]]
+id = "opencode2-sessions-own-file"
+guards = "OpenCode 2 saves Codex thread ids to its own session file and never writes OpenCode 1's openai-auth-sessions.json"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "  'openai-auth-sessions-opencode2.json'"
+new = "  'openai-auth-sessions.json' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssessions\\sacross\\slocations\\sand\\srestarts\\sOpenCode\\s2\\sprocesses\\sleave\\sOpenCode\\s1\\ssessions\\sunchanged\\sand\\skeep\\severy\\sthread\\sid$"]
+
+[[control]]
+id = "opencode2-sessions-stale-save-no-resurrect"
+guards = "an OpenCode 2 save writes only the sessions its process created or deleted, so a stale process cannot resurrect a deleted session"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "      for (const id of deleted) threads.delete(id)\n"
+new = "      for (const [id, loaded] of this.sessions) threads.set(id, loaded.threadID) // NON-VACUITY BREAK\n      for (const id of deleted) threads.delete(id)\n"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssession\\sstore\\sa\\sstale\\swriter\\sdoes\\snot\\sresurrect\\sa\\ssession\\sanother\\sprocess\\sdeleted$"]
+
+[[control]]
+id = "opencode2-sessions-reused-id-new-thread"
+guards = "a host session id reused after its deletion gets a new Codex thread id"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "    this.sessions.delete(sessionID)\n"
+new = "    // NON-VACUITY BREAK: the deleted session's thread stays in the map\n"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssession\\sstore\\sa\\ssession\\sid\\sreused\\safter\\sdeletion\\sgets\\sa\\snew\\sthread\\sid$"]
+
+[[control]]
+id = "opencode2-sticky-reset-credits-from-quota"
+guards = "OpenCode 2 sticky placement prefers an account holding reset credits when no account has a fresh reading, reading pool rows and vault routes from their quota map as OpenCode 1 does"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: () => undefined, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits an empty-weight placement: 0 vs positive prefers the positive balance$', '^OpenCode 2 sticky placement by reset credits an empty-weight placement: missing vs positive prefers the positive balance$', '^OpenCode 2 sticky placement by reset credits reads a vault account balance from its route quota$', '^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-sticky-scoring-no-pool-token"
+guards = "OpenCode 2 sticky scoring asks no pool row for a token, so a disabled row is never asked for one"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: (id) => { for (const row of source.peek().rows) source.usableToken(row); return resetCreditsOfQuota(quotaById.get(id)) }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-sticky-scoring-no-vault-authorize"
+guards = "OpenCode 2 sticky scoring asks the vault to authorize nothing, so an ineligible vault account is never authorized"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: (id) => { for (const route of vault?.routes() ?? []) void vault?.authorize(route.id); return resetCreditsOfQuota(quotaById.get(id)) }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits reads a vault account balance from its route quota$', '^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-reset-pool-miss-no-host-login"
+guards = "OpenCode 2 reset resolution refuses an account the pool does not hold and never falls back to a login in host credential storage, as OpenCode 1's resolver does"
+file = "packages/opencode/src/v2/reset-credits.ts"
+old = "    if (!access?.row)\n      throw new ResetTargetResolutionError(\n"
+new = "    if (!access?.row) { const host = (await (await import('./host-slot')).opencode1HostSlot().get({ path: { id: 'openai' } })) as { access?: string } | undefined; if (host?.access) return { accountKey, label: 'Main account', accessToken: host.access } } // NON-VACUITY BREAK\n    if (!access?.row)\n      throw new ResetTargetResolutionError(\n"
+test_file = "packages/opencode/src/tests/opencode2-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 reset target resolver over the pool a pool miss resolves no host login, even when OpenCode 1 holds one$']
+
+[[control]]
+id = "opencode2-reset-applicable-not-available"
+guards = "OpenCode 2's reset result never shows the available reset-credit count as the applicable one when the last poll carried no applicable count"
+file = "packages/opencode/src/v2/reset-credits.ts"
+old = "    const applicable = snapshot.resetCreditsApplicable\n"
+new = "    const applicable = snapshot.resetCreditsApplicable ?? (snapshot as { resetCreditsAvailable?: number }).resetCreditsAvailable // NON-VACUITY BREAK\n"
+test_file = "packages/opencode/src/tests/opencode2-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 reset quota re-check and quota view omits the applicable count when the last poll carried none, and never shows the available count in its place$']
+
+[[control]]
+id = "opencode2-reset-preview-capability"
+guards = "OpenCode 2 admits Preview on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['spend', 'retry'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sPreview\sshows\sthe\sbalance\sand\seligibility\sof\san\sexhausted\saccount\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-spend-capability"
+guards = "OpenCode 2 admits a confirmed Spend on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['preview', 'retry'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sredemption\sa\sconfirmed\sSpend\sredeems\son\sthe\schosen\saccount,\sverifies\sthe\swindow\sand\sreports\sthe\sremaining\scredits$']
+
+[[control]]
+id = "opencode2-reset-retry-capability"
+guards = "OpenCode 2 admits a confirmed Retry on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['preview', 'spend'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sredemption\san\sunknown\soutcome\skeeps\sits\spair,\sand\sRetry\sand\sSpend\sreplay\sthe\ssame\sids$']
+
+[[control]]
+id = "opencode2-reset-item-actions-only"
+guards = "OpenCode 2 refuses every reset request but Preview, Spend and Retry on one account, including one without an account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return ['preview', 'spend', 'retry', 'unknown', 'redeem', ''].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sreset\srequests\sother\sthan\sPreview,\sSpend\sand\sRetry\son\sone\saccount\sare\srefused$']
+
+[[control]]
+id = "opencode2-reset-visible"
+guards = "OpenCode 2 shows the Reset credits section with its accounts and actions once its actions are admitted"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    unavailableSections: ['cache'],"
+new = "    unavailableSections: ['cache', 'reset'], // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sopening\s/openai\slists\smain\sand\seach\senabled\saccount\swith\sPreview,\sSpend\sand\sRetry,\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-unconfirmed-never-spends"
+guards = "an OpenCode 2 Spend or Retry applied without confirmed: true never reaches the redemption"
+file = "packages/opencode/src/v2/menu.ts"
+old = "        ...(request.confirmed === true ? { confirmed: true } : {}),"
+new = "        confirmed: true, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sSpend\sand\sRetry\swithout\sconfirmation\snever\sreach\sthe\sredemption$']
+
+[[control]]
+id = "opencode2-reset-preview-spends-nothing"
+guards = "Preview of a reset-credit account on OpenCode 2 spends nothing"
+file = "packages/core/src/commands.ts"
+old = "              const row = await buildResetPreviewRow(accountKey, deps)"
+new = "              await spendResetCredit(deps, accountKey, false) // NON-VACUITY BREAK\n              const row = await buildResetPreviewRow(accountKey, deps)"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sPreview\sshows\sthe\sbalance\sand\seligibility\sof\san\sexhausted\saccount\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-open-spends-nothing"
+guards = "opening /openai on OpenCode 2 spends no reset credit"
+file = "packages/core/src/commands.ts"
+old = "      items: (await deps.accountKeys()).map((accountKey) => ({"
+new = "      items: (await Promise.all((await deps.accountKeys()).map(async (key) => (await spendResetCredit(deps, key, false), key)))).map((accountKey) => ({ // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sopening\s/openai\slists\smain\sand\seach\senabled\saccount\swith\sPreview,\sSpend\sand\sRetry,\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-vault-reset-refusal"
+guards = "in vault mode OpenCode 2 refuses reset actions with the vault refusal, not as unavailable"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          request.sectionId === 'reset' ||"
+new = "          false || // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sin\svault\smode\sReset\scredits\sshows\sthe\svault\snote,\sand\severy\saction\sis\srefused\swithout\sreading\sa\scredential$']

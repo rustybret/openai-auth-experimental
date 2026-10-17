@@ -1,12 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import {
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  type Stats,
-  statSync,
-  writeFileSync,
-} from 'node:fs'
+import { statSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
@@ -75,6 +68,13 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import {
+  type CodexSessionMetadata,
+  isMessageWithRole,
+  OPENAI_AGENT_HEADER,
+  prepareCodexRequest,
+} from './codex-request'
+import { loadCodexSessions, saveCodexSessions } from './codex-sessions'
+import {
   applyOpenAiMenu,
   menuText,
   OPENAI_COMMAND_NAME,
@@ -96,6 +96,7 @@ import {
   type OpenAICacheKeepManager,
   routedAccountForSession,
 } from './core/cachekeep'
+import { createCurrentStorageReader } from './core/current-storage'
 import {
   classifyMainAuthSlot,
   MAIN_REFRESH_LOCK_NAME,
@@ -159,7 +160,14 @@ import {
   selectStickyCandidate,
 } from './core/sticky-routing'
 import { migrationFenceOpen } from './core/version-fence'
-import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
+import { dumpCodexRequest } from './dump'
+
+export {
+  CODEX_USER_AGENT,
+  CODEX_VERSION,
+  RESPONSES_LITE_MODELS,
+} from './codex-request'
+
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
@@ -199,16 +207,10 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import {
-  type CanonicalInput,
-  canonicalInput,
-  canonicalPrefixLength,
-  retainedInput,
-} from './util/canonical-input'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
-import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
+import { OpenAIWebSocketPool } from './ws-pool'
 
 export const ALLOWED_MODELS = new Set([
   'gpt-5.5',
@@ -291,16 +293,23 @@ export function codexOAuthModelLimit(
   // applies to everything else. Checking the model family is the wrong test -
   // it is the rate card's named list.
   //
-  // gpt-6.1-sol is held here too. Its published pricing, read 2026-09-29 at
-  // developers.openai.com/api/docs/models/gpt-6.1-sol, charges 2x input and
-  // 1.5x output on the full request above 272K input tokens, and nothing names
-  // it in a Codex exception. (The rate card itself could not be fetched that
-  // day; re-check it before raising this.)
+  // gpt-6.1-sol gets Codex's own 500k default context (raised from 272k
+  // around 2026-10-12), and on a subscription it pays no surcharge for the
+  // input above 272K. OpenAI's "ChatGPT Work and Codex" help article
+  // (help.openai.com/en/articles/20001275, read 2026-10-16 from its search
+  // index because the page answered 403): "There's no additional long-context
+  // surcharge for GPT-6.1 Sol usage covered by your subscription's included
+  // allowance." Purchased credits and the platform API keep the surcharge
+  // (developers.openai.com/api/docs/models/gpt-6.1-sol: 2x input and 1.5x
+  // output on the full request above 272K), so a `codexApiEndpoint` override
+  // pointed at a differently billed surface is the operator's to re-check, as
+  // for gpt-6-astra. `input` is the window minus the 128k output reserve.
+  if (modelId.includes('gpt-6.1-sol'))
+    return { context: 500_000, input: 372_000, output: 128_000 }
   if (
     modelId.includes('gpt-5.6') ||
     modelId.includes('gpt-6-sol') ||
-    modelId.includes('gpt-6-luna') ||
-    modelId.includes('gpt-6.1-sol')
+    modelId.includes('gpt-6-luna')
   )
     return { context: 372_000, input: 244_000, output: 128_000 }
   return undefined
@@ -317,35 +326,7 @@ export function codexOAuthModelLimit(
  */
 export const EMPTY_BEARER_MESSAGE =
   'Refusing to send a request with no access token. This is a defect in the plugin, not a problem with the provider or the account; the transport log names the account and the path that produced it.'
-// Exact models currently marked `use_responses_lite` in Codex's catalog. Read
-// from the backend's own model list rather than assumed:
-//   GET /backend-api/codex/models?client_version=<v>
-// reports `use_responses_lite` per model, and every gpt-6 variant is marked true.
-export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'gpt-5.6-luna',
-  'gpt-6-astra',
-  'gpt-6-sol',
-  'gpt-6-luna',
-  'gpt-6.1-sol',
-])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
-const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-6.1-sol requires Codex client >= 0.159.0: the backend's model catalog
-// lists it from 0.159.0 and a request answers 400 ("not supported when using
-// Codex with a ChatGPT account") at 0.158.0, measured 2026-09-29. Its catalog
-// `minimal_client_version` says 0.153.0, which is wrong, so the catalog listing
-// and a real request are the evidence, not that field. gpt-6-sol and gpt-6-luna
-// need 0.155.0 and gpt-6-astra 0.153.0. Verified at 0.159.0 that gpt-6.1-sol,
-// the three gpt-6 models, gpt-5.5 and the three 5.6 variants all complete, so
-// one version serves the whole range. gpt-5.4, gpt-5.4-mini and
-// gpt-5.3-codex-spark answer 400 at every version ("not supported when using
-// Codex with a ChatGPT account") - a backend retirement, not something this
-// version causes.
-export const CODEX_VERSION = '0.159.0'
-export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
-const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
@@ -464,7 +445,7 @@ export interface PoolResetAccess {
 }
 
 /** The reset target for a pool row, or the refusal the legacy resolver gives. */
-function poolResetTarget(
+export function poolResetTarget(
   accountKey: string,
   pooled: PoolResetAccess,
 ): ResetTargetIdentity {
@@ -833,45 +814,6 @@ interface CodexAuthPluginOptions {
   }
 }
 
-interface CodexSessionMetadata {
-  threadID: string
-  turnID: string
-  windowID: string
-  turnStartedAt?: number
-  input?: unknown[]
-  canonicalInput?: CanonicalInput
-  /**
-   * The `reasoning.effort` this session opened with. Held so a later change can
-   * be carried as a `configuration_update` item instead of as a different
-   * request-level value. See `applyMidConversationEffort`.
-   */
-  pinnedEffort?: string
-  effortUpdates?: Array<{ anchor: number; fingerprint: string; effort: string }>
-}
-
-interface PersistedCodexSessions {
-  version?: number
-  sessions?: Record<string, { threadID?: unknown }>
-}
-
-interface PreparedCodexRequest {
-  init: RequestInit | undefined
-}
-
-function parseJsonObject(input: unknown) {
-  if (typeof input !== 'string') return undefined
-  try {
-    const parsed = JSON.parse(input)
-    return typeof parsed === 'object' &&
-      parsed !== null &&
-      !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined
-  } catch {
-    return undefined
-  }
-}
-
 // Real Codex mints the session/thread id (which becomes prompt_cache_key,
 // session-id, thread-id, x-client-request-id, window_id) as a UUIDv7 — a
 // time-ordered id whose first 48 bits are the unix-ms timestamp. crypto.randomUUID()
@@ -898,190 +840,6 @@ function getCodexSessionMetadata(
 
 function codexSessionStatePath() {
   return join(getConfigDir(), 'openai-auth-sessions.json')
-}
-
-function loadCodexSessions(): Map<string, CodexSessionMetadata> {
-  const sessions = new Map<string, CodexSessionMetadata>()
-  try {
-    const parsed = JSON.parse(
-      readFileSync(codexSessionStatePath(), 'utf8'),
-    ) as PersistedCodexSessions
-    if (!isRecord(parsed.sessions)) return sessions
-    for (const [sessionID, state] of Object.entries(parsed.sessions)) {
-      if (!isRecord(state) || typeof state.threadID !== 'string') continue
-      sessions.set(sessionID, {
-        threadID: state.threadID,
-        turnID: uuidV7(),
-        windowID: `${state.threadID}:0`,
-      })
-    }
-  } catch {
-    // Missing or malformed state should not break auth.
-  }
-  return sessions
-}
-
-function saveCodexSessions(sessions: Map<string, CodexSessionMetadata>): void {
-  const path = codexSessionStatePath()
-  const tmp = `${path}.tmp-${process.pid}`
-  try {
-    mkdirSync(getConfigDir(), { recursive: true })
-    const payload: PersistedCodexSessions = {
-      version: 1,
-      sessions: Object.fromEntries(
-        [...sessions.entries()].map(([sessionID, state]) => [
-          sessionID,
-          { threadID: state.threadID },
-        ]),
-      ),
-    }
-    writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-    renameSync(tmp, path)
-  } catch {
-    // State persistence only improves cache continuity; never fail a request.
-  }
-}
-
-function isMessageWithRole(item: unknown, role: string) {
-  return (
-    isRecord(item) &&
-    (item.type === 'message' || 'role' in item) &&
-    item.role === role
-  )
-}
-
-function startsHttpUserTurn(
-  metadata: CodexSessionMetadata,
-  input: unknown[],
-  canonical: CanonicalInput,
-) {
-  if (!metadata.input) return input.length > 0
-  const prior = metadata.canonicalInput ?? canonicalInput(metadata.input)
-  if (canonicalPrefixLength(prior, canonical) === undefined) return true
-  const suffix = input.slice(metadata.input.length)
-  return suffix.some(
-    (item) =>
-      isMessageWithRole(item, 'user') || isMessageWithRole(item, 'developer'),
-  )
-}
-
-function updateHttpTurnMetadata(
-  metadata: CodexSessionMetadata,
-  body: Record<string, unknown> | undefined,
-) {
-  const input = Array.isArray(body?.input) ? body.input : undefined
-  const canonical = input
-    ? canonicalInput(input, metadata.canonicalInput)
-    : undefined
-  if (
-    input &&
-    canonical &&
-    (startsHttpUserTurn(metadata, input, canonical) || !metadata.turnID)
-  ) {
-    metadata.turnID = uuidV7()
-    metadata.turnStartedAt = Date.now()
-  } else if (!metadata.turnStartedAt) {
-    metadata.turnStartedAt = Date.now()
-  }
-  // Copy the host input before effort updates are inserted, so the next tool
-  // request compares against host history and does not start a false user turn.
-  if (input && canonical) {
-    metadata.input = input.slice()
-    metadata.canonicalInput = retainedInput(canonical)
-  }
-}
-
-function prepareCodexRequest(input: {
-  init: RequestInit | undefined
-  headers: Headers
-  metadata: CodexSessionMetadata | undefined
-  installationID: string
-  websocket: boolean
-  responsesLite: boolean
-  dumpSessionID?: string
-}): PreparedCodexRequest {
-  // Read and remove the internal agent header before any early return, so it
-  // cannot reach outgoing headers, cachekeep captures or request dumps.
-  const agent = input.headers.get(OPENAI_AGENT_HEADER)
-  input.headers.delete(OPENAI_AGENT_HEADER)
-  if (!input.metadata) return { init: input.init }
-  const body = parseJsonObject(input.init?.body)
-  if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
-  else if (!input.metadata.turnStartedAt)
-    input.metadata.turnStartedAt = Date.now()
-  if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = Date.now()
-  // Base turn-metadata. HTTP sends full replay bodies, so we detect fresh user turns from append-only
-  // input growth above. The WebSocket path still overrides turn_id/turn_started_at in ws-pool.ts
-  // after continuation trimming/prewarm selection.
-  // Codex turn-metadata schema (exact field set + order; no request_id/originator):
-  // { session_id, thread_id, thread_source, turn_id, sandbox, turn_started_at_unix_ms, request_kind, window_id }
-  const turnMetadata = JSON.stringify({
-    session_id: input.metadata.threadID,
-    thread_id: input.metadata.threadID,
-    thread_source: 'user',
-    turn_id: input.metadata.turnID,
-    sandbox: CODEX_SANDBOX,
-    turn_started_at_unix_ms: input.metadata.turnStartedAt,
-    request_kind: 'turn',
-    window_id: input.metadata.windowID,
-  })
-  input.headers.set('originator', 'codex_exec')
-  if (input.websocket) {
-    // Codex's WebSocket upgrade carries neither Accept nor Content-Type.
-    input.headers.delete('accept')
-    input.headers.delete('content-type')
-  } else {
-    input.headers.set('accept', 'text/event-stream')
-  }
-  input.headers.set('session-id', input.metadata.threadID)
-  input.headers.delete('x-session-id')
-  input.headers.delete('x-session-affinity')
-  input.headers.set('thread-id', input.metadata.threadID)
-  input.headers.set('x-codex-window-id', input.metadata.windowID)
-  // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
-  input.headers.set('x-client-request-id', input.metadata.threadID)
-  input.headers.set('x-codex-beta-features', CODEX_BETA_FEATURES)
-  input.headers.set('x-codex-turn-metadata', turnMetadata)
-  input.headers.set('user-agent', CODEX_USER_AGENT)
-  input.headers.set('version', CODEX_VERSION)
-  if (input.dumpSessionID)
-    input.headers.set(DUMP_SESSION_HEADER, input.dumpSessionID)
-
-  const parsed = body
-  if (!parsed) return { init: input.init }
-  const useResponsesLite =
-    input.responsesLite &&
-    typeof parsed.model === 'string' &&
-    RESPONSES_LITE_MODELS.has(parsed.model)
-  if (useResponsesLite && !input.websocket)
-    input.headers.set('x-openai-internal-codex-responses-lite', 'true')
-  parsed.prompt_cache_key = input.metadata.threadID
-  parsed.parallel_tool_calls ??= true
-  if (Array.isArray(parsed.tools))
-    parsed.tools = parsed.tools.map(normalizeCodexTool)
-  applyMidConversationEffort(parsed, input.metadata, agent)
-  if (useResponsesLite) rewriteResponsesLiteBody(parsed)
-  const clientMetadata: Record<string, unknown> = {
-    ...(typeof parsed.client_metadata === 'object' &&
-    parsed.client_metadata !== null
-      ? parsed.client_metadata
-      : {}),
-    'x-codex-installation-id': input.installationID,
-    'x-codex-window-id': input.metadata.windowID,
-  }
-  if (input.websocket) {
-    clientMetadata['x-codex-turn-metadata'] = turnMetadata
-    clientMetadata['x-codex-ws-stream-request-start-ms'] = String(Date.now())
-    if (useResponsesLite)
-      clientMetadata.ws_request_header_x_openai_internal_codex_responses_lite =
-        'true'
-  }
-  parsed.client_metadata = clientMetadata
-  input.headers.delete('content-length')
-  input.headers.delete('Content-Length')
-  return {
-    init: { ...input.init, body: JSON.stringify(orderCodexBody(parsed)) },
-  }
 }
 
 export function findCachekeepFallbackAccount(
@@ -1174,7 +932,7 @@ export function buildSidebarMachineState(
       ...(typeof mainAccountIdentity === 'string'
         ? { mainAccountId: mainAccountIdentity }
         : {}),
-      killed: false,
+      killed: !killswitchPassesPolicy(mainQuota, store, undefined, now),
       ...(mainQuota?.resetCreditsAvailable !== undefined
         ? { resetCredits: mainQuota.resetCreditsAvailable }
         : {}),
@@ -1206,7 +964,12 @@ export function buildSidebarMachineState(
                 ),
               }
             : null,
-          killed: false,
+          killed: !killswitchPassesPolicy(
+            fallbackQuota,
+            store,
+            account.id,
+            now,
+          ),
           enabled: true,
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
             ? { resetCredits: fallbackQuota.resetCreditsAvailable }
@@ -1272,36 +1035,6 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-// The input saved to detect the next HTTP user turn (`metadata.input`) holds
-// the same item objects as this request body. Copy only the paths that change,
-// so removing image details from what is sent leaves that saved history as the
-// host sent it; otherwise every later request would look like a new turn.
-function stripResponsesLiteImageDetails(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    let next = value
-    for (let index = 0; index < value.length; index++) {
-      const nested = stripResponsesLiteImageDetails(value[index])
-      if (nested === value[index]) continue
-      if (next === value) next = value.slice()
-      next[index] = nested
-    }
-    return next
-  }
-  if (!isRecord(value)) return value
-  let next = value
-  for (const key of Object.keys(value)) {
-    if (value.type === 'input_image' && key === 'detail') {
-      if (next === value) next = { ...value }
-      delete next[key]
-      continue
-    }
-    const nested = stripResponsesLiteImageDetails(value[key])
-    if (nested === value[key]) continue
-    if (next === value) next = { ...value }
-    next[key] = nested
-  }
-  return next
-}
 
 // Models where a `configuration_update` item is both accepted and shown to change
 // effort. Accepted is not enough: a silently ignored item also completes with 200,
@@ -1326,7 +1059,6 @@ export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
 // OpenCode repository) mark title, compaction and summary as hidden helpers,
 // not the conversation's agent loop. chat.headers supplies the
 // host's agent name; missing tags retain compatibility with other fetch callers.
-const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'
 const HIDDEN_EFFORT_AGENTS = new Set(['title', 'compaction', 'summary'])
 
 /**
@@ -1414,14 +1146,41 @@ function applyMidConversationEffort(
   }
 }
 
-// Responses Lite trades capabilities for Codex's compact request shape. It is
-// opt-in because it disables parallel tool calls and excludes hosted tools.
+// Copy only changed paths: saved host history must retain image details for
+// the next request's turn comparison, even when Lite strips them on the wire.
+function stripResponsesLiteImageDetails(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    let next = value
+    for (let index = 0; index < value.length; index++) {
+      const nested = stripResponsesLiteImageDetails(value[index])
+      if (nested === value[index]) continue
+      if (next === value) next = value.slice()
+      next[index] = nested
+    }
+    return next
+  }
+  if (!isRecord(value)) return value
+  let next = value
+  for (const key of Object.keys(value)) {
+    if (value.type === 'input_image' && key === 'detail') {
+      if (next === value) next = { ...value }
+      delete next[key]
+      continue
+    }
+    const nested = stripResponsesLiteImageDetails(value[key])
+    if (nested === value[key]) continue
+    if (next === value) next = { ...value }
+    next[key] = nested
+  }
+  return next
+}
+
+// Lite is opt-in because it disables parallel calls and excludes hosted tools.
 export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
   reasoning.context = 'all_turns'
   parsed.reasoning = reasoning
   parsed.parallel_tool_calls = false
-
   const input = stripResponsesLiteImageDetails(
     Array.isArray(parsed.input) ? parsed.input : [],
   ) as unknown[]
@@ -1448,33 +1207,6 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   delete parsed.instructions
 }
 
-// Match Codex's function-tool shape: drop the JSON-Schema `$schema` dialect marker
-// (Codex omits it) and mark function tools `strict: false` as Codex does.
-function normalizeCodexTool(tool: unknown) {
-  if (!isRecord(tool)) return tool
-  if (tool.type !== 'function') return tool
-  const parameters =
-    isRecord(tool.parameters) && '$schema' in tool.parameters
-      ? (() => {
-          const { $schema: _schema, ...rest } = tool.parameters as Record<
-            string,
-            unknown
-          >
-          return rest
-        })()
-      : tool.parameters
-  // Codex function-tool key order: type, name, description, strict, parameters (+ any extras).
-  const { type, name, description, strict, parameters: _p, ...extra } = tool
-  return {
-    type,
-    name,
-    description,
-    strict: strict ?? false,
-    parameters,
-    ...extra,
-  }
-}
-
 export async function CodexAuthPlugin(
   input: PluginInput,
   options: CodexAuthPluginOptions = {},
@@ -1482,8 +1214,9 @@ export async function CodexAuthPlugin(
   const codexApiEndpoint =
     options.codexApiEndpoint ?? getSettings().codexApiEndpoint
   const installationID = crypto.randomUUID()
-  const codexSessions = loadCodexSessions()
-  const persistCodexSessions = () => saveCodexSessions(codexSessions)
+  const codexSessions = loadCodexSessions(codexSessionStatePath())
+  const persistCodexSessions = () =>
+    saveCodexSessions(codexSessionStatePath(), codexSessions)
   let websocketFetchInstalled = false
   let codexFetchInstalled = false
   const websocketFetches: Array<
@@ -1956,70 +1689,50 @@ export async function CodexAuthPlugin(
           }
         }
 
-        let requestStorageCache:
-          | {
-              path: string
-              mtimeMs: number
-              size: number
-              storage: Awaited<ReturnType<typeof loadAccounts>>
-            }
-          | undefined
-
         // The newest store snapshot this loader has read. It is the answer when
-        // a request's read overruns its budget, and what background sidebar
-        // writes describe, so neither has to read the store again.
+        // a request's read overruns its budget, and the fallback if a display
+        // write cannot read the current config.
         let lastRequestStorage = storage
 
-        // The store read on the request path. An unchanged config file costs
-        // one stat. A changed one is read without any lock (loadAccounts only
-        // reads), waiting at most HOT_PATH_READ_BUDGET_MS before going ahead
-        // with the last snapshot; the read then finishes in the background and
-        // serves the next request. A read failure still fails local requests;
-        // vault requests can use the last settings snapshot without local files.
+        // Request routing and sidebar projections share this stat-gated read.
+        // A loader can be idle while another process changes routing, so a
+        // machine-state write must not rely on its last request's snapshot.
+        const currentStorageReader = createCurrentStorageReader({
+          path: getConfigPath,
+          stat: (path) => {
+            try {
+              const stat = statSync(path)
+              return { mtimeMs: stat.mtimeMs, size: stat.size }
+            } catch {
+              return undefined
+            }
+          },
+          read: (path) => loadAccounts(getAccountPaths(path)),
+          fallback: async (error) => {
+            if ((await vault.authority()) !== 'local') return lastRequestStorage
+            throw error
+          },
+          onRead: (next) => {
+            lastRequestStorage = next
+          },
+        })
+
+        function loadCurrentStorageForDisplay() {
+          return currentStorageReader.read()
+        }
+
+        // Request reads wait only for the hot-path budget. A changed config is
+        // read in the background and serves the next request if it is slow.
         async function loadRequestAccounts() {
-          const path = getConfigPath()
-          let stat: Stats | undefined
-          try {
-            stat = statSync(path)
-          } catch {
-            stat = undefined
-          }
-          if (
-            stat &&
-            requestStorageCache?.path === path &&
-            requestStorageCache.mtimeMs === stat.mtimeMs &&
-            requestStorageCache.size === stat.size
-          ) {
-            return requestStorageCache.storage
-          }
-          if (!stat) requestStorageCache = undefined
-          const read = loadAccounts(getAccountPaths(path))
-            .catch(async (error) => {
-              if ((await vault.authority()) !== 'local')
-                return lastRequestStorage
-              throw error
-            })
-            .then((next) => {
-              if (stat) {
-                requestStorageCache = {
-                  path,
-                  mtimeMs: stat.mtimeMs,
-                  size: stat.size,
-                  storage: next,
-                }
-              }
-              lastRequestStorage = next
-              return next
-            })
           return settleWithinBudget(
-            read,
+            Promise.resolve(loadCurrentStorageForDisplay()),
             HOT_PATH_READ_BUDGET_MS,
             () => lastRequestStorage,
           )
         }
 
         function invalidateRequestStorageCache() {
-          requestStorageCache = undefined
+          currentStorageReader.invalidate()
         }
 
         // Derive the main account's stable ChatGPT identity from the live
@@ -2198,7 +1911,9 @@ export async function CodexAuthPlugin(
             fallbackManager,
             quotaManager,
             loadAccounts,
-            writeSidebarState: writeMachineSidebarState,
+            // The sidebar write reads the current store itself, so the store a
+            // quota refresh passes is not needed.
+            writeSidebarState: (qm) => writeMachineSidebarState(qm),
             client: input.client as Parameters<
               typeof refreshAllQuota
             >[0]['client'],
@@ -2841,19 +2556,12 @@ export async function CodexAuthPlugin(
             completeSnapshot,
           )
           const fallbackPush = Boolean(accountId && accountId !== 'main')
-          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () => {
-            // The sidebar state is built when this queued write starts (and
-            // again on a retry), from the in-memory quota cache and the
-            // newest account-store snapshot at that moment.
-            const latestStorage = lastRequestStorage
-            return writeMachineSidebarState(
+          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
+            writeMachineSidebarState(
               quotaManager,
-              latestStorage,
-              fallbackPush
-                ? latestStorage?.mainAccountId
-                : resolvedMainIdentity,
-            )
-          })
+              fallbackPush ? undefined : resolvedMainIdentity,
+            ),
+          )
         }
 
         // The pure resolver prefers an admission error's explicit reset and
@@ -2900,7 +2608,7 @@ export async function CodexAuthPlugin(
         function queueVaultSidebarWrite() {
           if (!vault.enrolled()) return
           sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
-            writeMachineSidebarState(quotaManager, lastRequestStorage),
+            writeMachineSidebarState(quotaManager),
           )
         }
 
@@ -2989,9 +2697,15 @@ export async function CodexAuthPlugin(
 
         async function writeMachineSidebarState(
           qm: QuotaManager,
-          store: Awaited<ReturnType<typeof loadAccounts>>,
-          mainAccountIdentity = store?.mainAccountId,
+          mainAccountIdentity?: string,
         ) {
+          const currentStorage = loadCurrentStorageForDisplay()
+          const store =
+            currentStorage instanceof Promise
+              ? await currentStorage.catch(() => lastRequestStorage)
+              : currentStorage
+          const displayMainAccountIdentity =
+            mainAccountIdentity ?? store?.mainAccountId
           // Vault mode: the sidebar lists the vault accounts that serve this
           // host, with the quota the vault roster holds for each. No local
           // account is read for it.
@@ -3033,7 +2747,7 @@ export async function CodexAuthPlugin(
               qm,
               store,
               Date.now(),
-              mainAccountIdentity,
+              displayMainAccountIdentity,
             ),
             boundSidebarFile,
             { canWrite: () => !vault.enrolled() },
@@ -3241,8 +2955,11 @@ export async function CodexAuthPlugin(
               sessionId,
             ),
           refreshSidebar: async () => {
-            const store = await loadAccounts(getAccountPaths(getConfigPath()))
-            await writeMachineSidebarState(quotaManager, store)
+            // A command just changed the store, possibly within the same
+            // mtime tick, so drop the cached snapshot and let the writer read
+            // the store from disk.
+            invalidateRequestStorageCache()
+            await writeMachineSidebarState(quotaManager)
           },
           // On a migrated install every row is polled through the pool
           // source, the same path its background poll takes, and every vault
@@ -3252,7 +2969,7 @@ export async function CodexAuthPlugin(
             await vault.authority()
             if (vault.enrolled()) {
               const vaultResults = await vault.pollStale(0)
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return vaultResults.map((result) => ({
                 account: result.id,
                 ok: result.ok,
@@ -3264,7 +2981,7 @@ export async function CodexAuthPlugin(
                 pollPoolRows(),
                 vault.pollStale(0),
               ])
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return [
                 ...results,
                 ...vaultResults.map((result) => ({
@@ -3424,6 +3141,8 @@ export async function CodexAuthPlugin(
               ? new URL(codexApiEndpoint)
               : parsed
           const prepared = prepareCodexRequest({
+            rewriteLite: rewriteResponsesLiteBody,
+            applyEffort: applyMidConversationEffort,
             init: {
               ...init,
               headers,
@@ -4518,13 +4237,13 @@ export async function CodexAuthPlugin(
           bootQuotaSeedStarted = true
 
           // Immediate: show persisted quota so the sidebar isn't blank
-          void writeMachineSidebarState(quotaManager, storage).catch(() => {})
+          void writeMachineSidebarState(quotaManager).catch(() => {})
           // In vault mode the sidebar lists the vault's accounts, which are
           // known once the vault's first account list has been read.
           void vaultFirstRoster
             .then(() =>
               vault.enrolled()
-                ? writeMachineSidebarState(quotaManager, lastRequestStorage)
+                ? writeMachineSidebarState(quotaManager)
                 : undefined,
             )
             .catch(() => {})
@@ -4555,7 +4274,7 @@ export async function CodexAuthPlugin(
             // polled by the shared vault consumer; the sidebar is rewritten
             // so it shows their latest quota.
             if (vault.enrolled()) {
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return
             }
             // A migrated install refreshes and polls its pool rows through
@@ -4569,7 +4288,7 @@ export async function CodexAuthPlugin(
                 () => acquireBackgroundRefreshLock(getConfigPath()),
               )
               if (polled.length > 0) {
-                await writeMachineSidebarState(quotaManager, lastRequestStorage)
+                await writeMachineSidebarState(quotaManager)
               }
               const failures = polled.filter((result) => !result.ok)
               if (failures.length > 0) {

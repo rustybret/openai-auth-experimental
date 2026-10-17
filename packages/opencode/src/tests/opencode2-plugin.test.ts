@@ -5,7 +5,7 @@
 
 import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import {
   isPlaceholderCredential,
   OpenCode2AuthError,
@@ -26,6 +26,7 @@ import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
 import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
+import { acquireSessionPins } from '../v2/shared-pins'
 import {
   type FakeModel,
   fakeOpenCode2Host,
@@ -65,6 +66,7 @@ async function start(
   const host = fakeOpenCode2Host(activeCredential ? { activeCredential } : {})
   const cleanup = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
     slot: opencode1HostSlot(join(files.dir, 'auth.json')),
     fence: async () => ({ open: true }),
     heartbeat: false,
@@ -332,6 +334,149 @@ describe('OpenCode 2 entry: the chosen row on the wire', () => {
       'Bearer a-token',
     )
     expect(bearer(await poolRequestHeaders(host, 'ses_2', 'title'))).toBe(
+      'Bearer b-token',
+    )
+  })
+})
+
+describe('OpenCode 2 shared session pins', () => {
+  it('gives each account store its own ledger and one ledger per store', () => {
+    const files = poolFiles()
+    const other = poolFiles()
+    const ledger = acquireSessionPins(files)
+    expect(
+      acquireSessionPins({
+        configPath: relative(process.cwd(), files.configPath),
+        statePath: relative(process.cwd(), files.statePath),
+      }),
+    ).toBe(ledger)
+    expect(acquireSessionPins(other)).not.toBe(ledger)
+    expect(
+      acquireSessionPins({
+        configPath: files.configPath,
+        statePath: other.statePath,
+      }),
+    ).not.toBe(ledger)
+  })
+
+  const rows = [
+    { id: 'a', usedPercent: 10 },
+    { id: 'b', usedPercent: 10 },
+  ]
+
+  it('one location spreads two cold sessions across equal rows', async () => {
+    const { host } = await startPool('sticky-balanced', rows)
+    const first = bearer(await poolRequestHeaders(host, 'ses_1'))
+    const second = bearer(await poolRequestHeaders(host, 'ses_2'))
+    expect(first).toBe('Bearer a-token')
+    expect(second).toBe('Bearer b-token')
+  })
+
+  it('two locations spread cold sessions across equal rows', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', rows)
+    const one = await start(files)
+    const two = await start(files)
+    const first = bearer(await poolRequestHeaders(one.host, 'ses_1'))
+    const second = bearer(await poolRequestHeaders(two.host, 'ses_2'))
+    expect(first).toBe('Bearer a-token')
+    expect(second).toBe('Bearer b-token')
+  })
+
+  it('relative and absolute paths to the same store share pins', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', rows)
+    const one = await start(files)
+    const two = await start(files, {
+      paths: () => ({
+        configPath: relative(process.cwd(), files.configPath),
+        statePath: relative(process.cwd(), files.statePath),
+      }),
+    })
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+      'Bearer a-token',
+    )
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_2'))).toBe(
+      'Bearer b-token',
+    )
+  })
+
+  for (const different of ['configPath', 'statePath', 'both'] as const) {
+    it(`does not share pins across stores differing in ${different}`, async () => {
+      const files = poolFiles()
+      const other = poolFiles()
+      seedPool(files, 'sticky-balanced', rows)
+      seedPool(other, 'sticky-balanced', rows)
+      const one = await start(files)
+      const two = await start(other, {
+        paths: () => ({
+          configPath:
+            different === 'statePath' ? files.configPath : other.configPath,
+          statePath:
+            different === 'configPath' ? files.statePath : other.statePath,
+        }),
+      })
+      expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+        'Bearer a-token',
+      )
+      expect(bearer(await poolRequestHeaders(two.host, 'ses_2'))).toBe(
+        'Bearer a-token',
+      )
+    })
+  }
+
+  it('keeps a pin after its location and then every location disposes', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 10 },
+      { id: 'b', usedPercent: 90 },
+    ])
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+    await one.stop()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 80 },
+      { id: 'b', usedPercent: 5 },
+    ])
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+    await two.stop()
+    const three = await start(files)
+    expect(bearer(await poolRequestHeaders(three.host, 'ses_new'))).toBe(
+      'Bearer b-token',
+    )
+    expect(bearer(await poolRequestHeaders(three.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+  })
+
+  it('session deletion in one location forgets the pin in every location', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 10 },
+      { id: 'b', usedPercent: 90 },
+    ])
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
+      'Bearer a-token',
+    )
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_deleted'))).toBe(
+      'Bearer a-token',
+    )
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 80 },
+      { id: 'b', usedPercent: 5 },
+    ])
+    await one.host.publish('session.deleted', { sessionID: 'ses_deleted' })
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_deleted'))).toBe(
+      'Bearer b-token',
+    )
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
       'Bearer b-token',
     )
   })
@@ -1001,7 +1146,10 @@ describe('Codex destination after transport ownership', () => {
     expect(draft.request.url).toBe(
       'https://chatgpt.com/backend-api/codex/responses',
     )
-    expect(draft.request.headers.get('session-id')).toBe('ses_endpoint')
+    expect(draft.request.headers.get('session-id')).toBe(
+      draft.request.headers.get('thread-id'),
+    )
+    expect(draft.request.headers.get('session-id')).toMatch(/^[\da-f-]{36}$/)
     const handshake = {
       ...scope('ses_endpoint'),
       url: 'wss://api.openai.com/v1/responses',
@@ -1012,7 +1160,9 @@ describe('Codex destination after transport ownership', () => {
     }
     await host.fire('experimental.ws.handshake', handshake)
     expect(handshake.url).toBe('wss://chatgpt.com/backend-api/codex/responses')
-    expect(handshake.headers['session-id']).toBe('ses_endpoint')
+    expect(handshake.headers['session-id']).toBe(
+      draft.request.headers.get('thread-id')!,
+    )
   })
 
   it('uses the configured Codex base and preserves custom transport destinations', () => {
@@ -1063,7 +1213,16 @@ describe('Codex destination after transport ownership', () => {
       }),
     }
     await host.fire('http.request', http)
-    expect(await http.request.json()).toEqual({ temperature: 0.5 })
+    const threadID = http.request.headers.get('thread-id')
+    expect(await http.request.json()).toEqual({
+      temperature: 0.5,
+      parallel_tool_calls: true,
+      prompt_cache_key: threadID,
+      client_metadata: {
+        'x-codex-installation-id': expect.any(String),
+        'x-codex-window-id': `${threadID}:0`,
+      },
+    })
     await wsHandshake(host, 'ses_options')
     const ws = {
       ...scope('ses_options'),
@@ -1077,6 +1236,7 @@ describe('Codex destination after transport ownership', () => {
     expect(JSON.parse(ws.frame)).toEqual({
       type: 'response.create',
       temperature: 0.5,
+      prompt_cache_key: threadID,
     })
   })
 })

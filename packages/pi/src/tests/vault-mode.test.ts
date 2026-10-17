@@ -57,6 +57,9 @@ import {
   VAULT_SLOT_CONFLICT,
   VAULT_SLOT_REFUSAL,
 } from '../vault-slot.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -198,6 +201,26 @@ function runtimeWith(target: OpenAiVault, slot?: PiSlot): PiOpenAIRuntime {
   })
 }
 
+// Authority/menu tests do not inspect login bytes. Keep their slot in memory;
+// the lifecycle tests below exercise the real durable stash and restore.
+function volatileSlot(): PiSlot {
+  let stashed = false
+  return {
+    inspect: async () => ({
+      slot: stashed ? 'placeholder' : 'original',
+      stash: stashed ? 'valid' : 'missing',
+    }),
+    enterVault: async () => {
+      stashed = true
+    },
+    exitVault: async () => {
+      const result = stashed ? 'restored' : 'nothing-to-do'
+      stashed = false
+      return result
+    },
+  }
+}
+
 async function send(
   runtime: PiOpenAIRuntime,
   sessionId?: string,
@@ -268,6 +291,85 @@ function poolFiles(): string[] {
 }
 
 describe('Pi in vault mode', () => {
+  for (const mode of ['main-first', 'fallback-first'] as const) {
+    test(`${mode} places the default vault account as main`, async () => {
+      const credentials = {
+        'chatgpt:openai': vaultLogin('chatgpt-default'),
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+      }
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials,
+      })
+      enroll()
+      await setMode(mode)
+      const target = vault()
+      const runtime = runtimeWith(target)
+      try {
+        await target.refresh()
+        // Discovery sorts credentials by name; put the default second so
+        // main-first must actually change the routing order.
+        const routes = target.routes.bind(target)
+        const ordered =
+          mode === 'main-first'
+            ? spyOn(target, 'routes').mockImplementation(() =>
+                routes().reverse(),
+              )
+            : undefined
+        try {
+          expect(target.routes().map((row) => row.credentialId)).toEqual(
+            mode === 'main-first'
+              ? ['chatgpt:openai:work', 'chatgpt:openai']
+              : ['chatgpt:openai', 'chatgpt:openai:work'],
+          )
+          expect(errorOf(await send(runtime))).toBeUndefined()
+          expect(codexTokens).toEqual([
+            chatgptAccessToken(
+              mode === 'main-first' ? 'chatgpt-default' : 'chatgpt-work',
+            ),
+          ])
+        } finally {
+          ordered?.mockRestore()
+        }
+      } finally {
+        target.close()
+      }
+    })
+  }
+
+  test('alias-only vault placements keep Ordered order and never serve the local main', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+        'chatgpt:openai:home': vaultLogin('chatgpt-home'),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      for (const mode of ['ordered', 'main-first', 'fallback-first'] as const) {
+        await setMode(mode)
+        expect(errorOf(await send(runtime))).toBeUndefined()
+        const routing = (
+          await createPiMenu(runtime.commandSupport()).open({ notify() {} })
+        ).menu.sections.find((section) => section.id === 'routing')!
+        expect(
+          routing.lines.includes(
+            'No default vault account, so this mode orders like Ordered',
+          ),
+        ).toBe(mode !== 'ordered')
+      }
+      expect(codexTokens).toEqual(
+        Array(3).fill(chatgptAccessToken('chatgpt-home')),
+      )
+    } finally {
+      target.close()
+    }
+  })
+
   test('unknown authority blocks synchronous local observation until a fresh read', async () => {
     const target = vault()
     const runtime = runtimeWith(target)
@@ -286,7 +388,13 @@ describe('Pi in vault mode', () => {
 
   for (const state of ['missing-token', 'unreadable'] as const) {
     test(`${state} enrollment disables local work and retains menu Disconnect`, async () => {
-      writeNativeLogin()
+      const locks = await import(
+        new URL(
+          './lock.js',
+          import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+        ).href
+      )
+      const acquire = spyOn(locks, 'acquirePiLock')
       mkdirSync(stateDir, { recursive: true, mode: 0o700 })
       writeFileSync(
         vaultPaths(stateDir, 'pi').statePath,
@@ -302,7 +410,7 @@ describe('Pi in vault mode', () => {
         { mode: 0o600 },
       )
       const target = vault()
-      const runtime = runtimeWith(target)
+      const runtime = runtimeWith(target, volatileSlot())
       try {
         await runtime.syncVaultSlot()
         expect(await runtime.readAuthority()).toBe(
@@ -343,7 +451,9 @@ describe('Pi in vault mode', () => {
         )
         expect(disconnected.ok).toBe(true)
         expect(await runtime.readAuthority()).toBe('local')
+        expect(acquire).not.toHaveBeenCalled()
       } finally {
+        acquire.mockRestore()
         target.close()
       }
     })
@@ -665,6 +775,103 @@ describe("Pi's real model runtime in vault mode", () => {
 })
 
 describe('Pi vault slot lifecycle', () => {
+  test('a paused stash publication expires the lease and the awaited sync owns lock-compromised', async () => {
+    const { createPiSlot } = (await import(
+      new URL(
+        './slot.js',
+        import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+      ).href
+    )) as {
+      createPiSlot(
+        options: Parameters<typeof openPiSlot>[0],
+        onStep: undefined,
+        hooks: {
+          onRenew(renew: () => Promise<void>): void
+          beforeRename(path: string): Promise<void>
+        },
+      ): PiSlot
+    }
+    const authPath = join(dir, 'auth.json')
+    const stashPath = join(stateDir, 'pi-openai-codex-login.json')
+    const original = writeNativeLogin()
+    enroll()
+    let renew!: () => Promise<void>
+    let entered!: () => void
+    let release!: () => void
+    const syncing = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    const resume = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const slot = createPiSlot(
+      {
+        authPath,
+        stashPath,
+        provider: 'openai-codex',
+        placeholderKey: VAULT_PLACEHOLDER_KEY,
+      },
+      undefined,
+      {
+        onRenew: (update) => {
+          renew = update
+        },
+        beforeRename: async (path) => {
+          if (path !== stashPath) return
+          entered()
+          await resume
+        },
+      },
+    )
+    const target = vault()
+    const runtime = runtimeWith(target, slot)
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    let clock: { mockRestore(): void } | undefined
+    // Handle syncVaultSlot's rejection before releasing the paused stash write,
+    // so an expired Pi auth lease cannot escape as an unhandled rejection.
+    const result = runtime.syncVaultSlot().then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    try {
+      await syncing
+      expect(existsSync(`${authPath}.lock`)).toBe(true)
+      // common-auth's beforeRename hook pauses after fsync but before publishing
+      // the stash. Advance Date.now and invoke its captured onRenew callback to
+      // test a renewal more than ten seconds overdue without a wall-clock wait.
+      const expired = Date.now() + 10_001
+      clock = spyOn(Date, 'now').mockReturnValue(expired)
+      await renew()
+      clock.mockRestore()
+      clock = undefined
+      release()
+      expect(await result).toMatchObject({ code: 'lock-compromised' })
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(unhandled).toEqual([])
+      expect(existsSync(stashPath)).toBe(false)
+      expect(readFileSync(authPath, 'utf8')).toContain(original)
+      expect(existsSync(`${authPath}.lock`)).toBe(true)
+      // common-auth leaves an expired lock for the next writer to reclaim once
+      // old enough. Remove this test's abandoned lock instead of waiting for
+      // that age threshold, then check that syncVaultSlot can recover.
+      rmSync(`${authPath}.lock`, { recursive: true })
+      await runtime.syncVaultSlot()
+      expect(
+        JSON.parse(readFileSync(authPath, 'utf8'))['openai-codex'].key,
+      ).toBe(VAULT_PLACEHOLDER_KEY)
+    } finally {
+      clock?.mockRestore()
+      release()
+      await result
+      process.off('unhandledRejection', onUnhandled)
+      target.close()
+    }
+  })
+
   test('steady local and vault sync ticks take no Pi auth locks', async () => {
     const locks = await import(
       new URL(

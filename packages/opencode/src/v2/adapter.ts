@@ -56,8 +56,6 @@ import {
   extractAccountIdFromClaims,
   getKillswitchThresholdsForAccount,
   isCompleteQuotaHeaderFrame,
-  isKillswitchEnabled,
-  killswitchPassesPolicy,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OpenAiVault,
@@ -79,14 +77,17 @@ import {
   orderedPlacement,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyRouteOptions,
   selectStickyRow,
+  vaultMainRouteId,
   waitForFirstQuotaReading,
 } from '../core/pool-routing'
 import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
 import {
   CODEX_CLIENT_HEADERS,
+  type CodexHttpState,
   MidConversationEffort,
   rewriteCodexFrame,
   rewriteCodexHttpRequest,
@@ -187,6 +188,9 @@ export type OpenAIAttemptData =
     }
 
 export interface OpenAIAdapterDeps {
+  codex?: CodexHttpState
+  /** Projects a primary request's actual route without affecting account choice. */
+  onRoute?: (sessionId: string, accountId: string, route: string) => void
   source: PoolAccess
   /**
    * True when OpenCode's login slot holds the placeholder while this store has
@@ -241,6 +245,21 @@ interface Target {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
+
+/**
+ * The reset-credit balance a pool row's or vault account's quota map holds
+ * (`counters.resetCredits.value`), kept only when it is a finite number, as
+ * OpenCode 1 reads its own saved balance. An explicit 0 stays 0; a missing or
+ * malformed count is undefined.
+ */
+export function resetCreditsOfQuota(quota: unknown): number | undefined {
+  const counters = isRecord(quota) ? quota.counters : undefined
+  const resetCredits = isRecord(counters) ? counters.resetCredits : undefined
+  const credits = isRecord(resetCredits) ? resetCredits.value : undefined
+  return typeof credits === 'number' && Number.isFinite(credits)
+    ? credits
+    : undefined
+}
 
 function parseJson(text: string): unknown {
   try {
@@ -370,7 +389,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const now = deps.now ?? Date.now
   const log = deps.log
   const vault = deps.vault
-  const effort = new MidConversationEffort()
+  const effort = new MidConversationEffort(deps.codex)
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
   // account (it follows `chooseAccount` at once) takes them.
@@ -445,20 +464,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     storage: AccountStorage | null,
     at: number,
   ): PoolRoutingInput => {
-    const killswitch = new Map<string, boolean>()
-    if (isKillswitchEnabled(storage)) {
-      for (const target of targets) {
-        killswitch.set(
-          target.id,
-          killswitchPassesPolicy(
-            windowsFromQuotaMap(target.quota),
-            storage,
-            target.id === FORMER_MAIN_ID ? undefined : target.id,
-            at,
-          ),
-        )
-      }
-    }
+    const killswitch = poolKillswitchVerdicts(targets, storage, at)
     const routingRows: RoutingRow[] = targets.map((target) => ({
       id: target.id,
       kind: 'oauth',
@@ -494,8 +500,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     mode: RoutingMode | string,
     excluded: ReadonlySet<string>,
     follow: string | undefined,
+    mainId: string | null | undefined,
   ): string | undefined => {
-    const plan = planOrdered({ ...routing, placement: orderedPlacement(mode) })
+    const plan = planOrdered({
+      ...routing,
+      placement: orderedPlacement(mode),
+      mainId,
+    })
     if (plan.kind === 'block') {
       log?.debug('pool admission refused the request', {
         reason: plan.block.reason,
@@ -521,6 +532,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     excluded: ReadonlySet<string>,
     persist: boolean,
   ): string | undefined => {
+    const quotaById = new Map(
+      targets.map((target) => [target.id, target.quota]),
+    )
     const options: StickyRouteOptions = {
       requestBytes: NOMINAL_REQUEST_BYTES,
       reservePercent: (id) =>
@@ -528,10 +542,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           id === FORMER_MAIN_ID ? undefined : id,
         ),
-      // OpenCode 1 breaks placement ties by the reset credits an account
-      // holds, which only its in-memory quota cache records; nothing here
-      // records them, so ties fall to the roster order.
-      resetCredits: () => undefined,
+      // The reset credits each account's saved quota reading records. As on
+      // OpenCode 1, they only matter when no account has a fresh reading with
+      // room above its reserve to weigh: the session then goes to the first
+      // account in roster order holding at least one credit, else the first
+      // account. Reading them touches no token and asks the vault for nothing.
+      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),
     }
     const sticky = admitSticky(routing)
     const place = (exclude: readonly string[], keep: boolean) =>
@@ -655,6 +671,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         mode,
         skip,
         primary ? undefined : sessionAccounts.get(input.sessionID),
+        vaultMode
+          ? mode === 'sticky-balanced'
+            ? null
+            : vaultMainRouteId(vault?.routes() ?? [])
+          : undefined,
       )
       if (accountId === undefined || refused.has(accountId)) {
         accountId = undefined
@@ -716,8 +737,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         message: VAULT_MODE_REFUSALS[cause],
       })
     }
-    if (accountId !== undefined && primary)
+    if (accountId !== undefined && primary) {
       rememberSessionAccount(input.sessionID, accountId)
+      deps.onRoute?.(input.sessionID, accountId, mode)
+    }
     log?.debug('pool account chosen', {
       kind: input.kind,
       accountId,

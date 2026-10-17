@@ -66,8 +66,13 @@ import {
   vaultConnectOutcome,
   vaultEnrollmentLine,
 } from './vault'
-import { type MenuVault, vaultAccountName } from './vault-account-menu'
+import {
+  type MenuVault,
+  VAULT_LOCAL_ACTION_REFUSAL,
+  vaultAccountName,
+} from './vault-account-menu'
 import { createVaultCommandMenu, menuStore } from './vault-command-menu'
+import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -595,6 +600,7 @@ export function loginAddInput(account: IngestAccount): AddInput {
 /** The Accounts section's add action, over this plugin's OAuth login. */
 export function menuLogin(
   deps: MenuLoginDeps,
+  vault?: MenuVault,
 ): NonNullable<AccountsSectionOptions['login']> {
   return {
     label: 'Add account',
@@ -621,8 +627,18 @@ export function menuLogin(
         ? `Open this verification URL:\n\n${flow.url}\n\nThen enter the code: ${flow.instructions.match(/Enter code: (.+)/)?.[1] ?? flow.instructions}\n\nThe account is added when you finish.`
         : `Open this URL and complete sign-in:\n\n${flow.url}\n\n${flow.instructions}\n\nThe account is added when you finish.`
       const completion = flow.completion.then(async (account) => {
+        // Enrollment may change while the browser is open. Check before even
+        // reading main's identity, not just when the add action starts.
+        if (vault && (await vault.authority()) !== 'local')
+          throw new CommandError(
+            'vault-local-action',
+            VAULT_LOCAL_ACTION_REFUSAL,
+          )
         const main = await deps.mainIdentity?.()
-        if (account.accountId && main && account.accountId === main) {
+        if (
+          account.id === MAIN_ROW_ID ||
+          (account.accountId && main && account.accountId === main)
+        ) {
           // The internal id only: the ChatGPT identity is sensitive.
           log.warn('account add rejected (main identity)', { id: account.id })
           throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
@@ -726,7 +742,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
           ...(connected
             ? [
                 status.accounts.length === 0
-                  ? 'The vault serves no OpenAI account to this host yet.'
+                  ? VAULT_EMPTY_ACCESS_HINT
                   : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
             : []),
@@ -1006,6 +1022,12 @@ export function resetCreditsSection(
 export interface OpenAiMenuOptions {
   store: PoolStore
   vault?: MenuVault
+  /** Display the normal actions, but refuse all applies before running one. */
+  readOnly?: boolean
+  /** A host capability fence, checked before the shared engine runs an action. */
+  allowAction?: (request: CommandApplyRequest) => boolean
+  /** Keep unsupported host sections in their normal positions without actions. */
+  unavailableSections?: readonly ('cache' | 'diagnostics' | 'reset')[]
   /**
    * The legacy locks the menu's writes that name no single row take (the
    * roster order, settings, a new account).
@@ -1048,6 +1070,18 @@ export const FLOOR_LABELS = ['primary', 'secondary'] as const
  * the notice and `apply` changes nothing.
  */
 export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
+  const unavailable = new Set(options.unavailableSections)
+  const unavailableSection = (title: string): PluginSection => ({
+    title,
+    build: async () => ({ lines: ['Not available on OpenCode 2 yet.'] }),
+  })
+  const extras = [...(options.extras ?? [])]
+  if (unavailable.has('reset')) {
+    const reset = { id: 'reset', ...unavailableSection('Reset credits') }
+    const index = extras.findIndex((section) => section.id === 'reset')
+    if (index < 0) extras.unshift(reset)
+    else extras[index] = reset
+  }
   const menuOptions = {
     command: OPENAI_COMMAND_NAME,
     title: OPENAI_MENU_TITLE,
@@ -1060,7 +1094,9 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     ),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     accounts: {
-      ...(options.login ? { login: menuLogin(options.login) } : {}),
+      ...(options.login
+        ? { login: menuLogin(options.login, options.vault) }
+        : {}),
       ...(options.protect ? { protect: options.protect } : {}),
       ...(options.describeIdentity
         ? { describeIdentity: options.describeIdentity }
@@ -1069,15 +1105,42 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     quota: options.quotaCheck ? { check: options.quotaCheck } : {},
     routing: { orderedVariants: ORDERED_VARIANTS, formerMainId: MAIN_ROW_ID },
     limits: { labels: FLOOR_LABELS },
-    ...(options.cache ? { cache: options.cache } : {}),
-    ...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
-    ...(options.extras ? { extras: options.extras } : {}),
+    ...(unavailable.has('cache')
+      ? { cache: unavailableSection('Cache') }
+      : options.cache
+        ? { cache: options.cache }
+        : {}),
+    ...(unavailable.has('diagnostics')
+      ? { diagnostics: unavailableSection('Diagnostics') }
+      : options.diagnostics
+        ? { diagnostics: options.diagnostics }
+        : {}),
+    extras,
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.now ? { now: options.now } : {}),
   }
   const menu = options.vault
-    ? createVaultCommandMenu(menuOptions, options.vault)
+    ? createVaultCommandMenu(menuOptions, options.vault, {
+        refresh: !options.readOnly,
+        ...(options.readOnly
+          ? {
+              refuseApply: {
+                code: 'unavailable',
+                text: 'Not available on OpenCode 2 yet.',
+              },
+            }
+          : {}),
+      })
     : createCommandMenu(menuOptions)
+  const refusedMenu = options.vault
+    ? createVaultCommandMenu(menuOptions, options.vault, {
+        refresh: false,
+        refuseApply: {
+          code: 'unavailable',
+          text: 'Not available on OpenCode 2 yet.',
+        },
+      })
+    : undefined
   // A copy of the caller's context taken before the first await, as the
   // shared menu does: work left running reports through this copy even if
   // the host rebinds its context object for another session meanwhile.
@@ -1099,7 +1162,8 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
           command: OPENAI_COMMAND_NAME,
           menu: migrationNoticeMenu(state.blockers),
         }
-      return menu.open(context)
+      const payload = await menu.open(context)
+      return { ...payload, menu: scrubMenu(payload.menu) }
     },
     async apply(
       request: CommandApplyRequest,
@@ -1117,9 +1181,27 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
           text: 'Nothing was changed: the accounts have not moved to the new layout yet.',
           menu: migrationNoticeMenu(state.blockers),
         }
+      // The gate must precede the shared apply: a section-only request can
+      // otherwise succeed without selecting an action.
+      // The vault wrapper keeps its more specific local-action refusals.
+      if (options.readOnly && options.vault) return menu.apply(request, context)
+      if (
+        options.readOnly ||
+        (options.allowAction && !options.allowAction(request)) ||
+        unavailable.has(request.sectionId as 'cache' | 'diagnostics' | 'reset')
+      ) {
+        // Preserve the vault's more specific refusal for captured local actions.
+        if (refusedMenu) return refusedMenu.apply(request, context)
+        return {
+          ...(await menu.open(context)),
+          ok: false,
+          code: 'unavailable',
+          text: 'Not available on OpenCode 2 yet.',
+        }
+      }
       const result = await menu.apply(request, context)
       if (result.ok) await options.afterApply?.()
-      return result
+      return { ...result, menu: scrubMenu(result.menu) }
     },
   }
 }
