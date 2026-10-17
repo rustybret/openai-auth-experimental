@@ -81,18 +81,18 @@ if [ -z "$SEQUENCE" ]; then
   printf "  -> synchronized suite sequence: %s (max observed %s + 1)\n" "$SEQUENCE" "$MAX_OBSERVED"
 fi
 
-RELEASE_ROOT="${REPO_ROOT}/dist/${SEQUENCE}"
+RELEASE_ROOT="${REPO_ROOT}/dist-arcus"
 
 printf "=====================================================================\n"
 printf "pack-all-arcus: openai-auth Suite Arcus Packaging\n"
 printf "  version:  %s\n" "$VERSION"
 printf "  sequence: %s (suite-wide synchronized)\n" "$SEQUENCE"
-printf "  output:   dist/%s/<component>/%s/\n" "$SEQUENCE" "$VERSION"
+printf "  output:   dist-arcus/<component> (staged for publish-all-arcus.sh)\n"
 printf "=====================================================================\n"
 
 # --- 0. Clean the target release directory ---
 if [ "$NO_CLEAN" -eq 0 ] && [ -z "$ONLY_COMPONENT" ] && [ -d "$RELEASE_ROOT" ]; then
-  printf "\n[Step 0/3] Cleaning stale release directory: dist/%s\n" "$SEQUENCE"
+  printf "\n[Step 0/3] Cleaning stale staging directory: dist-arcus\n"
   rm -rf "$RELEASE_ROOT"
 fi
 
